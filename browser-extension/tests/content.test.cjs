@@ -95,6 +95,57 @@ test('paired page consumes one job, posts its echo and final exactly once, and s
 });
 
 const shotJob='dad0beef0123456789abcdef01234567';
+for (const [mode,marked] of [['redraw',true],['edit',true],['edit',false]]) {
+  test(`acknowledged echo ${mode} before ${marked ? 'command' : 'final'} publication`,async()=>{
+    const chat='https://arena.ai/agent/echo', rows=[{role:'assistant',siteId:'old',text:'Previous reply',complete:true}];
+    const events=[];
+    let control,tick,mutate,source,now=100000,offer=true;
+    const ctx=vm.createContext({location:{href:chat},crypto,URL,document:{documentElement:{}},addEventListener(){},
+      Date:class extends Date{static now(){return now;}},
+      MutationObserver:class{constructor(fn){mutate=fn;}observe(){}},setInterval:fn=>{tick=fn;},
+      ArenaPage:class {
+        rows(){return rows.map(row=>({...row}));}
+        state(){return {idle:true,ready:true,field:{},value:''};}
+        historyReplySource(row){if(row.role==='user')return source;}
+        async submit(job,draft,guard,beforeClick){
+          assert.ok(guard());beforeClick();
+          source=job.text;
+          rows.push({role:'user',nativeMessage:true,siteId:'chat-message-echo',text:source,lastLine:source.split('\n').at(-1)});
+        }
+      },
+      chrome:{runtime:{id:'test',onMessage:{addListener:fn=>{control=fn;}},sendMessage:async message=>{
+        if(message.type==='event')events.push(message.event);
+        if(message.type==='poll' && message.ready && offer){
+          offer=false;return {ok:true,job:{id:shotJob,text:'Code\n\tstep()'}};
+        }
+        return {ok:true};
+      }}}
+    });
+    for (const file of ['core.js','content.js'])
+      vm.runInContext(fs.readFileSync(path.join(__dirname,'..',file),'utf8'),ctx);
+    const send=message=>new Promise(resolve=>control(message,{id:'test'},resolve));
+    const prepared=await send({type:'prepare',chat});
+    assert.ok(prepared.ok,prepared.error);
+    await send({type:'attach',chat,pageKey:prepared.pageKey,binding:'b1'});
+    await tick();await tick();
+    assert.equal(events.filter(e=>e.kind==='sent').length,1);
+    if (mode==='redraw') rows.at(-1).text=source.replace('\tstep()','step()\t');
+    else source=source.replace('\tstep()','\t\tstep()');
+    rows.push({role:'assistant',siteId:'chat-message-next',nativeMessage:true,complete:true,text:'Verified reply',toolFrame:marked});
+    mutate();now+=1200;await tick();await tick();await tick();
+    const replies=events.filter(e=>e.kind==='assistant');
+    if (mode==='redraw') {
+      assert.deepEqual(replies.map(e=>[e.replyTo,e.toolFrame]),[[shotJob,true]]);
+      assert.ok(!events.some(e=>e.kind==='blocked'));
+    } else {
+      assert.equal(replies.length,0);
+      assert.match(events.find(e=>e.kind==='blocked')?.text,/row 2 \(original source\)/);
+      assert.equal(events.find(e=>e.kind==='blocked').transcriptChanged,true);
+    }
+    assert.equal(events.filter(e=>e.kind==='sent').length,1);
+  });
+}
+
 test('composer account limit preserves a confirmed response and then prevents another Send',async()=>{
   const chat='https://arena.ai/agent/quota', rows=[{role:'assistant',siteId:'old',text:'Previous reply',complete:true}];
   const issues={kind:'limited',text:'Daily usage limit reached',account:true};

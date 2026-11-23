@@ -279,6 +279,43 @@ try {
   const next=interruptedLog.scan([user,page.rows()[0],nextUser,nextRow],options);
   check(next.some(event=>event.kind==='assistant' && event.text==='A later normal reply') && !next.some(event=>event.toolFrame),
     'the next turn is returned normally and cannot replay the incomplete command');
+  const sent = ArenaBridge.delivery('Result\n\tstep()',delivery);
+  const submitted = document.createElement('div');
+  submitted.id = 'chat-message-submitted';
+  submitted.dataset.agentTranscriptMessage = 'true';
+  submitted.dataset.chatMessageId = 'submitted';
+  submitted.dataset.messageAuthorRole = 'user';
+  submitted.innerHTML = '<div class="prose"><p>Result</p><pre><code></code></pre><p></p></div><button aria-label="Copy">Copy</button>';
+  submitted.querySelector('code').textContent = '\tstep()';
+  submitted.querySelector('.prose p:last-child').textContent = sent.receipt;
+  main.replaceChildren(submitted);
+  let legacyWrites = 0;
+  let submittedSource = sent.text;
+  Object.defineProperty(document,'execCommand',{configurable:true,value:()=>{legacyWrites++;return true;}});
+  submitted.querySelector('button').onclick = () => {
+    const shadow = document.createElement('span');
+    shadow.style.whiteSpace='pre';
+    shadow.textContent = submittedSource;
+    document.body.append(shadow);
+    const range = document.createRange();
+    range.selectNodeContents(shadow);
+    const selection = document.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    try { document.execCommand('copy'); }
+    finally { selection.removeAllRanges(); shadow.remove(); }
+  };
+  check(page.historyReplySource(page.rows()[0])===sent.text,'whole native legacy copy source is read without normalization');
+  submitted.querySelector('code').textContent = 'step()\t';
+  check(page.historyReplySource(page.rows()[0])===sent.text,'visual code redraw preserves the authored legacy copy source');
+  submittedSource=submittedSource.replace('\tstep()', '\t\tstep()');
+  check(page.historyReplySource(page.rows()[0])===submittedSource && legacyWrites===0,
+    'an original code indentation edit is observable without writing to the clipboard');
+  let clipboardItemWrites = 0;
+  Object.defineProperty(navigator.clipboard,'write',{configurable:true,value:async()=>{clipboardItemWrites++;}});
+  submitted.querySelector('button').onclick=()=>navigator.clipboard.write([]);
+  check(page.historyReplySource(page.rows()[0])===undefined && clipboardItemWrites===0,
+    'an unsupported user Copy transport cannot overwrite the system clipboard');
   document.querySelector('#out').textContent='All fixture checks passed';
 } catch(error){document.querySelector('#out').textContent=error.message;}
 })();

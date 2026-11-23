@@ -335,7 +335,7 @@
     }
   }
 
-  function collect(s,publishNativeFinal=false,outgoing=false) {
+  function collect(s,publishNativeFinal=false,outgoing=false,verifyEcho=false) {
     if (s !== session || s.chat !== here() || s.departed || s.log.fault || s.publishingReply) return;
     const state = page.state();
     if (state.verification) {
@@ -352,7 +352,7 @@
     }
     if (state.issue && !state.issue.account) { suspend(s, state.issue); return; }
     const rows=page.rows();
-    const scanState = {...state,outgoing,identityRows:rows,historySource:row=>page.historyReplySource?.(row)};
+    const scanState = {...state,outgoing,verifyEcho,identityRows:rows,historySource:row=>page.historyReplySource?.(row)};
     const oldIndex=s.log.seen.length;
     settleFinal(s,rows.slice(oldIndex).find(row=>row.role==='assistant'));
     if (s.passiveFollowupIndex===oldIndex && !s.log.waiting && !s.log.expected && rows[oldIndex]) {
@@ -499,7 +499,7 @@
           continue;
         }
         if (unpublished.has(next) || next.toolFrame) {
-          collect(s);
+          collect(s,false,false,next.kind==='assistant');
           if (s.outbox[0] !== next) continue;
           if (s.log.historyChangedAt != null) return;
           // Retrying an unacknowledged event can be its first successful publication.

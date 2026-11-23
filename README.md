@@ -42,7 +42,7 @@ python -m arena_terminal --root 'C:\путь\к\проекту'
 Для сборки нужны Python и npm. Архив появится в `dist/`.
 
 ```powershell
-python scripts/build_windows_release.py --version 0.1.4
+python scripts/build_windows_release.py --version 0.1.5
 python -m unittest test_arena_desktop test_arena_terminal test_windows_release
 node --test browser-extension/tests/*.test.cjs
 ```

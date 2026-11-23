@@ -292,6 +292,54 @@ test('only the bridge-issued receipt separator can settle after acknowledging a 
     'preserving the receipt does not authorize an altered tool result');
 });
 
+test('a confirmed user echo survives a redraw when its original source is identical', () => {
+  const echo = {...stampedUser('Code:\n\tstep()'), nativeMessage:true};
+  const original = echo.text;
+  const log = new Transcript([]);
+  const state = {generating:false, historySource:row=>row.role==='user' ? original : undefined};
+  log.expect(stamp, 'Code:\n\tstep()', null, echo.lastLine);
+  assert.deepEqual(log.scan([echo],state).map(event=>event.kind),['sent']);
+  const redrawn = {...echo,text:original.replace('\tstep()', 'step()\t')};
+  const command = {...assistant('one command',true),toolFrame:true,siteId:'command'};
+  assert.deepEqual(log.scan([redrawn,command],state).map(event=>event.kind),['assistant']);
+  assert.equal(log.fault,'');
+  assert.deepEqual(log.scan([redrawn,command],state),[]);
+});
+
+test('publication detects an original indentation edit even with an unchanged rendering', () => {
+  const echo = {...stampedUser('Code:\n\tstep()'), nativeMessage:true};
+  const log = new Transcript([]);
+  let source = echo.text;
+  const state = {generating:false,historySource:()=>source};
+  log.expect(stamp,'Code:\n\tstep()',null,echo.lastLine);
+  log.scan([echo],state);
+  source = source.replace('\tstep()', '\t\tstep()');
+  const command = {...assistant('must not run',true),toolFrame:true,siteId:'command'};
+  assert.deepEqual(log.scan([echo,command],{...state,verifyEcho:true}),[]);
+  assert.match(log.fault,/row 1 \(original source\)/);
+  assert.equal(log.transcriptChanged,true);
+  assert.deepEqual(log.scan([echo,command],state),[]);
+});
+
+test('a missing user source at publication cannot reset the verification deadline', (t) => {
+  let now = 1000;
+  t.mock.method(Date,'now',()=>now);
+  const echo = {...stampedUser('Code:\n\tstep()'),nativeMessage:true};
+  const log = new Transcript([]);
+  let source = echo.text;
+  const state = {generating:false,historySource:()=>source};
+  log.expect(stamp,'Code:\n\tstep()',null,echo.lastLine);
+  log.scan([echo],state);
+  source = undefined;
+  assert.deepEqual(log.scan([echo],{...state,verifyEcho:true}),[]);
+  now += 3000;
+  log.scan([echo],state);
+  assert.equal(log.historyChangedAt,1000);
+  now += 7100;
+  log.scan([echo],state);
+  assert.match(log.fault,/row 1 \(source unavailable\)/);
+});
+
 test('an image-only final waits for verified artifact bytes and is emitted exactly once', () => {
   const log=new Transcript(history), signal={generating:false,idle:true};
   const picture={mediaType:'image/png',data:'aW1hZ2U='};

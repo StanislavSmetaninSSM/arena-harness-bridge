@@ -141,10 +141,21 @@ const ArenaBridge = (() => {
     return null;
   }
 
-  function historyField(old, row, duplicateIds, readSource, outgoing) {
+  function historyField(old, row, duplicateIds, readSource, outgoing, verifyEcho) {
     const field = changedField(old,row);
     if (old.originalMarkdown === undefined || (field && !['text','tool authority','tool source'].includes(field))) return field;
     if (duplicateIds.has(row.siteId)) return 'duplicate site ID';
+    if (old.role === 'user') {
+      if (!row.nativeMessage || row.lastLine !== old.receipt) return field || 'receipt';
+      if (field && field !== 'text') return field;
+      if (!verifyEcho && !old.awaitingEchoSource && (!field || row.text === old.verifiedPresentation)) return null;
+      const source = readSource?.(row);
+      old.awaitingEchoSource = source === undefined;
+      if (old.awaitingEchoSource) return 'source unavailable';
+      if (source !== old.originalMarkdown) return 'original source';
+      old.verifiedPresentation = row.text;
+      return null;
+    }
     if (!row.nativeMessage || row.nativeQuestion || row.artifact || row.imageChoices?.length) return 'reply kind';
     if (!row.complete) return 'source unavailable';
     const prior = old.verifiedPresentation ?? old;
@@ -251,16 +262,17 @@ const ArenaBridge = (() => {
     }
 
     scan(rows, { generating, media, publishNativeFinal = true, historyOnly = false,
-      captureSource, historySource, recoverReply, outgoing = false, identityRows = rows }) {
+      captureSource, historySource, recoverReply, outgoing = false, verifyEcho = false, identityRows = rows }) {
       if (this.fault) return [];
       const latest = outgoing ? this.seen.findLastIndex(old=>old.role==='assistant') : -1;
+      const latestEcho = verifyEcho ? this.seen.findLastIndex(old=>old.role==='user') : -1;
       const ids = new Set(), duplicateIds = new Set();
       for (const row of identityRows) {
         if (ids.has(row.siteId)) duplicateIds.add(row.siteId);
         ids.add(row.siteId);
       }
       for (const [i,old] of this.seen.entries()) {
-        const field = historyField(old,rows[i],duplicateIds,historySource,i===latest);
+        const field = historyField(old,rows[i],duplicateIds,historySource,i===latest,i===latestEcho);
         if (!field) continue;
         if (this.verificationRecovery && field === 'presence') {
           if (this.waitForVerificationRow()) return [];
@@ -339,16 +351,20 @@ const ArenaBridge = (() => {
         const nativeMedia = media && this.waiting && row.role==='assistant' && row.nativeMessage &&
           (row.artifact || this.expectedImages);
         if (!row.text && !row.images?.length && !nativeUploadTurn && !nativeMedia) break;
-        let receipt;
+        let receipt, submittedSource;
         if (row.role === 'user') {
           if (this.expected?.receipt) {
-            if (!uniqueRow(rows,row) || row.lastLine !== this.expected.receipt) {
+            if (!uniqueRow(identityRows,row) || row.lastLine !== this.expected.receipt) {
               // The bubble can mount before its final paragraph. Stop at this
               // row until it settles, another turn appears, or the timer expires.
               if (i === rows.length - 1) break;
               return output.concat(this.fail('The expected delivery receipt is missing from the new user message.'));
             }
-            if (row.nativeMessage) receipt = this.expected.receipt;
+            if (row.nativeMessage) {
+              receipt = this.expected.receipt;
+              const original = historySource?.(row);
+              if (typeof original === 'string' && original.trimEnd().endsWith('\n'+receipt)) submittedSource = original;
+            }
           } else if ((this.expected?.job || this.expected?.contextId) && ![row.text,row.echoMarkdown].includes(this.expected.text.trim())) {
             return output.concat(this.fail('A different user message appeared before the expected echo.'));
           }
@@ -408,7 +424,8 @@ const ArenaBridge = (() => {
         } else {
           return output.concat(this.fail('Cannot pair this reply with a new user turn.'));
         }
-        this.seen.push(...rows.slice(i,end).map(consumed=>({...consumedRow(consumed),receipt})));
+        this.seen.push(...rows.slice(i,end).map(consumed=>({...consumedRow(consumed),receipt,
+          ...(submittedSource === undefined ? {} : {originalMarkdown:submittedSource})})));
         i=end-1;
       }
       this.pendingRows = this.seen.length < rows.length;

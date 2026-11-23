@@ -214,19 +214,31 @@
 
   let capturingReply = false;
   let clickingCopy = false;
-  function readCopy(row) {
+  function readCopy(row, submitted = false) {
     if (capturingReply) return;
     const content = '.prose,.markdown,[data-message-content],[data-testid="message-content"],pre,code,blockquote,details,form,[contenteditable],[inert],[aria-hidden="true"]';
     const buttons = Array.from(row.querySelectorAll('button[aria-label="Copy" i]')).filter(button =>
       button.closest('[id^="chat-message-"]') === row && !button.closest(content) && !button.matches(':disabled,[aria-disabled="true"]') &&
-      button.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}));
+      button.checkVisibility({checkOpacity:!submitted,checkVisibilityCSS:true}));
     if (buttons.length !== 1 || !navigator.clipboard) return;
     const clipboard = navigator.clipboard;
     const previous = Object.getOwnPropertyDescriptor(clipboard, 'writeText');
+    const previousWrite = submitted ? Object.getOwnPropertyDescriptor(clipboard, 'write') : undefined;
+    const previousCommand = submitted ? Object.getOwnPropertyDescriptor(document, 'execCommand') : undefined;
+    const originalChildren = submitted ? new Set(document.body.children) : null;
     const written = [];
+    let legacyInstalled = false, writeInstalled = false;
     const restore = () => {
       if (previous) Object.defineProperty(clipboard, 'writeText', previous);
       else delete clipboard.writeText;
+      if (writeInstalled) {
+        if (previousWrite) Object.defineProperty(clipboard, 'write', previousWrite);
+        else delete clipboard.write;
+      }
+      if (legacyInstalled) {
+        if (previousCommand) Object.defineProperty(document, 'execCommand', previousCommand);
+        else delete document.execCommand;
+      }
       capturingReply = false;
     };
     try {
@@ -235,6 +247,32 @@
         value:async text => { if (typeof text === 'string') written.push(text); }
       });
     } catch { return; }
+    if (submitted) {
+      try {
+        // Unrecognized ClipboardItem writes fail closed without touching the clipboard.
+        Object.defineProperty(clipboard, 'write', {configurable:true,value:async()=>{written.push(null);}});
+        writeInstalled = true;
+        Object.defineProperty(document, 'execCommand', {
+          configurable:true,
+          value: command => {
+            if (command !== 'copy') return false;
+            // Arena's legacy Copy selects a newly attached, single-text span.
+            // Read that exact text and never execute the system copy command.
+            const selection = document.getSelection();
+            const span = selection?.anchorNode;
+            if (!(span instanceof HTMLSpanElement) || span.parentElement !== document.body ||
+                originalChildren.has(span) || span.childNodes.length !== 1 ||
+                span.firstChild.nodeType !== Node.TEXT_NODE || selection.rangeCount !== 1 ||
+                selection.focusNode !== span) return false;
+            const range = selection.getRangeAt(0);
+            if (range.startOffset !== 0 || range.endOffset !== 1) return false;
+            written.push(span.textContent);
+            return true;
+          }
+        });
+        legacyInstalled = true;
+      } catch { restore(); return; }
+    }
     capturingReply = true;
     clickingCopy = true;
     try {
@@ -246,7 +284,7 @@
       if (written.length) restore();
       else queueMicrotask(restore);
     }
-    if (written.length === 1 && written[0].length <= maxReplyLength) return written[0];
+    if (written.length === 1 && typeof written[0] === 'string' && written[0].length <= maxReplyLength) return written[0];
   }
 
   function visibleReplies() {
@@ -259,7 +297,8 @@
   function captureReply(event) {
     const row = event.target;
     const messages = visibleReplies();
-    const historical = event.type === 'arena-harness-check-history';
+    const submitted = event.type === 'arena-harness-check-submitted';
+    const historical = submitted || event.type === 'arena-harness-check-history';
     const path = currentChat();
     if (clickingCopy || typeof event.detail !== 'string' || !/^[a-f0-9-]{36}$/.test(event.detail) ||
         !(row instanceof HTMLElement) || !messages.includes(row) ||
@@ -270,14 +309,14 @@
     const selector = identities.map(id => '#'+id+',[data-chat-message-id="'+id+'"],[data-message-id="'+id+'"]').join(',');
     if (document.querySelectorAll(selector).length !== 1) return;
 
-    const copy = readCopy(row);
+    const copy = readCopy(row, submitted);
     // Copy runs in the page. Verify the row and conversation again after the click.
     const latest = visibleReplies();
     if (path !== currentChat() || !row.isConnected || !latest.includes(row) ||
         !historical && row !== latest.at(-1) ||
         row.dataset.chatMessageId !== id || row.id !== 'chat-message-' + id ||
         document.querySelectorAll(selector).length !== 1) return;
-    const reply = replies.get(id);
+    const reply = submitted ? undefined : replies.get(id);
     const candidates = reply ? [reply.settled,...reply.streams.values()].filter(Boolean) : [];
     const stream = candidates[0]?.text;
     const disagrees = candidates.some(proof=>proof.text === null || proof.text !== stream) ||
@@ -293,7 +332,7 @@
         detail:JSON.stringify({nonce:event.detail,...result})
       }));
     }
-    if (path && copy !== undefined) {
+    if (!submitted && path && copy !== undefined) {
       try {
         const status = disagrees ? 'mismatch' : incomplete || !candidates.length ? 'unavailable' : 'match';
         console.debug('[Arena Harness Bridge] Markdown comparison',status);
@@ -302,5 +341,6 @@
   }
   document.addEventListener('arena-harness-read-reply',captureReply);
   document.addEventListener('arena-harness-check-history',captureReply);
+  document.addEventListener('arena-harness-check-submitted',captureReply);
   try { observeFetch(); } catch {}
 })();

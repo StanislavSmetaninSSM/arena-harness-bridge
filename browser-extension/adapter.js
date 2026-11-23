@@ -518,6 +518,7 @@ const ArenaPage = (() => {
       this.doc = doc;
       this.nodeIds = new WeakMap();
       this.replyNodes = new WeakMap();
+      this.submittedNodes = new WeakMap();
       this.originalReplies = new WeakMap();
       this.nextNodeId = 1;
     }
@@ -569,6 +570,8 @@ const ArenaPage = (() => {
     }
 
     historyReplySource(row) {
+      const submitted = this.submittedNodes.get(row);
+      if (submitted) return readReply(submitted,'arena-harness-check-submitted')?.source;
       const node = this.replyNodes.get(row);
       if (node && row.complete && row.text) return readReply(node,'arena-harness-check-history')?.source;
     }
@@ -641,6 +644,9 @@ const ArenaPage = (() => {
             complete: !!(body || artifact || nativeQuestion || imageChoices.length || multipleFinalBodies && prose) && (ended ||
               node.matches('[data-message-status="complete"],[data-message-status="completed"],[data-streaming="false"],[data-status="complete"]'))
           };
+          if (row.role === 'user' && row.nativeMessage && row.siteId === node.id && row.lastLine &&
+              node.dataset.agentTranscriptMessage === 'true' && node.id === 'chat-message-' + node.dataset.chatMessageId)
+            this.submittedNodes.set(row,node);
           if ((row.toolFrame || nativeBodies.length && commandBodies.every(el=>nativeBodies.includes(el))) &&
               row.role === 'assistant' &&
               node.dataset.agentTranscriptMessage === 'true' && node.id === 'chat-message-' + node.dataset.chatMessageId &&

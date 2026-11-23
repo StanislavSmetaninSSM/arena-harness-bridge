@@ -2,6 +2,10 @@
 
 Плагин добавляет модель **Arena Agent Mode** и команду **Connect Arena / Подключить Arena** (`/arena-pair`). Установите его с Python-компаньоном и расширением Chrome по [инструкции Windows](../INSTALL.md).
 
+Пакет 0.1.13 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
+
+**English** — Plugin 0.1.13 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+
 Начиная с плагина 0.1.11, команда `/arena-reset` очищает очередь моста и освобождает подключение из любого диалога этого профиля Desktop. Используйте её, если прежний диалог удалён или нужно привязать другой. После сброса выполните `/arena-pair` в нужном диалоге. Если Chrome уже получил задачу для отправки, она может дойти в прежний чат.
 
 **English** — Run `/arena-reset` in any Desktop chat in the profile to clear the bridge queue and release the connection. Then run `/arena-pair` in the chat you want to use. A send already handed to Chrome may still reach the original chat.

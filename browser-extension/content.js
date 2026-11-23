@@ -355,9 +355,6 @@
     const scanState = {...state,outgoing,identityRows:rows,historySource:row=>page.historyReplySource?.(row)};
     const oldIndex=s.log.seen.length;
     settleFinal(s,rows.slice(oldIndex).find(row=>row.role==='assistant'));
-    const candidate = rows[oldIndex];
-    if (publishNativeFinal && s.log.waiting && !state.generating && rows.length === oldIndex + 1 && candidate?.complete)
-      page.recoverToolReply?.(candidate,s.log.commandDelivery);
     if (s.passiveFollowupIndex===oldIndex && !s.log.waiting && !s.log.expected && rows[oldIndex]) {
       const tail=rows[oldIndex];
       if (tail.role==='assistant') {
@@ -373,6 +370,7 @@
     if (oldIndex!==s.log.seen.length) settleFinal(s,rows[s.log.seen.length]);
     // Keep a native final mutable until the tick can publish it after earlier events.
     const events = s.log.scan(rows, {...scanState,publishNativeFinal,captureSource:row=>page.captureReplySource?.(row),
+      recoverReply:(row,delivery)=>page.recoverToolReply?.(row,delivery),
       media:(index,log)=>mediaReply(s,rows,state,index,log,publishNativeFinal)});
     if (s.log.historyChangedAt != null) return;
     if (s.log.transcriptChanged) {

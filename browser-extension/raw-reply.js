@@ -3,19 +3,224 @@
 // The site's Copy action receives its Markdown before it is rendered.
 // Run in the page world so the synchronous write can be captured locally.
 (() => {
+  const maxReplyLength = 180000;
+  const maxEventLength = 1024 * 1024;
+  // A cloned stream can read ahead of Arena. Bound that backlog separately
+  // from parser state so ordinary long-lived connections can carry many turns.
+  const maxCloneBytes = 16 * 1024 * 1024;
+  const maxSavedReplies = 8;
+  const replies = new Map();
+  let chatPath;
+  let readers = 0;
+
+  function currentChat() {
+    const path = /^\/agent\/([A-Za-z0-9_-]+)\/?$/.exec(location.pathname)?.[1];
+    if (path !== chatPath) {
+      replies.clear();
+      chatPath = path;
+    }
+    return path;
+  }
+
+  function replyEntry(id) {
+    if (!replies.has(id)) {
+      if (replies.size === maxSavedReplies) replies.delete(replies.keys().next().value);
+      replies.set(id,{streams:new Map(),pending:new Map(),settled:undefined,epoch:0,interruptedAt:0});
+    }
+    return replies.get(id);
+  }
+
+  function rememberReply(id, text, observation) {
+    const reply = replies.get(id);
+    const epoch = reply?.pending.get(observation);
+    if (!epoch) return;
+    const {streams,pending} = reply;
+    pending.delete(observation);
+    const previous = streams.get(observation);
+    streams.set(observation,{text:!previous || previous.text === text ? text : null,epoch});
+  }
+
+  function finishObservation(observation, valid) {
+    for (const reply of replies.values()) {
+      const unfinished = reply.pending.get(observation);
+      if (unfinished) {
+        reply.pending.delete(observation);
+        reply.interruptedAt = Math.max(reply.interruptedAt,unfinished);
+      }
+      const proof = reply.streams.get(observation);
+      if (!reply.streams.delete(observation)) continue;
+      if (valid && !unfinished) {
+        const settled = reply.settled;
+        reply.settled = {text:!settled || settled.text === proof.text ? proof.text : null,
+          epoch:Math.max(settled?.epoch ?? 0,proof.epoch)};
+      }
+    }
+  }
+
+  function readReplyEvents(observation) {
+    const records = new Map();
+    let highest, turn, buffer = '', skipLF = false, type = '', data = [], dataLength = 0, recordsLength = 0;
+
+    function record(entry) {
+      const seq = entry?.seq_num;
+      if (!Number.isSafeInteger(seq) || seq < 0) throw Error('Invalid Arena sequence');
+      const serialized = JSON.stringify(entry);
+      if (records.has(seq)) {
+        if (records.get(seq) !== serialized) throw Error('Conflicting Arena sequence');
+        return;
+      }
+      if (seq <= highest) throw Error('Out-of-order Arena sequence');
+      if (seq !== highest + 1) turn = undefined;
+      if (serialized.length > maxEventLength) throw Error('Oversized Arena record');
+      while (recordsLength + serialized.length > maxEventLength) {
+        const first = records.keys().next().value;
+        recordsLength -= records.get(first).length;
+        records.delete(first);
+      }
+      records.set(seq,serialized);
+      recordsLength += serialized.length;
+      highest = seq;
+
+      if (typeof entry.body !== 'string' || entry.headers?.some(([key,value]) => key === '' && value === 'trim')) {
+        turn = undefined;
+        return;
+      }
+      const chunk = JSON.parse(entry.body)?.data;
+      const kind = chunk?.type;
+      if (kind === 'start') {
+        turn = typeof chunk.messageId === 'string' && chunk.messageId
+          ? {id:chunk.messageId,parts:new Map(),length:0,recordsLength:serialized.length} : undefined;
+        if (turn) {
+          const reply = replyEntry(turn.id);
+          reply.pending.set(observation,++reply.epoch);
+        }
+        return;
+      }
+      if (!turn) return;
+      turn.recordsLength += serialized.length;
+      if (typeof kind !== 'string' || turn.recordsLength > maxEventLength) {
+        turn = undefined;
+        return;
+      }
+      if (kind === 'finish') {
+        const parts = [...turn.parts.values()];
+        if (chunk.messageMetadata?.nodeId === turn.id && chunk.messageMetadata.pending === false &&
+            parts.length && parts.every(part=>part.ended)) {
+          rememberReply(turn.id,parts.map(part=>part.text).join(''),observation);
+        }
+        turn = undefined;
+      } else if (kind === 'abort' || kind === 'error') {
+        turn = undefined;
+      } else if (kind === 'text-start') {
+        if (typeof chunk.id !== 'string' || !chunk.id || turn.parts.has(chunk.id)) turn = undefined;
+        else turn.parts.set(chunk.id,{text:'',ended:false});
+      } else if (kind === 'text-delta' || kind === 'text-end') {
+        const part = turn.parts.get(chunk.id);
+        if (!part || part.ended) turn = undefined;
+        else if (kind === 'text-end') part.ended = true;
+        else if (typeof chunk.delta !== 'string' || turn.length + chunk.delta.length > maxReplyLength)
+          turn = undefined;
+        else {
+          part.text += chunk.delta;
+          turn.length += chunk.delta.length;
+        }
+      }
+    }
+
+    function readLine(line) {
+      if (line.length > maxEventLength) throw Error('Oversized Arena event line');
+      if (!line) {
+        if (type === 'batch' && data.length) {
+          const entries = JSON.parse(data.join('\n')).records;
+          if (!Array.isArray(entries)) throw Error('Invalid Arena batch');
+          for (const entry of entries) record(entry);
+        }
+        type = '';
+        data = [];
+        dataLength = 0;
+      } else if (line.startsWith('event:')) type = line.slice(6).replace(/^ /,'');
+      else if (line.startsWith('data:')) {
+        dataLength += line.length;
+        if (dataLength > maxEventLength) throw Error('Oversized Arena event');
+        data.push(line.slice(5).replace(/^ /,''));
+      }
+    }
+
+    return function readText(text) {
+      if (!text) return;
+      if (skipLF && text.startsWith('\n')) text = text.slice(1);
+      skipLF = text.endsWith('\r');
+      const input = buffer + text;
+      let offset = 0;
+      for (const newline of input.matchAll(/\r\n?|\n/g)) {
+        readLine(input.slice(offset,newline.index));
+        offset = newline.index + newline[0].length;
+      }
+      buffer = input.slice(offset);
+      if (buffer.length > maxEventLength) throw Error('Oversized Arena event line');
+    };
+  }
+
+  async function observe(response, chat) {
+    if (readers >= 2 || currentChat() !== chat || !response.ok || response.redirected ||
+        !/^text\/event-stream(?:\s*;|$)/i.test(response.headers.get('content-type') || '') || !response.body) return;
+    const reader = response.clone().body.getReader();
+    const decoder = new TextDecoder('utf-8',{fatal:true});
+    const observation = {};
+    const readText = readReplyEvents(observation);
+    let bytes = 0, valid = true;
+    readers++;
+    try {
+      while (currentChat() === chat) {
+        const next = await reader.read();
+        if (currentChat() !== chat) break;
+        bytes += next.value?.byteLength ?? 0;
+        if (bytes > maxCloneBytes) break;
+        try {
+          readText(decoder.decode(next.value,{stream:!next.done}));
+        } catch {
+          valid = false;
+          break;
+        }
+        if (next.done) break;
+      }
+    } finally {
+      readers--;
+      finishObservation(observation,valid);
+      // Cancel only the diagnostic branch. The page can continue reading its own body.
+      void reader.cancel().catch(()=>{});
+    }
+  }
+
+  function observeFetch() {
+    const fetch = window.fetch;
+    window.fetch = function(input, init) {
+      const promise = Reflect.apply(fetch,this,arguments);
+      try {
+        const chat = currentChat();
+        if (chat) {
+          const request = input instanceof Request ? input : null;
+          const method = init?.method ?? request?.method ?? 'GET';
+          const url = new URL(request ? request.url : input,location.href);
+          if (url.origin === location.origin && url.pathname === '/api/chat/' + chat + '/events' &&
+              String(method).toUpperCase() === 'GET') {
+            void promise.then(response=>observe(response,chat)).catch(()=>{});
+          }
+        }
+      } catch {}
+      return promise;
+    };
+  }
+
   let capturingReply = false;
-  function captureReply(event) {
-    const row = event.target;
-    const messages = document.querySelectorAll('[data-agent-transcript-message="true"][id^="chat-message-"]');
-    if (capturingReply || typeof event.detail !== 'string' || !/^[a-f0-9-]{36}$/.test(event.detail) ||
-        !(row instanceof HTMLElement) || !Array.from(messages).includes(row) ||
-        event.type === 'arena-harness-read-reply' && row !== messages[messages.length - 1] ||
-        row.id !== 'chat-message-' + row.dataset.chatMessageId) return;
-    const identities = [row.id,row.dataset.chatMessageId,row.dataset.messageId].filter(Boolean).map(CSS.escape);
-    if (document.querySelectorAll(identities.map(id => '#'+id+',[data-chat-message-id="'+id+'"],[data-message-id="'+id+'"]').join(',')).length !== 1) return;
-    const buttons = row.querySelectorAll(':scope > .bg-surface-primary.rounded-xl.border.w-full > .px-3.pb-3 > .mt-3 > div > div > button[aria-label="Copy"]');
-    if (buttons.length !== 1 || !buttons[0].checkVisibility({checkOpacity:true,checkVisibilityCSS:true}) ||
-        buttons[0].disabled || !navigator.clipboard) return;
+  let clickingCopy = false;
+  function readCopy(row) {
+    if (capturingReply) return;
+    const content = '.prose,.markdown,[data-message-content],[data-testid="message-content"],pre,code,blockquote,details,form,[contenteditable],[inert],[aria-hidden="true"]';
+    const buttons = Array.from(row.querySelectorAll('button[aria-label="Copy" i]')).filter(button =>
+      button.closest('[id^="chat-message-"]') === row && !button.closest(content) && !button.matches(':disabled,[aria-disabled="true"]') &&
+      button.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}));
+    if (buttons.length !== 1 || !navigator.clipboard) return;
     const clipboard = navigator.clipboard;
     const previous = Object.getOwnPropertyDescriptor(clipboard, 'writeText');
     const written = [];
@@ -31,20 +236,71 @@
       });
     } catch { return; }
     capturingReply = true;
+    clickingCopy = true;
     try {
       buttons[0].click();
     } finally {
+      clickingCopy = false;
       // Only an immediate Copy is a source. Keep the stub through the first
       // microtask if an updated control defers the write instead.
       if (written.length) restore();
       else queueMicrotask(restore);
     }
-    if (written.length === 1 && written[0].length <= 180000 && row.isConnected) {
+    if (written.length === 1 && written[0].length <= maxReplyLength) return written[0];
+  }
+
+  function visibleReplies() {
+    const message = '[data-agent-transcript-message="true"][id^="chat-message-"]';
+    // Arena can keep the previous conversation mounted after changing routes.
+    return Array.from(document.querySelectorAll(message)).filter(row =>
+      row.getClientRects().length && row.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}));
+  }
+
+  function captureReply(event) {
+    const row = event.target;
+    const messages = visibleReplies();
+    const historical = event.type === 'arena-harness-check-history';
+    const path = currentChat();
+    if (clickingCopy || typeof event.detail !== 'string' || !/^[a-f0-9-]{36}$/.test(event.detail) ||
+        !(row instanceof HTMLElement) || !messages.includes(row) ||
+        !historical && row !== messages.at(-1) ||
+        row.id !== 'chat-message-' + row.dataset.chatMessageId) return;
+    const id = row.dataset.chatMessageId;
+    const identities = [row.id,row.dataset.chatMessageId,row.dataset.messageId].filter(Boolean).map(CSS.escape);
+    const selector = identities.map(id => '#'+id+',[data-chat-message-id="'+id+'"],[data-message-id="'+id+'"]').join(',');
+    if (document.querySelectorAll(selector).length !== 1) return;
+
+    const copy = readCopy(row);
+    // Copy runs in the page. Verify the row and conversation again after the click.
+    const latest = visibleReplies();
+    if (path !== currentChat() || !row.isConnected || !latest.includes(row) ||
+        !historical && row !== latest.at(-1) ||
+        row.dataset.chatMessageId !== id || row.id !== 'chat-message-' + id ||
+        document.querySelectorAll(selector).length !== 1) return;
+    const reply = replies.get(id);
+    const candidates = reply ? [reply.settled,...reply.streams.values()].filter(Boolean) : [];
+    const stream = candidates[0]?.text;
+    const disagrees = candidates.some(proof=>proof.text === null || proof.text !== stream) ||
+      typeof stream === 'string' && copy !== undefined && stream !== copy;
+    const incomplete = reply && (reply.pending.size || !candidates.some(proof=>proof.epoch > reply.interruptedAt));
+    let result;
+    if (!historical && disagrees) result = {status:'conflict'};
+    else if (!historical && incomplete) result = {status:'incomplete'};
+    else if (!historical && typeof stream === 'string') result = {source:stream,origin:'stream'};
+    else if (copy !== undefined) result = {source:copy,origin:'copy'};
+    if (result) {
       row.dispatchEvent(new CustomEvent('arena-harness-reply-source', {
-        detail:JSON.stringify({nonce:event.detail,source:written[0]})
+        detail:JSON.stringify({nonce:event.detail,...result})
       }));
+    }
+    if (path && copy !== undefined) {
+      try {
+        const status = disagrees ? 'mismatch' : incomplete || !candidates.length ? 'unavailable' : 'match';
+        console.debug('[Arena Harness Bridge] Markdown comparison',status);
+      } catch {}
     }
   }
   document.addEventListener('arena-harness-read-reply',captureReply);
   document.addEventListener('arena-harness-check-history',captureReply);
+  try { observeFetch(); } catch {}
 })();

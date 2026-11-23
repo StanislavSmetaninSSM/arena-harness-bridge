@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { win32 } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { outgoingPng } from './outgoing-image.mjs'
@@ -11,6 +12,10 @@ const maxGeneratedBytes = 8 * 1024 ** 2
 const maxGeneratedImages = 20
 const maxOutgoingImages = 20 // Default DSH LocalAttachments limit per native message.
 const maxOutgoingBytes = 32 * 1024 ** 2
+const batchName = 'arena_read_batch'
+const batchTools = new Set(['read', 'glob', 'grep'])
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value)
+const isBatch = items => Array.isArray(items) && items.length >= 2
 
 async function storeGeneratedImages(ctx, images, signal) {
   if (!Array.isArray(images) || images.length < 1 || images.length > maxGeneratedImages)
@@ -43,6 +48,36 @@ function requestIdFor(sessionId, messageId) {
   return createHash('sha256').update(JSON.stringify([sessionId, messageId])).digest('hex')
 }
 
+function imageReadCaption(ref, png) {
+  const width = png.readUInt32BE(16)
+  const height = png.readUInt32BE(20)
+  const name = typeof ref.name === 'string' ? win32.basename(ref.name).replace(/[\p{Cc}\p{Cf}]/gu, ' ').trim() : ''
+  const filename = [...name].slice(0,120).join('')
+  const caption = `${filename || 'Image'} (${width}×${height} px`
+  const origin = ref.originalDimensions ?? ref
+  if (![origin.width,origin.height].every(value => Number.isSafeInteger(value) && value > 0) ||
+      (origin.width === width && origin.height === height)) return caption + ')'
+  const x = Number((origin.width / width).toFixed(4))
+  const y = Number((origin.height / height).toFixed(4))
+  const scale = x === y ? `×${x}` : `×${x} x / ×${y} y`
+  return `${caption}, original ${origin.width}×${origin.height} px, coordinates ${scale})`
+}
+
+function readBatchResults(calls, results, callPrefix) {
+  if (!isBatch(calls) || calls.length !== results.length ||
+      !calls.every((call, index) => call.id === `${callPrefix}_${index}` && batchTools.has(call.name))) {
+    throw Error('Arena cannot match this read batch to its original calls')
+  }
+  const byId = new Map(results.filter(result => result.role === 'tool').map(result => [result.toolCallId, result]))
+  return calls.map(call => {
+    const result = byId.get(call.id)
+    if (!result?.id || !result.content.every(block => block.type === 'text')) {
+      throw Error('Arena requires one text result for each tool in the read batch')
+    }
+    return { toolCallId: call.id, failed: result.isError === true, text: result.content.map(block => block.text).join('\n') }
+  })
+}
+
 function selectMessage(messages, sessionId) {
   // DSH also injects user-role notices, skill catalogs and runtime context.
   // Only human actions, native goal rounds and our own tool results start a delivery.
@@ -53,11 +88,20 @@ function selectMessage(messages, sessionId) {
     const assistantAt = messages.slice(0, index).findLastIndex(previous => previous.role === 'assistant')
     const assistant = messages[assistantAt]
     const origin = messages.slice(0, assistantAt).findLast(isTurn)
-    if (assistant?.source?.provider !== route || assistant.source.model !== model.id || !origin?.id || origin.role === 'assistant' ||
-        message.toolCallId !== 'arena_' + requestIdFor(sessionId, origin.id) ||
-        !assistant.content.some(block => block.type === 'tool-call' && block.id === message.toolCallId)) {
-      throw Error('Arena cannot match this tool result to its original request and Desktop session')
+    const mismatch = () => Error('Arena cannot match this tool result to its original request and Desktop session')
+    if (assistant?.source?.provider !== route || assistant.source.model !== model.id || !origin?.id || origin.role === 'assistant') {
+      throw mismatch()
     }
+    const callPrefix = 'arena_' + requestIdFor(sessionId, origin.id)
+    const calls = assistant.content.filter(block => block.type === 'tool-call')
+    if (calls.length > 1) {
+      const results = readBatchResults(calls, messages.slice(assistantAt + 1, index + 1).filter(isTurn), callPrefix)
+      return { message, index, results }
+    }
+    if (message.toolCallId !== callPrefix || calls[0]?.id !== message.toolCallId) {
+      throw mismatch()
+    }
+    return { message, index, toolName:calls[0].name }
   }
   return { message, index }
 }
@@ -68,6 +112,20 @@ export class ArenaAdapter extends LlmAdapter {
     this.ctx = ctx
     this.companion = companion
     this.pollMs = pollMs
+    this.shellResults = new Map()
+  }
+
+  recordShellResult(exec, result) {
+    const sessionId = exec.agent?.session?.id
+    const value = result.value
+    if (!sessionId || exec.name !== 'pwsh' || !/^arena_[a-f0-9]{64}$/.test(exec.callId) ||
+        result.isError || value?.kind !== 'foreground') return
+    const { exitCode, signal, timedOut } = value
+    if (!(exitCode === null || Number.isSafeInteger(exitCode)) ||
+        !(signal === null || typeof signal === 'string') || typeof timedOut !== 'boolean') return
+    const key = JSON.stringify([sessionId,exec.callId])
+    this.shellResults.set(key,{exitCode,signal,timedOut})
+    if (this.shellResults.size > 64) this.shellResults.delete(this.shellResults.keys().next().value)
   }
 
   providerInfo() { return { id: route, name: 'Arena' } }
@@ -81,22 +139,29 @@ export class ArenaAdapter extends LlmAdapter {
   async request(options) {
     if (options.purpose) throw Error('Arena does not accept auxiliary model requests')
     if (!options.sessionId) throw Error('Arena requires a Desktop session')
-    const { message, index } = selectMessage(options.messages, options.sessionId)
+    const { message, index, results, toolName } = selectMessage(options.messages, options.sessionId)
     const requestId = requestIdFor(options.sessionId, message.id)
-    const tools = options.tools ?? []
+    const tools = (options.tools ?? []).filter(tool => tool.name !== batchName)
     const catalog = tools.some(tool => tool.name === 'skill')
       ? options.messages.findLast(row => row.role === 'user' && row.source?.kind === 'skill-catalog' && row.source.form === 'catalog')
       : undefined
     const skills = (catalog?.source.entries ?? []).map(({ name, description }) => ({ name, description }))
     const request = { requestId, sessionId: options.sessionId, text: '', tools, skills }
+    if (tools.some(tool => batchTools.has(tool.name))) request.supportsReadBatch = true
     // The Desktop preset owns Plan Mode. Read the same committed session projection
     // as Desktop, so a pending selection takes effect at the next step boundary.
     const agent = this.ctx.agents?.get(options.sessionId)
     const planMode = agent && this.ctx.sessionProjections?.snapshot(agent.session, ['plan']).values.plan?.active
     if (typeof planMode === 'boolean') request.planMode = planMode
+    if (results) {
+      request.toolResult = JSON.stringify({ results })
+      request.toolResultView = {}
+      return request
+    }
     const parts = []
     const pngs = []
     let imageBytes = 0
+    let imageCaption
     if (message.content.filter(block => block.type === 'image').length > maxOutgoingImages) throw Error('Arena accepts up to 20 images per turn')
     for (const block of message.content) {
       if (block.type === 'text') parts.push(block.text)
@@ -105,12 +170,20 @@ export class ArenaAdapter extends LlmAdapter {
         imageBytes += png.length
         if (imageBytes > maxOutgoingBytes) throw Error('Arena images exceed the 32 MiB limit per turn')
         pngs.push(png.toString('base64'))
+        if (toolName === 'read_image' && !message.isError) imageCaption = imageReadCaption(block.attachment,png)
       } else throw Error('Arena supports text and static image attachments in a message')
     }
     if (pngs.length === 1) request.png = pngs[0]
     else if (pngs.length > 1) request.pngs = pngs
     if (message.role === 'tool') {
       request.toolResult = JSON.stringify({ toolCallId: message.toolCallId, failed: message.isError === true, text: parts.join('\n') })
+      request.toolResultView = {}
+      if (imageCaption && pngs.length === 1) request.toolResultView.image = imageCaption
+      if (toolName === 'pwsh' && !message.isError) {
+        const key = JSON.stringify([options.sessionId,message.toolCallId])
+        const process = this.shellResults.get(key)
+        if (process) request.toolResultView.process = process
+      }
     } else {
       for (const extra of options.messages.slice(index + 1)) {
         if (extra.role === 'user' && extra.source?.kind === 'skill-invocation') {
@@ -130,9 +203,10 @@ export class ArenaAdapter extends LlmAdapter {
     const address = { id: request.requestId, sessionId: request.sessionId }
     let reply
     signal?.throwIfAborted()
-    if (request.pngs) {
+    if (request.pngs || request.toolResultView) {
       const setup = await this.companion.rpc('setup')
-      if (setup?.supportsPngBatch !== true) throw Error('Update the Arena bridge companion to send multiple images in one turn')
+      if (request.pngs && setup?.supportsPngBatch !== true) throw Error('Update the Arena bridge companion to send multiple images in one turn')
+      if (setup?.supportsResultView !== true) delete request.toolResultView
       signal?.throwIfAborted()
     }
     try {
@@ -155,6 +229,17 @@ export class ArenaAdapter extends LlmAdapter {
     if (reply?.kind === 'text' && typeof reply.text === 'string') {
       if (reply.text || reply.images === undefined) blocks.push({ type:'text', text:reply.text })
       if (reply.images !== undefined) blocks.push(...await storeGeneratedImages(this.ctx, reply.images, signal))
+    } else if (reply?.kind === 'tool-batch') {
+      const { calls, text, images } = reply
+      if (!request.supportsReadBatch || !isBatch(calls) || images !== undefined ||
+          (text !== undefined && typeof text !== 'string') || !calls.every(call => record(call) &&
+            Object.keys(call).length === 2 && batchTools.has(call.name) && record(call.arguments) &&
+            request.tools.some(tool => tool.name === call.name))) {
+        throw Error('Invalid Arena read batch or tool outside the active DSH profile')
+      }
+      if (text) blocks.push({ type:'text', text })
+      calls.forEach((call, index) => blocks.push({ type:'tool-call', id:`arena_${address.id}_${index}`,
+        name:call.name, arguments:JSON.stringify(call.arguments) }))
     } else if ((reply?.kind === 'tool' || imageChoice) && reply.images === undefined && request.tools.some(tool => tool.name === reply.name) &&
              reply.arguments && typeof reply.arguments === 'object' && !Array.isArray(reply.arguments) &&
              (reply.text === undefined || typeof reply.text === 'string')) {

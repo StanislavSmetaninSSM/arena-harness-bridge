@@ -2,18 +2,19 @@
 <script src="../core.js"></script><script src="../generated-images.js"></script>
 <script src="../native-questions.js"></script><script src="../raw-reply.js"></script><script src="../adapter.js"></script>
 <script>
+(async () => {
 try {
   const page = new ArenaPage(document), main = document.querySelector('main');
   const delivery = 'a'.repeat(32), ticks = String.fromCharCode(96).repeat(3);
   const source = JSON.stringify({$harness:'tool_call',turn_id:delivery,name:'read',arguments:{filePath:'C:\\Users\\fixture.txt'}}, null, 2);
   let clipboardWrites = 0, clicks = 0, currentSource;
   Object.defineProperty(navigator.clipboard,'writeText',{configurable:true,value:async()=>{clipboardWrites++;}});
-  function mount(raw, rendered) {
+  function mount(raw, rendered, id = 'fixture') {
     currentSource = raw;
     const row = document.createElement('div');
-    row.id = 'chat-message-fixture';
+    row.id = 'chat-message-' + id;
     row.dataset.agentTranscriptMessage = 'true';
-    row.dataset.chatMessageId = 'fixture';
+    row.dataset.chatMessageId = id;
     row.dataset.messageStatus = 'complete';
     row.innerHTML = '<div class="relative bg-surface-primary rounded-xl border w-full"><div class="px-3 pb-3">'+
       '<div class="flex flex-col gap-2"><div class="prose prose-base body-base">'+rendered+'</div></div>'+
@@ -26,6 +27,25 @@ try {
   const block = text => `${ticks}json\n${text}\n${ticks}`;
   const check = (test, label) => { if (!test) throw Error(label); };
   const visuallyBroken='<p>Before</p><p>{"$harness":"tool_call",</p><pre><code>invalid</code></pre><pre><code>fragment</code></pre>';
+  mount(block(source),visuallyBroken);
+  const message = main.firstElementChild;
+  const action = message.querySelector('button');
+  const newActions = document.createElement('footer');
+  newActions.setAttribute('role','group');
+  message.append(newActions);
+  newActions.append(action);
+  message.querySelector('.prose').insertAdjacentHTML('afterbegin','<button aria-label="Copy">Copy code</button>');
+  check(page.captureReplySource(page.rows()[0])===block(source),'native Copy survives changed classes and nesting');
+  const duplicateAction=action.cloneNode(true);
+  newActions.append(duplicateAction);
+  check(page.captureReplySource(page.rows()[0])===undefined,'two visible message actions are ambiguous');
+  duplicateAction.hidden=true;
+  check(page.captureReplySource(page.rows()[0])===block(source),'a hidden duplicate cannot shadow the visible action');
+  message.insertAdjacentHTML('beforeend','<section data-message-content><button aria-label="Copy">Embedded Copy</button></section>');
+  check(page.captureReplySource(page.rows()[0])===block(source),'a semantic answer body is not a source of Copy actions');
+  message.insertAdjacentHTML('beforeend','<div id="chat-message-other"><button aria-label="Copy">Different reply</button></div>');
+  check(page.historyReplySource(page.rows()[0])===block(source),'the Copy action must belong to exactly this reply');
+  clicks=0;
   let row = mount('Before\n\n'+block(source)+'\n\nAfter', visuallyBroken);
   check(!row.toolFrame,'the rendered fragment is not a trustworthy command');
   page.recoverToolReply(row, delivery);
@@ -107,6 +127,159 @@ try {
   currentSource=originalMarkdown.replace('fixture.txt','different.txt');
   log.scan([user,page.rows()[0]],{...options,outgoing:true});
   check(/source/i.test(log.fault),'actual Send guard detects changed arguments with identical visible rendering');
+  const link=JSON.stringify({$harness:'tool_call',turn_id:delivery,name:'pwsh',arguments:{command:{$text:'script'}}});
+  const script='  $p = "D:\\Games\\Arena"\r\n\r\n[Console]::WriteLine($p)  ';
+  row=mount('Before\n\n'+block(link)+'\n\n'+ticks+'harness-text script\r\n'+script+'\r\n'+ticks+'\n\nAfter',visuallyBroken);
+  page.recoverToolReply(row,delivery);
+  check(row.toolSource==='\x1e'+link+'\x1escript\n'+script && row.responseText==='Before\n\nAfter',
+    'the same confirmed source retains the separate text bytes outside the display text');
+  check(page.confirmToolReply(page.rows()[0]),'the whole source is verified before handing off the argument');
+  currentSource=currentSource.replace('WriteLine','Write');
+  check(!page.confirmToolReply(page.rows()[0]),'changing only the separate text invalidates the tool proof');
+  const fenced=ticks+'harness-text script\nWrite-Output denied\n'+ticks;
+  for(const ambiguous of [
+    fenced+'\n\n'+fenced, '    '+fenced, '<table>\n'+fenced+'\n</table>', '<!--\n'+fenced+'\n-->',
+    fenced+'\u2003', ticks+'`text\n'+fenced+'\n'+ticks+'`', '<![CDATA[\n'+fenced+'\n]]>',
+    '<table data-test="/>">\n'+fenced+'\n</table>', '<table/>\n'+fenced,
+    'ordinary\u2028'+fenced, fenced.replace('\n'+ticks,'\u2029'+ticks),
+    '<table\n>\n'+fenced+'\n</table>', ticks+'text`tail\n'+ticks+'\n'+fenced+'\n'+ticks,
+    ['- item','   '+ticks,ticks,fenced].join('\n'),
+  ]){
+    row=mount(block(link)+'\n\n'+ambiguous,visuallyBroken);
+    page.recoverToolReply(row,delivery);
+    check(row.toolSource===link,'a nested, unclosed, or ambiguous block cannot accompany a tool command');
+  }
+  const overlap=[ticks+'ordinary'+ticks[0],ticks,ticks+'json',link,ticks,ticks,fenced].join('\n');
+  row=mount(overlap,visuallyBroken);
+  page.recoverToolReply(row,delivery);
+  check(row.toolSource===link,'the JSON span cannot suppress a surrounding ordinary fence');
+  const crBody='\r  Write-Output "D:\\Temp"  ';
+  row=mount(block(link)+'\n\n'+ticks+'harness-text script\r'+crBody+'\r'+ticks,visuallyBroken);
+  page.recoverToolReply(row,delivery);
+  check(row.toolSource==='\x1e'+link+'\x1escript\n'+crBody,'CR-only delimiters keep the exact body');
+  const invalidFrame = link+'\x1escript\nWrite-Output ignored';
+  row=mount(block(invalidFrame),visuallyBroken);
+  page.recoverToolReply(row,delivery);
+  check(row.toolSource===invalidFrame && !row.toolSource.startsWith('\x1e'),'copied malformed JSON cannot mint the transport prefix');
+  const streamMarkdown = '## Stream fixture\n\nSecond part \u{1F9EA}';
+  row=mount(streamMarkdown,'<p>Fixed visible reply</p>');
+  const compareStatuses = [], debug = console.debug;
+  try {
+    console.debug = (label,status) => {
+      if (label === '[Arena Harness Bridge] Markdown comparison') compareStatuses.push(status);
+    };
+    const stream = await fetch('/api/chat/fixture/events');
+    check((await stream.text()).includes('event: batch'),'Arena can still consume its original response');
+    for (let attempt=0; attempt<100; attempt++) {
+      check(page.captureReplySource(row)===streamMarkdown,'the source event still contains the exact Copy');
+      if (compareStatuses.at(-1)==='match') break;
+      await new Promise(resolve=>setTimeout(resolve,10));
+    }
+    check(compareStatuses.at(-1)==='match','the two settled stream parts match the native Copy');
+    currentSource += '\nActual edit to the original';
+    check(page.historyReplySource(row)===currentSource,'history checks still receive Copy after an edit');
+    check(compareStatuses.at(-1)==='mismatch','edited historical Copy no longer matches the completed stream');
+    check(clipboardWrites===0,'comparison did not write the system clipboard');
+  } finally {
+    console.debug = debug;
+  }
+  const controlled = JSON.stringify({$harness:'tool_call',turn_id:delivery,name:'read',arguments:{filePath:'fixture.txt'}});
+  const toolMarkdown = 'Before\n\n'+block(controlled)+'\n\nAfter';
+  const fallback = '[Report](https://example.test/report)';
+  row=mount(fallback,'<p><a href="https://example.test/report">Report</a></p>','copy-fallback');
+  page.recoverToolReply(row,delivery);
+  check(row.responseText===fallback && !row.toolFrame,'ordinary Copy fallback retains its exact Markdown');
+  async function withStream(scenario) {
+    await (await fetch('/api/chat/fixture/events?case='+scenario)).text();
+    // Chrome consumes the original body and the observer's branch independently.
+    await new Promise(resolve=>setTimeout(resolve,50));
+    return mount(toolMarkdown,visuallyBroken,scenario);
+  }
+  row = await withStream('stream-only');
+  main.firstElementChild.querySelector('button').remove();
+  const hiddenPrior = main.firstElementChild.cloneNode(true);
+  hiddenPrior.id = 'chat-message-hidden-prior';
+  hiddenPrior.dataset.chatMessageId = 'hidden-prior';
+  hiddenPrior.hidden = true;
+  main.append(hiddenPrior);
+  page.recoverToolReply(row,delivery);
+  check(row.toolSource===controlled && row.responseText==='Before\n\nAfter',
+    'the complete stream is available with a hidden previous-chat reply after the visible one');
+  check(page.confirmToolReply(page.rows()[0]),'the stream alone can confirm the same source before publication');
+  check(page.captureReplySource(page.rows()[0])===toolMarkdown,'the exact streamed Markdown is recorded for the history check');
+  const sameTick = new ArenaBridge.Transcript([]);
+  sameTick.expect(delivery,'Read the fixture',null,receipt);
+  const combined = sameTick.scan([user,row],{...options,recoverReply:(row,id)=>page.recoverToolReply(row,id)});
+  check(combined.length===2 && combined[1].toolSource===controlled,'an echo and reply arriving together still require the exact source');
+  check(sameTick.scan([user,page.rows()[0]],options).length===0,'the same native reply cannot publish its tool again');
+  const markerParagraph = main.firstElementChild.querySelectorAll('.prose p')[1];
+  markerParagraph.style.visibility='hidden';
+  const obscured = page.rows()[0];
+  check(obscured.text===row.text && !obscured.visibleToolMarker,'only visibility of the mandatory marker changed');
+  check(!page.confirmToolReply(obscured),'a cached frame cannot replace a currently visible native marker');
+  markerParagraph.style.visibility='';
+  hiddenPrior.remove();
+
+  row = await withStream('no-op-copy');
+  main.firstElementChild.querySelector('button').onclick=()=>{};
+  page.recoverToolReply(row,delivery);
+  check(row.toolSource===controlled && page.confirmToolReply(page.rows()[0]),
+    'a visible Copy action without an immediate write cannot block an independently complete stream');
+
+  row = await withStream('conflict');
+  page.recoverToolReply(row,delivery);
+  check(row.toolSource===controlled,'the matching Copy and stream prove the original tool');
+  const conflictLog = new ArenaBridge.Transcript([user]);
+  conflictLog.waiting=true;
+  conflictLog.replyTo=conflictLog.commandDelivery=delivery;
+  const [queuedCommand] = conflictLog.scan([user,row],options);
+  currentSource=toolMarkdown.replace('fixture.txt','changed.txt');
+  check(!page.confirmToolReply(page.rows()[0]),'a late disagreement blocks the tool before publication');
+  // Use the same identifier for the downgraded publication, including after a lost acknowledgement.
+  queuedCommand.text='Arena changed or lost the original tool reply.';
+  delete queuedCommand.toolFrame;
+  delete queuedCommand.toolSource;
+  conflictLog.acknowledgeReply(queuedCommand);
+  row=mount(currentSource,visuallyBroken,'conflict');
+  check(conflictLog.scan([user,row],options).length===0 && !conflictLog.fault,
+    'a rejected command on the same redrawn row is passive history');
+  const freshPage = new ArenaPage(document);
+  row = freshPage.rows()[0];
+  freshPage.recoverToolReply(row,delivery);
+  check(!row.toolFrame && !row.toolSource && /disagree/i.test(row.responseText),
+    'a disagreement at collection yields a reason and no tool');
+
+  row = await withStream('interrupted');
+  page.recoverToolReply(row,delivery);
+  check(!row.toolFrame && !row.toolSource && /incomplete/i.test(row.responseText),
+    'a stream without finish cannot borrow authority from a visible command or Copy');
+  const interrupted = main.firstElementChild;
+  const interruptedLog = new ArenaBridge.Transcript([user]);
+  interruptedLog.waiting=true;
+  interruptedLog.replyTo=interruptedLog.commandDelivery=delivery;
+  const rejected=interruptedLog.scan([user,row],options);
+  check(rejected.length===1 && !rejected[0].toolFrame && /incomplete/i.test(rejected[0].text),
+    'the incomplete turn settles as an ordinary error without a command');
+  interruptedLog.acknowledgeReply(rejected[0]);
+  const generic = mount(toolMarkdown,visuallyBroken,'interrupted');
+  const nativeNode = main.firstElementChild, genericProse = document.createElement('div');
+  nativeNode.dataset.messageAuthorRole='assistant';
+  genericProse.className='prose';
+  genericProse.innerHTML='<pre><code class="language-json"></code></pre>';
+  genericProse.querySelector('code').textContent=controlled;
+  nativeNode.replaceChildren(genericProse);
+  const genericRow = page.rows()[0];
+  check(!generic.toolFrame && genericRow.toolFrame,'the alternate layout exposes a rendered native tool frame');
+  page.recoverToolReply(genericRow,delivery);
+  check(!genericRow.toolFrame && /incomplete/i.test(genericRow.responseText),
+    'a different layout still cannot substitute rendered JSON for an incomplete stream');
+  const nextUser={role:'user',siteId:'next-user',text:'Continue normally'};
+  const nextRow=mount('A later normal reply','<p>A later normal reply</p>','next-reply');
+  main.prepend(interrupted);
+  const next=interruptedLog.scan([user,page.rows()[0],nextUser,nextRow],options);
+  check(next.some(event=>event.kind==='assistant' && event.text==='A later normal reply') && !next.some(event=>event.toolFrame),
+    'the next turn is returned normally and cannot replay the incomplete command');
   document.querySelector('#out').textContent='All fixture checks passed';
 } catch(error){document.querySelector('#out').textContent=error.message;}
+})();
 </script>

@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import sqlite3
 import struct
@@ -23,6 +24,178 @@ def tool_call(turn_id, name="read", arguments=None):
                                       "arguments":{} if arguments is None else arguments}) + '\n```'
 
 class DesktopProviderTests(unittest.TestCase):
+    def test_confirmed_text_argument_preserves_script_and_returns_only_explanation(self):
+        self.db.start(dict(self.request, tools=[{"name":"pwsh"}]))
+        first = self.db.poll(self.addr, True)
+        delivery = first["id"]
+        script = '  $p = "D:\\Games\\Arena"\r\n\r\n[Console]::WriteLine($p)  \r\n'
+        source = tool_call(delivery, "pwsh", {"description":"Fixture", "command":{"$text":"script"}}).split("\n")[1]
+        self.send_raw(delivery, "\x1e"+source+"\x1escript\n"+script, text="Before.\n\nAfter.")
+        reply = self.db.status("first", "desktop-session")["reply"]
+        self.assertEqual(reply, {"kind":"tool", "name":"pwsh", "arguments":{"description":"Fixture", "command":script},
+                                 "text":"Before.\n\nAfter."})
+        self.assertIn('harness-text script', first["text"])
+        self.db.start(dict(self.request, tools=[{"name":"pwsh"}], requestId="next", text="", toolResult=json.dumps(
+            {"toolCallId":"arena_first", "failed":False, "text":"output"})))
+        self.assertIn('harness-text script', self.db.poll(self.addr, True)["text"])
+
+    def test_text_argument_rejects_missing_ambiguous_nested_and_unproven_sources(self):
+        valid = "\x1escript\nWrite-Output benign"
+        invalid = [
+            ("missing", "pwsh", {"command":{"$text":"script"}}, "", True),
+            ("empty", "pwsh", {"command":{"$text":"script"}}, "\x1escript\n", True),
+            ("wrong label", "pwsh", {"command":{"$text":"other"}}, valid, True),
+            ("no label line", "pwsh", {"command":{"$text":"script"}}, "\x1escript", True),
+            ("separator inside copied JSON fence", "pwsh", {"command":{"$text":"script"}}, valid, True),
+            ("unreferenced body", "pwsh", {"command":"Write-Output benign"}, valid, True),
+            ("wrong field", "pwsh", {"description":{"$text":"script"}, "command":"Write-Output benign"}, valid, True),
+            ("several links", "pwsh", {"description":{"$text":"script"}, "command":{"$text":"script"}}, valid, True),
+            ("nested link", "pwsh", {"description":[{"$text":"script"}], "command":{"$text":"script"}}, valid, True),
+            ("different tool", "read", {"file_path":{"$text":"script"}}, valid, True),
+            ("old turn", "pwsh", {"command":{"$text":"script"}}, valid, True),
+            ("rendered only", "pwsh", {"command":{"$text":"script"}}, valid, False),
+        ]
+        for index, (case, name, args, body, exact) in enumerate(invalid):
+            with self.subTest(case=case):
+                request = dict(self.request, requestId=f"arg-{index}", tools=[{"name":name}])
+                self.db.start(request)
+                delivery = self.db.poll(self.addr, True)["id"]
+                json_block = tool_call('a'*32 if case == "old turn" else delivery, name, args)
+                event_id = f"reply-{index}"
+                if exact:
+                    prefix = "\x1e" if body and case != "separator inside copied JSON fence" else ""
+                    self.send_raw(delivery, prefix+json_block.split("\n")[1]+body, event_id=event_id,
+                                  text="```harness-text script\nWrite-Output display-only\n```")
+                else:
+                    self.db.event(dict(self.addr, id=f"sent-{index}", kind="sent", job=delivery))
+                    self.db.event(dict(self.addr, id=event_id, kind="assistant", toolFrame=True, replyTo=delivery, text=json_block))
+                status = self.db.status(request["requestId"], request["sessionId"])
+                self.assertEqual(status["state"], "failed")
+                self.assertIsNone(self.db.poll(self.addr, True))
+
+    def test_unmarked_text_and_existing_inline_command_keep_their_meaning(self):
+        self.db.start(self.request)
+        first = self.db.poll(self.addr, True)
+        self.assertNotIn('harness-text', first["text"])
+        sample = '```harness-text script\nWrite-Output example\n```'
+        self.db.event(dict(self.addr, id="sent-example", kind="sent", job=first["id"]))
+        self.db.event(dict(self.addr, id="example", kind="assistant", text=sample, replyTo=first["id"]))
+        self.assertEqual(self.db.status("first", "desktop-session")["reply"], {"kind":"text", "text":sample})
+        self.db.start(dict(self.request, requestId="inline", tools=[{"name":"pwsh"}]))
+        delivery = self.db.poll(self.addr, True)["id"]
+        command = 'Write-Output "D:\\Games\\Arena"'
+        self.send_raw(delivery, tool_call(delivery, "pwsh", {"command":command}).split("\n")[1])
+        self.assertEqual(self.db.status("inline", "desktop-session")["reply"]["arguments"]["command"], command)
+
+    def test_read_batch_returns_one_ordered_continuation_and_rejects_replay(self):
+        self.db.start(dict(self.request, supportsReadBatch=True))
+        job = self.db.poll(self.addr, True)
+        self.assertIn('arena_read_batch', job['text'])
+        calls = [{"name":"read", "arguments":{"file_path":f"file-{i}.txt"}} for i in range(5)]
+        self.send_raw(job['id'], tool_call(job['id'], "arena_read_batch", {"calls":calls}).split("\n")[1])
+        self.assertEqual(self.db.status("first", "desktop-session")["reply"],
+                         {"kind":"tool-batch", "calls":calls, "text":"Пояснение."})
+        results = [{"toolCallId":f"arena_first_{i}", "failed":i == 1, "text":value}
+                   for i, value in enumerate(("content of one", "two was missing", "three", "four", "five"))]
+        followup = dict(self.request, requestId="complete", text="")
+        for invalid in ([results[0]], results[:-1], results[::-1], [results[0], *results[:-1]],
+                        [results[0], dict(results[1], toolCallId="arena_unrelated_1"), *results[2:]]):
+            with self.assertRaises(Problem):
+                self.db.start(dict(followup, toolResult=json.dumps({"results":invalid})))
+        with self.assertRaises(Problem):
+            self.db.start(dict(followup, toolResult=json.dumps(dict(results[0], toolCallId="arena_first"))))
+        self.assertIsNone(self.db.poll(self.addr, True))
+
+        followup["toolResult"] = json.dumps({"results":results})
+        self.assertEqual(self.db.start(followup), self.db.start(followup))
+        self.assertEqual(self.db.status("first", "desktop-session")["state"], "failed")
+        continued = self.db.poll(self.addr, True)
+        self.assertIn(followup["toolResult"], continued["text"])
+        with self.assertRaises(Problem):
+            self.db.start(dict(followup, requestId="replay"))
+
+    def test_read_batch_rejects_unavailable_call_as_a_unit(self):
+        self.db.start(dict(self.request, supportsReadBatch=True))
+        delivery = self.db.poll(self.addr, True)['id']
+        calls = [{"name":"read", "arguments":{}}, {"name":"grep", "arguments":{}}]
+        self.send_raw(delivery, tool_call(delivery, "arena_read_batch", {"calls":calls}).split("\n")[1])
+        self.assertEqual(self.db.status("first", "desktop-session")["state"], "failed")
+        self.assertEqual(self.db.pending_calls(), [])
+
+    def test_readable_batch_preserves_result_order_ids_status_and_literal_text(self):
+        self.db.start(dict(self.request, supportsReadBatch=True))
+        delivery = self.db.poll(self.addr, True)['id']
+        calls = [{"name":"read", "arguments":{"file_path":f"{i}.txt"}} for i in range(2)]
+        self.send_raw(delivery, tool_call(delivery, "arena_read_batch", {"calls":calls}).split("\n")[1])
+        body = "first line\r\n<path>literal</path> &lt;keep&gt;\\value\r\ud83d"
+        results = [{"toolCallId":"arena_first_0", "failed":False, "text":body},
+                   {"toolCallId":"arena_first_1", "failed":True, "text":"Missing file"}]
+        self.db.start(dict(self.request, requestId="next", text="", toolResult=json.dumps({"results":results}),
+                           toolResultView={}))
+        text = self.db.poll(self.addr, True)["text"]
+        expected = "first line\n<path>literal</path> &lt;keep&gt;\\value\\r\\ud83d"
+        self.assertIn("Tool arena_first_0 (ok)\n" + expected, text)
+        self.assertIn("Tool arena_first_1 (failed)\nMissing file", text)
+        self.assertLess(text.index("arena_first_0"), text.index("arena_first_1"))
+        self.assertNotIn('"results"', text)
+
+    def test_readable_shell_reports_process_exit_separately_from_tool_status(self):
+        self.db.start(dict(self.request, tools=[{"name":"pwsh"}]))
+        delivery = self.db.poll(self.addr, True)['id']
+        self.send_raw(delivery, tool_call(delivery, "pwsh").split("\n")[1])
+        raw = json.dumps({"toolCallId":"arena_first", "failed":False,
+                          "text":"out\r\n[stderr]\r\nerr\r\n[exit code: 3221226505]"})
+        request = dict(self.request, requestId="next", text="", toolResult=raw)
+        args = dict(request, toolResultView={"process":{"exitCode":3221226505, "signal":None, "timedOut":False}})
+        self.assertEqual(self.db.start(args), self.db.start(request))
+        text = self.db.poll(self.addr, True)["text"]
+        self.assertIn("Tool arena_first (ok)\nProcess exit code: 3221226505\nout\n[stderr]\nerr", text)
+        self.assertEqual(text.count("3221226505"), 1)
+        # A prior companion accepted this exact request with the view still in its digest.
+        legacy = {key:value for key,value in args.items() if key != "supportsReadBatch"}
+        fingerprint = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
+        with self.db.sql:
+            self.db.sql.execute("UPDATE requests SET fingerprint=? WHERE id='next'", (fingerprint,))
+        self.assertEqual(self.db.start(args), {"id":"next"})
+
+    def test_read_batch_cannot_be_picked_up_after_reconnect_new_browser_turn_or_cancel(self):
+        actions = {
+            "reconnect": lambda db, addr: db.bind(addr['chat'], addr['tab']),
+            "browser turn": lambda db, addr: db.event(dict(addr, id="new-turn", kind="user", text="New browser turn")),
+            "cancel": lambda db, _addr: db.cancel("first", "desktop-session"),
+        }
+        for name, action in actions.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory(dir=self.root) as folder:
+                db = DesktopJournal(Path(folder) / "isolated.db", Path(folder))
+                try:
+                    db.pair_owner("desktop-session")
+                    addr = dict(self.addr, binding=db.bind(self.addr['chat'], self.addr['tab']))
+                    db.start(dict(self.request, supportsReadBatch=True))
+                    delivery = db.poll(addr, True)['id']
+                    calls = [{"name":"read", "arguments":{"file_path":f"{i}.txt"}} for i in range(2)]
+                    source = tool_call(delivery, "arena_read_batch", {"calls":calls}).split("\n")[1]
+                    db.event(dict(addr, id="sent", kind="sent", job=delivery))
+                    db.event(dict(self.raw_reply(delivery, source), **addr))
+                    self.assertEqual(db.status("first", "desktop-session")["state"], "done")
+                    action(db, addr)
+                    self.assertEqual(db.status("first", "desktop-session")["state"], "failed")
+                    self.assertEqual(json.loads(db.lookup("first", "desktop-session")["reply"])["calls"], calls)
+                finally:
+                    db.close()
+
+    def test_enabling_read_batch_preserves_the_recorded_catalog_of_an_existing_request(self):
+        # Leave room for the legacy catalog, with less than another catalog entry available.
+        legacy = dict(self.request, text="a" * 178798)
+        old_request = self.db.start(legacy)
+        upgraded = dict(legacy, supportsReadBatch=True)
+        self.assertEqual(self.db.start(upgraded), old_request)
+        with self.assertRaisesRegex(Problem, "reused with different content"):
+            self.db.start(dict(upgraded, text="Different request"))
+        delivery = self.db.poll(self.addr, True)
+        self.assertNotIn("arena_read_batch", delivery["text"])
+        self.send_raw(delivery["id"], tool_call(delivery["id"]).split("\n")[1])
+        self.assertEqual(self.db.status("first", "desktop-session")["reply"]["kind"], "tool")
+
     def test_changed_transcript_retires_a_browser_started_turn(self):
         self.db.event(dict(self.addr, id="browser-user", kind="user", text="Started in Chrome"))
         self.db.event(dict(self.addr, id="source-fault", kind="blocked", transcriptChanged=True, text="Source changed"))

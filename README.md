@@ -4,7 +4,7 @@
 
 Arena Harness Bridge connects an Arena Agent Mode browser chat to the standard DeepSeek Harness Desktop app. Type in Desktop and get Arena’s replies there.
 
-**Проверено на Windows с Chrome и DeepSeek Harness Desktop 0.2.2-rc.5.** [Последний релиз и ZIP для Windows](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest) · [Инструкция на русском](INSTALL.md) · [English installation guide](INSTALL.en.md)
+**Проверено на Windows с Chrome и DeepSeek Harness Desktop 0.2.2-rc.5 и 0.2.3-alpha.2.** [Последний релиз и ZIP для Windows](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest) · [Инструкция на русском](INSTALL.md) · [English installation guide](INSTALL.en.md)
 
 ## Возможности
 
@@ -42,7 +42,7 @@ python -m arena_terminal --root 'C:\путь\к\проекту'
 Для сборки нужны Python и npm. Архив появится в `dist/`.
 
 ```powershell
-python scripts/build_windows_release.py --version 0.1.3
+python scripts/build_windows_release.py --version 0.1.4
 python -m unittest test_arena_desktop test_arena_terminal test_windows_release
 node --test browser-extension/tests/*.test.cjs
 ```

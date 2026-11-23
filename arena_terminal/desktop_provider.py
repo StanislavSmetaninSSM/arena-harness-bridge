@@ -17,6 +17,8 @@ from .transport import Endpoint, ExtensionHandler
 
 
 TOOL_RESULT_HEADER = "DeepSeek Harness tool result:"
+READ_BATCH = "arena_read_batch"
+READ_BATCH_TOOLS = {"read", "glob", "grep"}
 DESKTOP_CANCELLED = "Desktop cancelled this request"
 DESKTOP_TOOL_HANDOFF = (
     "For local Windows work, put the tool request in your visible reply for Desktop. "
@@ -24,6 +26,14 @@ DESKTOP_TOOL_HANDOFF = (
     + TOOL_REPLY_GUIDANCE
     + " End the reply after issuing the request. Desktop executes it and returns the result in the next message."
 )
+TEXT_ARGUMENTS = {"pwsh": "command"}
+TEXT_ARGUMENT_GUIDANCE = (
+    'For a multiline pwsh script, use "command":{"$text":"script"} in the same JSON tool call. '
+    'In the same reply add one top-level fenced block opening with ```harness-text script and closing with ```. '
+    'Put the actual script between those lines with normal newlines, quotes, and backslashes. '
+    'Desktop inserts that text as the native command string. For a short one-line command, use a normal JSON command string.'
+)
+TEXT_BLOCK_NAME = r"[A-Za-z][A-Za-z0-9_-]{0,31}"
 PLAN_ACTIVE = (
     "DeepSeek Harness plan mode: ACTIVE. Use only read-only inspection. Do not modify files or settings, "
     "commit, or implement the task. Ask the user only about decisions that inspection cannot resolve. "
@@ -39,6 +49,143 @@ PLAN_INACTIVE = (
     "DeepSeek Harness plan mode: INACTIVE. This supersedes earlier plan-mode instructions. "
     "Proceed with the user's task under the current Desktop permissions."
 )
+
+
+def desktop_handoff(names):
+    if any(name in TEXT_ARGUMENTS for name in names):
+        return DESKTOP_TOOL_HANDOFF + "\n" + TEXT_ARGUMENT_GUIDANCE
+    return DESKTOP_TOOL_HANDOFF
+
+
+def bind_argument_text(frame, block):
+    """Bind a reserved reference to one body recovered from the exact browser source."""
+    arguments = frame["arguments"]
+    field = TEXT_ARGUMENTS.get(frame["name"])
+    value = arguments.get(field)
+    references = []
+    pending = [arguments]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            if set(item) == {"$text"} or item is value and "$text" in item:
+                references.append(item)
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    if not references and block is None:
+        return
+    if block is None or len(references) != 1 or references[0] is not value:
+        raise InvalidToolSource("A text argument requires a confirmed original reply and an allowed tool field.")
+    name = value["$text"]
+    if set(value) != {"$text"} or not isinstance(name, str) or not re.fullmatch(TEXT_BLOCK_NAME, name):
+        raise InvalidToolSource("Invalid text argument reference in the Arena tool call.")
+    label, line_break, body = block.partition("\n")
+    if label != name or not line_break or not body.strip():
+        raise InvalidToolSource("Expected one nonempty top-level harness-text block matching the tool argument reference.")
+    arguments[field] = body
+
+
+def desktop_tools(tools, supports_read_batch):
+    # This entry describes a bridge operation, never a native Harness tool.
+    tools = [tool for tool in tools if tool["name"] != READ_BATCH]
+    names = sorted(READ_BATCH_TOOLS.intersection(tool["name"] for tool in tools))
+    if supports_read_batch is not True or not names:
+        return tools
+    return [*tools, {
+        "name": READ_BATCH,
+        "description": (
+            "Send two or more independent text inspection calls together using this name in one tool_call "
+            "with the current turn_id. Use each tool's native arguments. Use single requests when one "
+            "call needs a previous result. Desktop returns all results in one message in call order "
+            "with a distinct tool call ID, status and output for each call."
+        ),
+        "parameters": {"type":"object", "required":["calls"], "additionalProperties":False, "properties":{
+            "calls":{"type":"array", "minItems":2, "items":{
+                "type":"object", "required":["name", "arguments"], "additionalProperties":False,
+                "properties":{"name":{"enum":names}, "arguments":{"type":"object"}},
+            }},
+        }},
+    }]
+
+
+def read_batch_reply(frame, names):
+    arguments = frame["arguments"]
+    calls = arguments.get("calls")
+    if (set(arguments) != {"calls"} or not isinstance(calls, list) or len(calls) < 2
+            or not all(isinstance(call, dict) and set(call) == {"name", "arguments"}
+                       and isinstance(call["name"], str) and call["name"] in READ_BATCH_TOOLS
+                       and call["name"] in names and isinstance(call["arguments"], dict) for call in calls)):
+        raise InvalidToolSource("Arena sent an invalid read batch. No tool in the batch was run.")
+    reply = {"kind":"tool-batch", "calls":calls}
+    if "text" in frame:
+        reply["text"] = frame["text"]
+    return reply
+
+
+def result_origin(data):
+    """Validate the grouped result shape before consulting the original request."""
+    if isinstance(data, dict) and set(data) == {"results"}:
+        results = data["results"]
+        if (not isinstance(results, list) or len(results) < 2
+                or not all(isinstance(row, dict) and set(row) == {"toolCallId", "failed", "text"}
+                           and isinstance(row["toolCallId"], str) and isinstance(row["failed"], bool)
+                           and isinstance(row["text"], str) for row in results)):
+            raise Problem("Expected one native result for each call in the Arena read batch")
+        prefix, _, _ = results[0]["toolCallId"].rpartition("_")
+        if not prefix.startswith("arena_") or not all(
+                row["toolCallId"] == f"{prefix}_{index}" for index, row in enumerate(results)):
+            raise Problem("Arena read batch contains mismatched native call IDs")
+        return prefix[len("arena_"):], len(results)
+    tool_id = data.get("toolCallId") if isinstance(data, dict) else None
+    if not isinstance(tool_id, str) or not tool_id.startswith("arena_"):
+        raise Problem("Native tool result is missing its original call ID")
+    return tool_id[len("arena_"):], None
+
+
+def readable_result(data, view):
+    """Render a validated Desktop result for Arena, preserving the original data for routing."""
+    if not isinstance(view, dict) or set(view) not in (set(), {"process"}, {"image"}):
+        raise Problem("Invalid Desktop result presentation")
+    rows = data["results"] if set(data) == {"results"} else [data]
+    if len(rows) != 1 and view:
+        raise Problem("Expected only text results in an Arena read batch")
+    parts = []
+    for row in rows:
+        if not isinstance(row.get("text"), str) or not isinstance(row.get("failed"), bool):
+            raise Problem("Invalid Desktop result text or status")
+        status = "failed" if row["failed"] else "ok"
+        lines = [f"Tool {row['toolCallId']} ({status})"]
+        output = row["text"].replace("\r\n", "\n")
+        if "process" in view:
+            process = view["process"]
+            if (not isinstance(process, dict) or set(process) != {"exitCode", "signal", "timedOut"}
+                    or type(process["exitCode"]) not in (int, type(None))
+                    or type(process["signal"]) not in (str, type(None))
+                    or not isinstance(process["timedOut"], bool) or row["failed"]):
+                raise Problem("Invalid PowerShell process status")
+            code, signal = process["exitCode"], process["signal"]
+            if signal:
+                lines.append(f"Process signal: {signal}")
+                output = output.removesuffix(f"\n[killed by signal: {signal}]")
+            if code is not None:
+                lines.append(f"Process exit code: {code}")
+                if code != 0 and not signal:
+                    output = output.removesuffix(f"\n[exit code: {code}]")
+            if process["timedOut"]:
+                lines.append("Process timed out")
+        if "image" in view:
+            output = view["image"]
+            if not isinstance(output, str) or not 0 < len(output) <= 512 or row["failed"]:
+                raise Problem("Invalid Desktop image caption")
+        parts.append("\n".join([*lines, output]))
+    # Browser editors normalize carriage returns, and SQLite requires Unicode scalars.
+    # Retain lone control characters and split UTF-16 pairs as visible escapes.
+    return "\n\n".join(parts).replace("\r", "\\r").encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def request_fingerprint(request, omit=()):
+    content = {key:value for key, value in request.items() if key not in omit}
+    return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 
 def desktop_pngs(request):
@@ -180,16 +327,12 @@ class DesktopJournal(Journal):
         plan_mode = request.get("planMode")
         if "planMode" in request and not isinstance(plan_mode, bool):
             raise Problem("Expected Desktop plan mode as a boolean")
-        if result:
-            text = TOOL_RESULT_HEADER + "\n" + result + ("\n\n" + text if text else "")
         images = desktop_pngs(request)
-        if not text and images:
-            text = "Review the attached image." if len(images) == 1 else "Review the attached images."
-        if not text.strip() or len(text) > 180000:
-            raise Problem("Expected a message of at most 180000 characters")
         tools = request.get("tools", [])
         if not isinstance(tools, list) or not all(isinstance(t,dict) and isinstance(t.get("name"),str) for t in tools):
             raise Problem("Invalid active Desktop tool catalog")
+        tools = desktop_tools(tools, request.get("supportsReadBatch"))
+        handoff = desktop_handoff(tool["name"] for tool in tools)
         schema = json.dumps(tools, separators=(",",":"), sort_keys=True, ensure_ascii=False)
         skills = request.get("skills", [])
         if not isinstance(skills,list) or not all(isinstance(s,dict) and isinstance(s.get("name"),str)
@@ -201,13 +344,10 @@ class DesktopJournal(Journal):
                    "Use Desktop tools for local project or computer operations, and ask_user_question for "
                    "questions to the Desktop user when available. Native tool catalog: " + schema
                    + "\nAvailable skills: " + json.dumps(skill_list,ensure_ascii=False))
-        if result:
-            text = text.replace(TOOL_RESULT_HEADER, TOOL_RESULT_HEADER + " " + DESKTOP_TOOL_HANDOFF, 1)
-        elif tools:
-            text += "\n\n" + DESKTOP_TOOL_HANDOFF
-        if len(text) + (0 if result else len(context)) > 180000:
-            raise Problem("Message and native tool instructions exceed the bridge text limit")
-        fingerprint = hashlib.sha256(json.dumps(request,sort_keys=True).encode()).hexdigest()
+        # Capability negotiation affects the initial catalog only. Replaying a
+        # previously admitted request must retain its original catalog and ID.
+        presentation = request.get("toolResultView")
+        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView"))
         with self.lock, self.sql:
             owner = self.one("SELECT id FROM desktop_session")
             if not owner or owner["id"] != session:
@@ -218,7 +358,11 @@ class DesktopJournal(Journal):
             browser_turn = self.one("SELECT COALESCE(MAX(rowid),0) AS n FROM events WHERE kind='user'")["n"]
             old = self.one("SELECT * FROM requests WHERE id=?", (rid,))
             if old:
-                if old["session"] != session or old["fingerprint"] != fingerprint:
+                # Older companions may have included a presentation or capability hint in the digest.
+                if old["session"] != session or (old["fingerprint"] != fingerprint and not any(
+                    old["fingerprint"] == request_fingerprint(request, omitted)
+                    for omitted in ((), ("supportsReadBatch",), ("toolResultView",))
+                )):
                     raise Problem("Desktop request ID reused with different content")
                 route = self.one("SELECT binding FROM request_context WHERE id=?", (rid,))
                 if not route or route["binding"] != binding["id"]:
@@ -229,15 +373,28 @@ class DesktopJournal(Journal):
             selection = None
             if result is not None:
                 tool_data = json.loads(result)
-                tool_id = tool_data.get("toolCallId") if isinstance(tool_data,dict) else None
-                if not isinstance(tool_id,str) or not tool_id.startswith("arena_"):
-                    raise Problem("Native tool result is missing its original call ID")
-                origin = tool_id[len("arena_"):]
+                origin, batch_count = result_origin(tool_data)
                 prior = self.lookup(origin,session)
+                reply = json.loads(prior["reply"]) if prior["reply"] else {}
                 route = self.one("SELECT binding,browser_turn FROM request_context WHERE id=?", (origin,))
                 if (not route or route["binding"] != binding["id"] or route["browser_turn"] != browser_turn
-                        or not prior["reply"] or json.loads(prior["reply"]).get("kind") not in ("tool", "image-choice")):
+                        or prior["error"] or not reply):
                     raise Problem("The browser conversation changed before this tool result. Inspect the original result in Desktop.")
+                if batch_count is not None:
+                    if reply["kind"] != "tool-batch" or len(reply["calls"]) != batch_count or images or request.get("text"):
+                        raise Problem("The native results do not match the original Arena read batch")
+                elif reply["kind"] not in ("tool", "image-choice"):
+                    raise Problem("The native result does not match the original Arena tool request")
+                if presentation is not None:
+                    if isinstance(presentation, dict) and (
+                        ("process" in presentation and reply.get("name") != "pwsh") or
+                        ("image" in presentation and (reply.get("name") != "read_image" or len(images) != 1))
+                    ):
+                        raise Problem("Desktop result presentation does not match the original tool")
+                    rendered_result = readable_result(tool_data, presentation)
+                else:
+                    rendered_result = result
+                text = TOOL_RESULT_HEADER + " " + handoff + "\n" + rendered_result + ("\n\n" + text if text else "")
                 if self.one("SELECT id FROM request_context WHERE origin=?", (origin,)):
                     raise Problem("This native tool result already has a delivery")
                 prior_job = prior["job"]
@@ -248,6 +405,15 @@ class DesktopJournal(Journal):
                     if images or request.get("text"):
                         raise Problem("A native Arena answer must contain only the Desktop selection")
                     selection = selected_option(json.loads(site["card"]), tool_data)
+            else:
+                if not text and images:
+                    text = "Review the attached image." if len(images) == 1 else "Review the attached images."
+                if not text.strip():
+                    raise Problem("Expected a message of at most 180000 characters")
+                if tools:
+                    text += "\n\n" + handoff
+            if len(text) + (0 if result else len(context)) > 180000:
+                raise Problem("Message and native tool instructions exceed the bridge text limit")
             if selection is None and plan_mode is not None:
                 text += "\n\n" + (PLAN_ACTIVE if plan_mode else PLAN_INACTIVE)
                 catalog_chars = 0 if result else len(context) + 2
@@ -292,7 +458,7 @@ class DesktopJournal(Journal):
         self.sql.execute("""UPDATE requests SET error=? WHERE error IS NULL
                             AND id IN (SELECT c.id FROM request_context c WHERE c.binding=?)
                             AND (reply IS NULL OR (
-                                 json_extract(reply,'$.kind') IN ('tool','image-choice')
+                                 json_extract(reply,'$.kind') IN ('tool','tool-batch','image-choice')
                                  AND NOT EXISTS (SELECT 1 FROM request_context WHERE origin=requests.id)))""",
                          (reason, binding))
 
@@ -471,22 +637,29 @@ class DesktopJournal(Journal):
         reply = {"kind":"text","text":text}
         # Clicking a site's answer option never sends the job's delivery marker to the model.
         names = json.loads(request["names"])
+        block = None
         if tool_source is not None:
             if request["site_choice"]:
                 raise InvalidToolSource("An Arena selection cannot authorize a local tool command.")
-            frame = source_tool_frame(tool_source, delivery, names)
+            command = tool_source
+            if tool_source.startswith("\x1e"):
+                command, separator, block = tool_source[1:].partition("\x1e")
+                if not separator:
+                    raise InvalidToolSource("Invalid browser transport for a text argument.")
+            frame = source_tool_frame(command, delivery, names)
             if text.strip():
                 frame["text"] = text
         else:
             frame = None if request["site_choice"] else tool_frame(text, delivery, names)
         if frame:
-            reply = {"kind":"tool", **frame}
+            bind_argument_text(frame, block)
+            reply = read_batch_reply(frame, names) if frame["name"] == READ_BATCH else {"kind":"tool", **frame}
         self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (job,))
         self.sql.execute("UPDATE requests SET reply=? WHERE id=?", (json.dumps(reply),request["id"]))
 
     def retry_tool_reply(self, job, diagnostic):
         # The event transaction already owns the lock. Keep the rejection and new delivery atomic.
-        request = self.one("""SELECT r.id,j.parent FROM requests r JOIN jobs j ON j.id=r.job
+        request = self.one("""SELECT r.id,r.names,j.parent FROM requests r JOIN jobs j ON j.id=r.job
                               JOIN request_context c ON c.id=r.id JOIN binding b ON b.id=c.binding
                               JOIN desktop_session s ON s.id=r.session
                               WHERE j.id=? AND j.state='waiting' AND r.reply IS NULL AND r.error IS NULL
@@ -498,7 +671,7 @@ class DesktopJournal(Journal):
             return False
         prompt = (diagnostic + " Reissue the single intended tool call as valid JSON. "
                   "Use the fresh ID on the final Bridge delivery line. Keep the current task and plan mode. "
-                  "Return one command and wait for its result.\n\n" + DESKTOP_TOOL_HANDOFF)
+                  "Return one command and wait for its result.\n\n" + desktop_handoff(json.loads(request["names"])))
         retry = self._insert_job(prompt, None, request["parent"], "queued")
         self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (job,))
         self.sql.execute("UPDATE requests SET job=? WHERE id=?", (retry, request["id"]))
@@ -521,6 +694,13 @@ class DesktopJournal(Journal):
                 return {"state":"failed","error":r["error"]}
             if r["reply"]:
                 reply = json.loads(r["reply"])
+                if reply["kind"] == "tool-batch" and not self.one("""
+                    SELECT 1 FROM request_context c JOIN binding b ON b.id=c.binding
+                    JOIN desktop_session s ON s.id=? WHERE c.id=?
+                    AND c.browser_turn=(SELECT COALESCE(MAX(rowid),0) FROM events WHERE kind='user')
+                    AND NOT EXISTS (SELECT 1 FROM request_context WHERE origin=c.id)
+                    """, (session, rid)):
+                    return {"state":"failed", "error":"Arena read batch is no longer pending in its original browser turn"}
                 if reply["kind"] == "text":
                     images = self.generated_images(r["job"])
                     if images:
@@ -541,6 +721,9 @@ class DesktopJournal(Journal):
     def cancel(self, rid, session):
         with self.lock, self.sql:
             r = self.lookup(rid, session)
+            if (r["reply"] and not r["error"] and json.loads(r["reply"])["kind"] == "tool-batch"
+                    and not self.one("SELECT 1 FROM request_context WHERE origin=?", (rid,))):
+                self.sql.execute("UPDATE requests SET error=? WHERE id=?", (DESKTOP_CANCELLED, rid))
             if not r["reply"] and not r["error"]:
                 state = self.state(r["job"])
                 # An exact, later reply may settle a confirmed ordinary send.
@@ -607,7 +790,7 @@ def serve():
                         with db.lock:
                             bound = db.one("SELECT chat FROM binding")
                         result = {"chat":bound["chat"] if bound else None, "port":8766, "supportsPngBatch":True,
-                                  "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
+                                  "supportsResultView":True, "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
                         if "sessionId" in params:
                             result["pairToken"] = pair
                     elif method == "start":

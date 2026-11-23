@@ -115,8 +115,9 @@ const ArenaBridge = (() => {
     if (delivery && rows.filter(row=>row.role==='user' && row.lastLine===echo.lastLine).length===1) return delivery;
   }
 
-  function consumedRow({role, text, siteId, domKey, toolFrame, toolSource, nativeMessage}) {
-    return {role, text, siteId, domKey, toolFrame:toolFrame === true, toolSource, nativeMessage:nativeMessage === true};
+  function consumedRow({role, text, siteId, domKey, toolFrame, toolSource, nativeMessage, nativeSourceRejected}) {
+    return {role, text, siteId, domKey, toolFrame:toolFrame === true, toolSource, nativeMessage:nativeMessage === true,
+      ...(nativeSourceRejected ? {passiveNativeHistory:true} : {})};
   }
 
   function receiptText(text, receipt) {
@@ -200,10 +201,10 @@ const ArenaBridge = (() => {
       const row = this.seen[receipt.index];
       if (event.text === receipt.text && !!event.toolFrame === receipt.command && receipt.source !== undefined)
         row.originalMarkdown = receipt.source;
-      // A published native command stays in history even if Arena redraws its controls.
-      if (event.toolFrame && row.nativeMessage && row.siteId) {
+      // A settled command stays passive in history even if Arena redraws its controls.
+      if ((event.toolFrame || receipt.command || receipt.rejected) && row.nativeMessage && row.siteId) {
         row.passiveNativeHistory = true;
-        row.publishedNativeCommand = true;
+        row.publishedNativeCommand = event.toolFrame === true;
       }
     }
 
@@ -250,7 +251,7 @@ const ArenaBridge = (() => {
     }
 
     scan(rows, { generating, media, publishNativeFinal = true, historyOnly = false,
-      captureSource, historySource, outgoing = false, identityRows = rows }) {
+      captureSource, historySource, recoverReply, outgoing = false, identityRows = rows }) {
       if (this.fault) return [];
       const latest = outgoing ? this.seen.findLastIndex(old=>old.role==='assistant') : -1;
       const ids = new Set(), duplicateIds = new Set();
@@ -280,13 +281,23 @@ const ArenaBridge = (() => {
       if (historyOnly) return [];
       const pending = this.pendingNativeCommand;
       const candidate = rows[this.seen.length];
+      let recovered;
+      const readFinal = row => {
+        if (recoverReply && row !== recovered && publishNativeFinal && !generating && row.complete &&
+            row.nativeMessage && row === rows.at(-1) && uniqueRow(identityRows,row,this.seen)) {
+          recovered = row;
+          recoverReply(row,this.commandDelivery);
+        }
+      };
       if (pending && !candidate && this.waitForVerificationRow()) return [];
       this.verificationRecovery = false;
       if (pending) {
         const field = changedField(pending, candidate, true);
         if (field)
           return this.fail('The current native command changed before publication (' + field + '). Inspect the chat and reconnect.');
-        if (!candidate.toolFrame && rows.length === this.seen.length + 1 && uniqueRow(rows,candidate,this.seen)) {
+        readFinal(candidate);
+        if (!candidate.toolFrame && !candidate.nativeSourceRejected &&
+            rows.length === this.seen.length + 1 && uniqueRow(rows,candidate,this.seen)) {
           pending.authorityMissingAt ??= Date.now();
           if (Date.now() - pending.authorityMissingAt >= 10000)
             return this.fail('The current native command did not regain visible authority before publication. Inspect the chat and reconnect.');
@@ -356,14 +367,15 @@ const ArenaBridge = (() => {
           this.expected = null;
           this.waiting = true;
         } else if (row.role === 'assistant' && this.waiting) {
+          readFinal(row);
           const allowTool = row.toolFrame === true && !!this.commandDelivery && this.replyTo === this.commandDelivery &&
             this.expectsImage !== 'explicit' && i === rows.length-1 && uniqueRow(rows,row,this.seen);
           const reportedFailure = this.expectsImage && !allowTool && imageUnavailable(row.text);
-          const result = !allowTool && !row.nativeQuestion ? media?.(i,this) : undefined;
+          const result = !allowTool && !row.nativeQuestion && !row.nativeSourceRejected ? media?.(i,this) : undefined;
           if (result === null) break;
           if (result === undefined) {
             if (generating || !row.complete || row.artifactsPending && !(row.artifact?.progressOnly && reportedFailure)) break;
-            if (this.expectsImage && !row.images?.length && !allowTool && !reportedFailure) break;
+            if (this.expectsImage && !row.images?.length && !allowTool && !reportedFailure && !row.nativeSourceRejected) break;
           } else end = result.end;
           if (row.nativeMessage && !publishNativeFinal) {
             if (allowTool) this.pendingNativeCommand = consumedRow(row);
@@ -383,8 +395,8 @@ const ArenaBridge = (() => {
           const source = !result && !images?.length && row.nativeMessage && row.complete && row.siteId &&
             !row.artifact && !row.nativeQuestion && !row.imageChoices?.length && i===rows.length-1 && uniqueRow(rows,row)
             ? captureSource?.(row) : undefined;
-          if (fields.toolFrame || typeof source === 'string' && source.length)
-            this.replyRows.set(reply,{index:i,source,text:fields.text,command:!!fields.toolFrame});
+          if (fields.toolFrame || row.nativeSourceRejected || typeof source === 'string' && source.length)
+            this.replyRows.set(reply,{index:i,source,text:fields.text,command:!!fields.toolFrame,rejected:row.nativeSourceRejected});
           output.push(reply);
           this.waiting = false;
           this.waitingJob = null;

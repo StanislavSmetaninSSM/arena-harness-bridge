@@ -362,6 +362,36 @@ const ArenaPage = (() => {
     return null;
   }
 
+  function originalTextArgument(raw, command) {
+    let opening = null, block = null;
+    const lines = /[^\r\n]*(?:\r\n|\r|\n|$)/g;
+    for (const match of raw.matchAll(lines)) {
+      if (opening && match.index < command.end && match.index+match[0].length > command.start) return;
+      if (match.index >= command.start && match.index < command.end) continue;
+      const line = match[0].replace(/(?:\r\n|\r|\n)$/,'');
+      const [,indent,fence,label] = /^( {0,3})(\x60{3,}|~{3,})(.*)$/s.exec(line) ?? [];
+      if (opening) {
+        if (fence?.startsWith(opening.fence) && !/[^ \t]/.test(label)) {
+          if (opening.name) {
+            if (block) return;
+            block = {name:opening.name,start:opening.start,end:match.index+line.length,
+              body:raw.slice(opening.body,match.index).replace(/(?:\r\n|\r|\n)$/,'')};
+          }
+          opening = null;
+        }
+      } else if (/^ {0,3}<(?:[!?]|\/?[a-z][a-z\d:-]*(?=[\s/>]|$))/i.test(line)) {
+        // A raw HTML block can contain fences that Markdown does not render as code.
+        return;
+      } else if (fence && (fence[0] !== '\x60' || !label.includes('\x60'))) {
+        // Indentation can be local to a list. A later dedent is ambiguous here.
+        if (indent) return;
+        const name = /^harness-text ([A-Za-z][A-Za-z\d_-]{0,31})[ \t]*$/.exec(label)?.[1];
+        opening = {fence,name,start:match.index,body:match.index+match[0].length};
+      }
+    }
+    if (!opening?.name) return block;
+  }
+
   function originalToolReply(raw) {
     const candidates = [];
     function addFence(fence, close, end) {
@@ -414,8 +444,18 @@ const ArenaPage = (() => {
     }
     if (opening) addFence(opening,raw.length,raw.length);
     if (!candidates.length) return {toolFrame:false,responseText:raw};
+    const command = candidates[0];
+    let block;
+    if (candidates.length === 1) {
+      try {
+        const args = JSON.parse(command.source).arguments;
+        if (args && Object.values(args).some(value => value && typeof value === 'object' && Object.hasOwn(value,'$text')))
+          block = originalTextArgument(raw,command);
+      } catch { /* Strict JSON validation belongs to the companion. */ }
+    }
+    const spans = block ? [command,block].sort((a,b)=>a.start-b.start) : candidates;
     let plain = [], end = 0;
-    for (const candidate of candidates) {
+    for (const candidate of spans) {
       plain.push(raw.slice(end,candidate.start).trim());
       end = candidate.end;
     }
@@ -424,24 +464,34 @@ const ArenaPage = (() => {
       plain.push('Arena returned more than one marked tool command. No command was run.');
       return {toolFrame:false,responseText:plain.filter(Boolean).join('\n\n')};
     }
-    return {toolFrame:true,toolSource:candidates[0].source,responseText:plain.filter(Boolean).join('\n\n')};
+    // Copied command candidates start with '{'. Only the extension can add the leading separator.
+    const source = block ? `\x1e${command.source}\x1e${block.name}\n${block.body}` : command.source;
+    return {toolFrame:true,toolSource:source,responseText:plain.filter(Boolean).join('\n\n')};
   }
 
-  function copiedReply(node, action = 'arena-harness-read-reply') {
+  function readReply(node, action = 'arena-harness-read-reply') {
     const nonce = crypto.randomUUID();
-    let source;
+    let result;
+    let received = false;
     const receive = event => {
       if (event.target !== node || typeof event.detail !== 'string' || event.detail.length > 1080200) return;
       try {
         const reply = JSON.parse(event.detail);
-        if (reply.nonce === nonce && typeof reply.source === 'string' && reply.source.length <= 180000)
-          source = reply.source;
+        if (reply.nonce !== nonce) return;
+        if (received) { result = {status:'conflict'}; return; }
+        received = true;
+        if (typeof reply.source === 'string' && reply.source.length <= 180000 &&
+            (reply.origin === 'stream' || reply.origin === 'copy')) {
+          result = {source:reply.source,origin:reply.origin};
+        } else if (reply.status === 'conflict' || reply.status === 'incomplete') {
+          result = {status:reply.status};
+        }
       } catch {}
     };
     node.addEventListener('arena-harness-reply-source',receive);
     try { node.dispatchEvent(new CustomEvent(action,{detail:nonce,bubbles:true})); }
     finally { node.removeEventListener('arena-harness-reply-source',receive); }
-    return source;
+    return result;
   }
 
   function emptyNativeReply(node, successor, root) {
@@ -474,23 +524,37 @@ const ArenaPage = (() => {
 
     recoverToolReply(row, delivery) {
       const node = this.replyNodes.get(row);
-      if (!node || !row.complete || !/^[a-f\d]{32}$/.test(delivery || '') ||
-          !row.visibleToolMarker) return;
+      if (!row.complete) return;
       const previous = this.originalReplies.get(node);
-      if (previous?.text === row.text) return;
-      const raw = copiedReply(node);
-      if (raw === undefined) return;
+      const canReadTool = (row.visibleToolMarker || row.toolFrame) && /^[a-f\d]{32}$/.test(delivery || '');
+      // Keep the same proof on the unchanged row. Publication independently
+      // rechecks every possible command before sending it to Harness.
+      if (previous && previous.siteId === row.siteId && previous.text === row.text && previous.delivery === delivery) return;
+      const evidence = node && readReply(node);
+      const raw = evidence?.source;
+      let reply;
+      if (evidence?.status === 'conflict' && canReadTool) {
+        reply = {toolFrame:false,toolSource:undefined,nativeSourceRejected:true,
+          responseText:'Arena’s streamed reply and its original source disagree. No command was run.'};
+      } else if (raw === undefined && canReadTool) {
+        const reason = evidence?.status === 'incomplete' ? 'Arena’s response stream was incomplete.'
+          : 'Arena’s original tool reply is unavailable.';
+        reply = {toolFrame:false,toolSource:undefined,nativeSourceRejected:true,responseText:reason+' No command was run.'};
+      } else if (raw !== undefined) {
+        reply = canReadTool ? originalToolReply(raw) : {toolFrame:false,responseText:raw};
+      } else return;
       row.copiedMarkdown = raw;
-      const reply = originalToolReply(raw);
-      this.originalReplies.set(node,{text:row.text,raw,reply});
+      if (node) this.originalReplies.set(node,{siteId:row.siteId,text:row.text,raw,reply,delivery,origin:evidence?.origin});
       Object.assign(row,reply);
     }
 
     confirmToolReply(row) {
       const node = this.replyNodes.get(row);
       const original = this.originalReplies.get(node);
-      return !!(original?.reply.toolSource && original.reply.toolSource === row.toolSource &&
-        row.visibleToolMarker && copiedReply(node) === original.raw);
+      if (!original?.reply.toolSource || original.siteId !== row.siteId || original.reply.toolSource !== row.toolSource ||
+          !row.visibleToolMarker) return false;
+      const latest = readReply(node);
+      return latest?.source === original.raw && (original.origin !== 'stream' || latest.origin === 'stream');
     }
 
     captureReplySource(row) {
@@ -498,14 +562,15 @@ const ArenaPage = (() => {
       if (!node || !row.complete || !row.text) return;
       if (row.copiedMarkdown !== undefined) return row.copiedMarkdown;
       const original = this.originalReplies.get(node);
-      if (original?.text === row.text && original.reply.toolSource && row.toolFrame && row.toolSource === original.reply.toolSource && row.visibleToolMarker)
+      if (original && original.siteId === row.siteId && original.text === row.text &&
+          original.reply.toolSource && row.toolFrame && row.toolSource === original.reply.toolSource)
         return original.raw;
-      return copiedReply(node);
+      return readReply(node)?.source;
     }
 
     historyReplySource(row) {
       const node = this.replyNodes.get(row);
-      if (node && row.complete && row.text) return copiedReply(node,'arena-harness-check-history');
+      if (node && row.complete && row.text) return readReply(node,'arena-harness-check-history')?.source;
     }
 
     rows() {
@@ -576,14 +641,16 @@ const ArenaPage = (() => {
             complete: !!(body || artifact || nativeQuestion || imageChoices.length || multipleFinalBodies && prose) && (ended ||
               node.matches('[data-message-status="complete"],[data-message-status="completed"],[data-streaming="false"],[data-status="complete"]'))
           };
-          if (nativeBodies.length && commandBodies.every(el=>nativeBodies.includes(el)) && row.role === 'assistant' &&
+          if ((row.toolFrame || nativeBodies.length && commandBodies.every(el=>nativeBodies.includes(el))) &&
+              row.role === 'assistant' &&
               node.dataset.agentTranscriptMessage === 'true' && node.id === 'chat-message-' + node.dataset.chatMessageId &&
               !nativeQuestion && !imageChoices.length && !artifact) {
             this.replyNodes.set(row,node);
-            row.visibleToolMarker = row.text.includes('"$harness"') && commandBodies.some(hasVisibleToolMarker);
+            row.visibleToolMarker = !!command || row.text.includes('"$harness"') && commandBodies.some(hasVisibleToolMarker);
           }
           const original = this.originalReplies.get(node);
-          if (original?.text === row.text && row.visibleToolMarker) Object.assign(row,original.reply);
+          if (original && original.siteId === row.siteId && original.text === row.text &&
+              (!original.reply.toolFrame || row.visibleToolMarker)) Object.assign(row,original.reply);
           return row;
         });
     }

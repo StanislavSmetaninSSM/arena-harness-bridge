@@ -6,7 +6,7 @@ import { Companion } from './companion.mjs'
 import { pairingCommand, resetCommand } from './pairing.mjs'
 
 export const name = 'arena-desktop'
-export const inject = ['llm', 'commands', 'agents', 'sessionProjections']
+export const inject = ['llm', 'commands', 'agents', 'sessionProjections', 'tools']
 
 export function apply(ctx, config = {}) {
   const packageRoot = dirname(fileURLToPath(import.meta.url))
@@ -18,7 +18,9 @@ export function apply(ctx, config = {}) {
   const env = Object.fromEntries(allowed.filter(key => process.env[key]).map(key => [key, process.env[key]]))
   const companion = new Companion({ cwd: root, command, args: ['-u','-m','arena_terminal.desktop_provider'], env: {...env, PYTHONUTF8:'1'} })
   ctx.effect(() => () => companion.close())
-  ctx.llm.registerAdapter([route], new ArenaAdapter(ctx, companion))
+  const adapter = new ArenaAdapter(ctx, companion)
+  ctx.on('tools/result', (exec, result) => { adapter.recordShellResult(exec, result) })
+  ctx.llm.registerAdapter([route], adapter)
   ctx.commands.register(pairingCommand(companion))
   ctx.commands.register(resetCommand(companion))
 }

@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { register } from '../../harness-adapter/node_modules/tsx/dist/esm/api/index.mjs'
 register({ tsconfig: fileURLToPath(new URL('../../deepseek-harness/tsconfig.json', import.meta.url)) })
 
@@ -20,10 +21,11 @@ const collect = async iterable => Array.fromAsync(iterable)
 class BrowserPeer {
   calls = []
   queued = new Map()
+  supportsResultView = true
   reply = { kind: 'text', text: 'reply from fixture' }
   async rpc(method, params = {}) {
     this.calls.push({ method, params })
-    if (method === 'setup') return {supportsPngBatch:true}
+    if (method === 'setup') return {supportsPngBatch:true,supportsResultView:this.supportsResultView}
     if (method === 'start') {
       this.queued.set(params.requestId, params)
       return { id: params.requestId }
@@ -66,6 +68,31 @@ test('an explicit tool action streams its explanation and exactly one executable
   assert.deepEqual(chunks.at(-1).reason, {kind:'tool-calls'})
 })
 
+test('a read batch rejects an unavailable or malformed member before streaming any block', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const peer = new BrowserPeer()
+  const adapter = new ArenaAdapter({}, peer, 1)
+  const valid = {name:'read', arguments:{file_path:'one.txt'}}
+  for (const invalid of [{name:'pwsh', arguments:{}}, {name:'grep', arguments:{}}, {...valid, arguments:[]}]) {
+    peer.reply = {kind:'tool-batch', calls:[valid, invalid], text:'I will inspect both.'}
+    await assert.rejects(adapter.stream(options).next(), /batch|tool/i)
+  }
+  peer.reply = {kind:'tool-batch', calls:[valid, valid], text:'I will inspect both.'}
+  const chunks = await collect(adapter.stream(options))
+  const tools = chunks.filter(chunk => chunk.block?.type === 'tool-call').map(chunk => chunk.block)
+  assert.equal(tools.length, 2)
+  assert.notEqual(tools[0].id, tools[1].id)
+  assert.deepEqual(chunks.at(-1).reason, {kind:'tool-calls'})
+  const assistant = {id:'a', role:'assistant', source:{kind:'model', provider, model}, content:tools}
+  const result = (id, index) => ({id, role:'tool', toolCallId:tools[index].id, content:[textBlock(id)]})
+  await assert.rejects(adapter.request({...options, messages:[...options.messages, assistant, result('one', 0)]}), /batch/i)
+  const request = await adapter.request({...options, messages:[...options.messages, assistant, result('two', 1), result('one', 0)]})
+  assert.deepEqual(JSON.parse(request.toolResult).results.map(row => row.text), ['one', 'two'])
+  peer.reply.calls = Array(5).fill(valid)
+  const largerBatch = await collect(adapter.stream(options))
+  assert.equal(largerBatch.filter(chunk => chunk.block?.type === 'tool-call').length, 5)
+})
+
 test('one Arena action becomes a stable native DSH tool call and the next request carries its result', async () => {
   const { ArenaAdapter } = await import('../provider.mjs')
   const peer = new BrowserPeer()
@@ -93,6 +120,54 @@ test('one Arena action becomes a stable native DSH tool call and the next reques
   assert.equal(peer.calls.length, issued)
   peer.reply = {kind:'tool',name:'unregistered',arguments:{}}
   await assert.rejects(collect(adapter.stream({...options, messages:[user('other', 'next')]})), /tool/i)
+})
+
+test('PowerShell process status belongs to its exact Harness call and session', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const peer = new BrowserPeer()
+  const tools = [{name:'pwsh'}]
+  peer.reply = {kind:'tool', name:'pwsh', arguments:{command:'exit 7'}}
+  const adapter = new ArenaAdapter({}, peer, 1)
+  const chunks = await collect(adapter.stream({...options,tools}))
+  const call = chunks.find(chunk => chunk.block?.type === 'tool-call').block
+  const result = {id:'process-result',role:'tool',toolCallId:call.id,content:[textBlock('before\r\n[exit code: 7]')]}
+  const messages = [...options.messages,{role:'assistant',source:{provider,model},content:[call]},result]
+  const exec = {name:'pwsh',callId:call.id,agent:{session:{id:options.sessionId}}}
+  const facts = {exitCode:7,signal:null,timedOut:false}
+  const foreground = {isError:false,value:{kind:'foreground',...facts}}
+  adapter.recordShellResult({...exec,agent:{session:{id:'different'}}},foreground)
+  assert.deepEqual((await adapter.request({...options,tools,messages})).toolResultView,{})
+  adapter.recordShellResult(exec,foreground)
+  const request = await adapter.request({...options,tools,messages})
+  assert.deepEqual(request.toolResultView,{process:facts})
+  assert.equal(JSON.parse(request.toolResult).text,result.content[0].text)
+  peer.reply = {kind:'text',text:'Done'}
+  peer.supportsResultView = false
+  await collect(adapter.stream({...options,tools,messages}))
+  const legacyRequest = peer.calls.findLast(call => call.method === 'start').params
+  assert.equal(legacyRequest.toolResultView,undefined)
+  assert.equal(legacyRequest.toolResult,request.toolResult)
+})
+
+test('a native image read captions the actual delivered dimensions and preserves the image', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const sharp = createRequire(import.meta.url)('sharp')
+  const png = await sharp({create:{width:12,height:8,channels:3,background:'#de262d'}}).png().toBuffer()
+  const peer = new BrowserPeer()
+  const adapter = new ArenaAdapter({get:() => ({readImage:async () => ({data:png})})},peer,1)
+  const tools = [{name:'read_image'}]
+  peer.reply = {kind:'tool', name:'read_image', arguments:{file_path:'fixture.png'}}
+  const chunks = await collect(adapter.stream({...options,tools}))
+  const call = chunks.find(chunk => chunk.block?.type === 'tool-call').block
+  const name = 'a'.repeat(119)+'😀'
+  const result = {id:'image-result',role:'tool',toolCallId:call.id,content:[textBlock('<path>native metadata</path>'),{
+    type:'image',attachment:{id:'img',mediaType:'image/png',bytes:png.length,width:12,height:8,name:name+'.png',
+      originalDimensions:{width:24,height:24}},
+  }]}
+  const messages = [...options.messages,{role:'assistant',source:{provider,model},content:[call]},result]
+  const request = await adapter.request({...options,tools,messages})
+  assert.equal(request.png,png.toString('base64'))
+  assert.deepEqual(request.toolResultView,{image:`${name} (12×8 px, original 24×24 px, coordinates ×2 x / ×3 y)`})
 })
 
 test('aborting a pending browser reply cancels the bound request and auxiliary calls send nothing', async () => {
@@ -395,13 +470,14 @@ test('forwards current DSH skill summaries and only the explicit invocation for 
   await assert.rejects(collect(adapter.stream({...options,messages,purpose:'title'})), /auxiliary/)
 })
 
-test('ordinary native DSH agent executes and approves a real project edit, then continues the same session', {timeout:15000}, async t => {
+test('native DSH executes two parallel reads before one Arena continuation and preserves edit approval', {timeout:15000}, async t => {
   const { Context } = await import('@deepseek-ai/cordis')
   const { default:Llm, createUserMessage } = await import('@deepseek-ai/dsh-llm')
   const { ArenaAdapter } = await import('../provider.mjs')
   const root = await mkdtemp(join(tmpdir(), 'arena-native-session-'))
   t.after(() => rm(root, {recursive:true, force:true}))
   await writeFile(join(root, 'item.txt'), 'before')
+  await writeFile(join(root, 'second.txt'), 'second marker')
   const ctx = new Context()
   t.after(() => ctx.fiber.dispose())
   await ctx.plugin(Llm)
@@ -422,20 +498,31 @@ test('ordinary native DSH agent executes and approves a real project edit, then 
   const peer = new BrowserPeer()
   peer.rpc = async (method, args) => {
     if (method === 'setup') {
-      pairedSession = args.sessionId
-      return { pairToken:'synthetic-integration-token', chat:null, port:0 }
+      if (args?.sessionId) pairedSession = args.sessionId
+      return { pairToken:'synthetic-integration-token', chat:null, port:0, supportsResultView:true }
     }
     assert.equal(args.sessionId, pairedSession)
     if (method === 'start') { calls.push(args); return {id:args.requestId} }
     assert.equal(method, 'status')
     let reply
-    if (calls.length === 1) reply = {kind:'tool', name:'read', arguments:{file_path:'item.txt'}}
+    if (calls.length === 1) reply = {kind:'tool-batch', calls:['item.txt','second.txt'].map(file_path => ({name:'read', arguments:{file_path}}))}
     if (calls.length === 2) reply = {kind:'tool', name:'edit', arguments:{file_path:'item.txt',old_string:'before',new_string:'after'}}
     if (calls.length === 3) reply = {kind:'text',text:'Finished the native edit'}
     return {state:'done', reply}
   }
   ctx.llm.registerAdapter([provider], new ArenaAdapter(ctx, peer))
+  const reads = []
+  const bothReading = Promise.withResolvers()
   ctx.on('tools/pre-execute', (exec, next) => exec.name === 'edit' ? {kind:'ask',reason:'Review native edit'} : next())
+  ctx.on('tools/execute', async (exec, next) => {
+    if (exec.name === 'read') {
+      reads.push(exec.arguments.file_path)
+      if (reads.length === 2) bothReading.resolve()
+      await Promise.race([bothReading.promise, delay(2000, undefined, {ref:false}).then(() => { throw Error('Reads did not overlap') })])
+    }
+    return next()
+  })
+  t.after(() => bothReading.resolve())
   ctx.on('approval/request', req => { approvals.push(req.toolName); return 'allowed-once' })
   const {agent} = await ctx.agents.create({sessionId:'native-file-session',meta:{cwd:root},agentOptions:{provider,model}})
   const { pairingCommand } = await import('../pairing.mjs')
@@ -448,7 +535,12 @@ test('ordinary native DSH agent executes and approves a real project edit, then 
   await agent.whenIdle()
   assert.equal(calls.length, 3)
   assert.equal(calls[0].text, 'Please read and edit the sample')
-  assert.match(calls[1].toolResult, /1: before/)
+  assert.equal(calls[0].supportsReadBatch, true)
+  const batch = JSON.parse(calls[1].toolResult).results
+  assert.deepEqual(batch.map(row => [row.toolCallId, row.failed]), [0,1].map(index => [`arena_${calls[0].requestId}_${index}`, false]))
+  assert.match(batch[0].text, /1: before/)
+  assert.match(batch[1].text, /1: second marker/)
+  assert.deepEqual([...reads].sort(), ['item.txt','second.txt'])
   assert.match(calls[2].toolResult, /updated successfully/)
   assert.deepEqual(approvals,['edit'])
   assert.equal(await readFile(join(root, 'item.txt'), 'utf8'), 'after')

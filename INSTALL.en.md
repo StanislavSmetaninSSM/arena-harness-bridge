@@ -2,11 +2,11 @@
 
 [Инструкция на русском](INSTALL.md)
 
-You’ll need **DeepSeek Harness Desktop**, Google Chrome, and Python. The bundle was tested on Windows with Desktop **0.2.2-rc.5** and Python 3.14. The v0.1.3 ZIP contains Desktop plugin 0.1.11 with its Python companion and Chrome extension 0.1.40. [DeepSeek Harness Desktop](https://deepseek.com/harness/) · [v0.1.3 release](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/tag/v0.1.3)
+You’ll need **DeepSeek Harness Desktop**, Google Chrome, and Python. The supported Desktop versions are **0.2.2-rc.5** and **0.2.3-alpha.2**. The v0.1.4 ZIP contains Desktop plugin 0.1.13 with its Python companion and Chrome extension 0.1.41. [DeepSeek Harness Desktop](https://deepseek.com/harness/) · [Bridge releases](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases)
 
 ## 1. Download and extract the ZIP
 
-1. Under **Assets** on the release page, download `arena-harness-bridge-v0.1.3-windows.zip`. Extract it to a folder you plan to keep, such as `C:\Tools\Arena Bridge`. Desktop stores the path to the plugin archive, and Chrome loads the extension from the extracted folder.
+1. Under **Assets** on the release page, find the Windows ZIP for the version you want, such as `arena-harness-bridge-v0.1.4-windows.zip`. Extract it to a folder you plan to keep, such as `C:\Tools\Arena Bridge`. Desktop stores the path to the plugin archive, and Chrome loads the extension from the extracted folder.
 2. Install Python and run `python --version` in PowerShell to check that it is on your PATH. The plugin installer also needs access to the npm registry to install dependencies.
 
 ## 2. Install the Desktop plugin
@@ -21,11 +21,11 @@ You’ll need **DeepSeek Harness Desktop**, Google Chrome, and Python. The bundl
 
    If the `dsh` command on your PATH belongs to that Desktop installation, you can set `$dsh = 'dsh'`.
 
-3. Print the exact Harness version and install the plugin. Set `$pluginVersion` to the version in the extracted `.tgz` filename. For the v0.1.3 bundle, it is `0.1.11`.
+3. Print the exact Harness version and install the plugin. Set `$pluginVersion` to the version in the extracted `.tgz` filename. For the v0.1.4 bundle, it is `0.1.13`.
 
    ```powershell
    & $dsh --version
-   $pluginVersion = '0.1.11'
+   $pluginVersion = '0.1.13'
    $package = (Resolve-Path -LiteralPath ".\dsh-arena-desktop-$pluginVersion.tgz").Path
    & $dsh plugin --profile desktop add $package
    ```
@@ -58,8 +58,8 @@ In Desktop, type “Reply on one line: THE BRIDGE IS WORKING.” The message sho
 ## Upgrade from a previous release
 
 1. Let the current request finish, then extract the new ZIP to a separate folder.
-2. If you’re upgrading from v0.1.0, quit Desktop completely, install `dsh-arena-desktop-0.1.11.tgz` with the command in the [plugin installation section](#2-install-the-desktop-plugin), then reopen Desktop. If you’re upgrading from v0.1.1 or v0.1.2, keep the installed 0.1.11 plugin and its archive in place.
-3. Copy the files from the new `browser-extension` folder into the folder Chrome already uses for the extension. Confirm the file replacement. In `chrome://extensions`, enable **Developer mode**, click **Reload** on the **Arena Harness Bridge** card, and check that it shows version **0.1.40**.
+2. Quit Desktop completely, install the new `.tgz` from the ZIP with the command in the [plugin installation section](#2-install-the-desktop-plugin), then reopen Desktop.
+3. Copy the files from the new `browser-extension` folder into the folder Chrome already uses for the extension. Confirm the file replacement. In `chrome://extensions`, enable **Developer mode**, click **Reload** on the **Arena Harness Bridge** card, and check that it shows version **0.1.41**.
 4. Refresh the Arena tab and run `/arena-pair` in the original Desktop session. Copy the token and bind the tab as described in steps 3–4 of the [pairing section](#3-load-the-extension-and-pair-the-chat).
 
 ## Troubleshooting

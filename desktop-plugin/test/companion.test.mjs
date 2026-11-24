@@ -51,6 +51,18 @@ test('WinError 10013 reports Windows denying access even when stderr mentions th
   } finally { await child.close() }
 })
 
+test('a second Desktop serving the same state reports the profile conflict', async () => {
+  const child = dying('RuntimeError: ARENA_DESKTOP_STATE_IN_USE')
+  try { await assert.rejects(child.rpc('setup'), /already running for this Desktop profile/) }
+  finally { await child.close() }
+})
+
+test('failure on the OS-selected port is distinguished from a busy default port', async () => {
+  const child = dying('[WinError 10013] endpoint refused. ARENA_LOOPBACK_UNAVAILABLE')
+  try { await assert.rejects(child.rpc('setup'), /could not open a local port automatically/) }
+  finally { await child.close() }
+})
+
 test('a companion that dies for another reason is not reported as a busy port', async () => {
   const child = dying("ModuleNotFoundError: No module named 'arena_terminal'")
   try { await assert.rejects(child.rpc('setup'), /^Error: Arena bridge companion disconnected/) }

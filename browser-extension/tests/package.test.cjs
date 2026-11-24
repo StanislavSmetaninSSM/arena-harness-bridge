@@ -13,7 +13,7 @@ test('Chrome can load the popup, worker and Arena-only content script', () => {
     assert.deepEqual(script.matches.sort(), ['https://arena.ai/*', 'https://www.arena.ai/*']);
   assert.deepEqual(manifest.content_scripts.filter(script=>script.world==='MAIN').flatMap(script=>script.js), ['raw-reply.js']);
   assert.equal(manifest.content_scripts.find(script=>script.world==='MAIN').run_at,'document_start');
-  assert.deepEqual(manifest.host_permissions.sort(), ['http://127.0.0.1:8766/*', 'https://arena.ai/*', 'https://www.arena.ai/*']);
+  assert.deepEqual(manifest.host_permissions.sort(), ['http://127.0.0.1/*', 'https://arena.ai/*', 'https://www.arena.ai/*']);
   for (const entry of [manifest.action.default_popup, manifest.background.service_worker, ...manifest.content_scripts.flatMap(script=>script.js)]) {
     assert.ok(fs.existsSync(path.join(root, entry)), entry);
   }

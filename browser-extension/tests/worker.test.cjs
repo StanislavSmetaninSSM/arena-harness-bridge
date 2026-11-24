@@ -3,8 +3,19 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { createHmac, randomBytes } = require('node:crypto');
 
-test('binding pins the source tab and document, keeps token in worker, and restricts skill choice to popup', async () => {
+test('a raw code authenticates port 8766 on each request while pinning the document and restricting skill choice',
+  () => exerciseBinding(8766));
+test('dynamic binding authenticates the selected loopback companion for each request and receipt retry',
+  () => exerciseBinding(59812));
+
+async function exerciseBinding(port) {
+  const secret = 'local-test-token';
+  const code = port === 8766 ? secret : `AHB1:${port}→${secret}`;
+  const base = `http://127.0.0.1:${port}/v1/`;
+  const hmac = message => createHmac('sha256', secret).update(message).digest('hex');
+  const trace = [];
   const chat = 'https://arena.ai/agent/one';
   const ext = 'chrome-extension://' + 'a'.repeat(32) + '/';
   const storage = {}, requests = [], tabMessages = [];
@@ -21,9 +32,18 @@ test('binding pins the source tab and document, keeps token in worker, and restr
       } }
   };
   const root = path.join(__dirname, '..');
-  const context = vm.createContext({ chrome, URL, crypto, AbortSignal, setTimeout, clearTimeout,
+  const context = vm.createContext({ chrome, URL, crypto, TextEncoder, AbortSignal, setTimeout, clearTimeout,
     fetch: async (url, opts) => {
       const data = JSON.parse(opts.body);
+      const record = {url, opts, data};
+      trace.push(record);
+      if (url.endsWith('/identity')) {
+        // A different instance for each request detects reuse of either the proof or the bearer.
+        const instance = randomBytes(16).toString('hex');
+        record.instance = instance;
+        const proof = hmac(`arena-proof-v1|${port}|${instance}|${data.nonce}`);
+        return {ok:true, json:async () => ({instance, proof})};
+      }
       requests.push({ url, opts, data });
       if (data.kind === 'sent' || data.kind === 'uncertain') lease=null;
       if (loseSentAck && data.kind === 'sent') { loseSentAck = false; throw Error('connection interrupted after commit'); }
@@ -43,8 +63,7 @@ test('binding pins the source tab and document, keeps token in worker, and restr
   const tab = { id:chrome.runtime.id, frameId:0, tab:{id:7}, url:chat };
   const choices = (await send(popup,{type:'targets'})).targets;
   assert.deepEqual(JSON.parse(JSON.stringify(choices || [])), [{tab:7,chat}]);
-  assert.equal((await send(popup, {type:'bind', tab:7, token:'local-test-token'})).ok, true);
-  assert.equal(requests[0].opts.headers.Authorization, 'Bearer local-test-token');
+  assert.equal((await send(popup, {type:'bind', tab:7, token:code})).ok, true);
   assert.equal(requests[0].data.tab, 7);
   assert.equal(requests[0].data.settledDelivery,settledDelivery);
   assert.equal(tabMessages.find(m=>m.type==='attach').context?.id,'ctx');
@@ -64,7 +83,7 @@ test('binding pins the source tab and document, keeps token in worker, and restr
   await send(tab,{...poll,type:'event',event:{id:'source-changed',kind:'blocked',transcriptChanged:true,text:'Changed'}});
   assert.equal(requests.at(-1).data.transcriptChanged,true);
   assert.equal((await send(tab,poll)).context?.id, 'ctx');
-  assert.equal(requests.at(-1).url, 'http://127.0.0.1:8766/v1/poll');
+  assert.equal(requests.at(-1).url, base + 'poll');
   assert.notEqual(requests.at(-1).data.supportsPngBatch, true, 'a stale content script cannot lease a batch');
   await send(tab,{...poll,supportsPngBatch:true});
   assert.equal(requests.at(-1).data.supportsPngBatch,true,'the current content script can lease a batch');
@@ -113,7 +132,7 @@ test('binding pins the source tab and document, keeps token in worker, and restr
   await send(tab,{...poll,type:'event',event:{id:'u1',kind:'user',text:'catalogue and draft',contextId:'ctx'}});
   assert.equal(requests.at(-1).data.contextId,'ctx');
   assert.equal((await send(popup,{type:'skill',tab:7,name:'sample'})).ok, true);
-  assert.equal(requests.at(-1).url, 'http://127.0.0.1:8766/v1/skill');
+  assert.equal(requests.at(-1).url, base + 'skill');
   assert.equal(requests.at(-1).data.name, 'sample');
   assert.ok(tabMessages.some(m => m.type === 'applySkill' && m.content === 'local instruction'));
   offered = {id:'job1',text:'hello'};
@@ -124,7 +143,7 @@ test('binding pins the source tab and document, keeps token in worker, and restr
     assert.equal((await send(tab,{...fileChunk,...changes})).ok,false);
   assert.equal(requests.length,readsBefore);
   assert.equal((await send(tab,fileChunk)).ok,true);
-  assert.equal(requests.at(-1).url,'http://127.0.0.1:8766/v1/file-chunk');
+  assert.equal(requests.at(-1).url,base + 'file-chunk');
   assert.deepEqual(requests.at(-1).data,{chat,binding:'bind1',tab:7,job:'job1',index:0,offset:0});
   loseSentAck = true;
   assert.equal((await send(tab,{...poll,type:'event',event:{id:'sent-original',kind:'sent',job:'job1'}})).ok,false);
@@ -134,21 +153,42 @@ test('binding pins the source tab and document, keeps token in worker, and restr
   assert.equal(retry[1][0],'busy');
   storage.link.lease='stale-offer';
   const beforeRebind=requests.length;
-  assert.equal((await send(popup,{type:'bind',tab:7,token:'local-test-token'})).ok,true);
+  assert.equal((await send(popup,{type:'bind',tab:7,token:code})).ok,true);
   assert.ok(requests[beforeRebind].url.endsWith('/bind'));
   assert.equal(requests.length,beforeRebind+1,'discard unoffered stale lease without replay');
   lease='still-offered';
-  await send(popup,{type:'bind',tab:7,token:'local-test-token'});
+  await send(popup,{type:'bind',tab:7,token:code});
   assert.equal(requests.at(-1).data.kind,'uncertain');
   assert.equal(requests.at(-1).data.job,'still-offered');
   storage.link.lease='stale-on-poll';
   await send(tab,poll);
   assert.equal(storage.link.lease,undefined,'terminal resolution clears worker lease');
-});
+  assert.ok(tabMessages.every(message => !JSON.stringify(message).includes(secret)));
+  const nonces = new Set();
+  assert.equal(trace.length, 2 * requests.length);
+  for (let index = 0; index < trace.length; index += 2) {
+    const [identity, application] = trace.slice(index, index + 2);
+    assert.equal(identity.url, base + 'identity');
+    assert.equal(identity.opts.method, 'POST');
+    assert.deepEqual(Object.keys(identity.data), ['nonce']);
+    assert.match(identity.data.nonce, /^[0-9a-f]{32}$/);
+    assert.equal(nonces.has(identity.data.nonce), false);
+    nonces.add(identity.data.nonce);
+    assert.equal(new Headers(identity.opts.headers).has('Authorization'), false);
+    assert.equal(identity.opts.cache, 'no-store');
+    assert.equal(identity.opts.redirect, 'error');
+    assert.equal(application.opts.redirect, 'error');
+    assert.ok(application.url.startsWith(base));
+    const bearer = hmac(`arena-auth-v1|${port}|${identity.instance}`);
+    assert.equal(application.opts.headers.Authorization, 'Bearer ' + bearer);
+    assert.ok(!JSON.stringify(tabMessages).includes(bearer));
+    assert.ok(!JSON.stringify([identity, application]).includes(secret));
+  }
+}
 
-function navigationFixture() {
+function navigationFixture(transport) {
   const chat='https://arena.ai/agent/one', binding='b1', pageKey='doc1', token='local';
-  const browser={id:7,url:chat,status:'complete'}, messages=[], requests=[];
+  const browser={id:7,url:chat,status:'complete'}, messages=[], requests=[], wire=[];
   const doc={chat,binding,pageKey}, sender={id:'ext',frameId:0,tab:{id:7},url:chat};
   const state={link:{chat,binding,pageKey,token,tab:7},active:doc,offer:{id:'image',text:'read_image',png:'AAAA'},lease:null};
   let receive,updated,removed;
@@ -165,8 +205,16 @@ function navigationFixture() {
       },
       onUpdated:{addListener:fn=>updated=fn},onRemoved:{addListener:fn=>removed=fn}}
   };
-  const ctx=vm.createContext({chrome,URL,crypto,AbortSignal,setTimeout:(fn,ms)=>setTimeout(fn,Math.min(20,ms)),clearTimeout,fetch:async(url,opts)=>{
-    const data=JSON.parse(opts.body);requests.push({url,data});
+  const ctx=vm.createContext({chrome,URL,crypto,TextEncoder,AbortSignal,setTimeout:(fn,ms)=>setTimeout(fn,Math.min(20,ms)),clearTimeout,fetch:async(url,opts)=>{
+    const data=JSON.parse(opts.body);
+    wire.push({url,data,opts});
+    if (transport) return transport(data);
+    if (url === 'http://127.0.0.1:8766/v1/identity') {
+      const instance = randomBytes(16).toString('hex');
+      const proof = createHmac('sha256', token).update(`arena-proof-v1|8766|${instance}|${data.nonce}`).digest('hex');
+      return {ok:true, json:async () => ({instance, proof})};
+    }
+    requests.push({url,data,opts});
     let job=null;
     if(url.endsWith('/poll') && data.ready && state.offer) {
       job=state.offer;state.offer=null;state.lease=job.id;
@@ -179,10 +227,74 @@ function navigationFixture() {
   ctx.importScripts=run;run('worker.js');
   const send=(msg,from=sender)=>new Promise(resolve=>receive({...doc,...msg},from,resolve));
   const settle=()=>send({type:'targets'},{id:'ext',url:chrome.runtime.getURL('popup.html')});
-  return {browser,doc,sender,state,messages,requests,send,
+  return {browser,doc,sender,state,messages,requests,wire,send,
     update:async(change,id=7)=>{updated(id,change,structuredClone(browser));await settle();},
     close:async()=>{removed(7);await settle();}};
 }
+
+test('malformed pairing codes cannot send requests or replace the saved binding', async () => {
+  const f = navigationFixture();
+  const popup = {id:'ext', url:'chrome-extension://ext/popup.html'};
+  const codes = [
+    'AHB1:0→secret', 'AHB1:65536→secret', 'AHB1:08765→secret', 'AHB1:8766→secret',
+    'AHB1:1e4→secret', 'AHB1:+12345→secret', 'AHB1:12345->secret',
+    'AHB1:12345→', 'AHB2:12345→secret', 'AHB1:127.0.0.2:80→secret',
+    'http://127.0.0.1:12345', 'https://example.org/', 'AHB1:12345→first→second',
+    'AHB1|12345|secret', 'AHB1:12345→first|second'
+  ];
+  for (const token of codes) {
+    assert.equal((await f.send({type:'bind', tab:7, token}, popup)).ok, false);
+    assert.equal(f.wire.length, 0, token);
+  }
+  assert.equal(f.state.link.token, 'local');
+});
+
+test('a resumed link sends only a fresh challenge and provides recovery steps for an unknown listener', async () => {
+  const secret = 'persistent-test-token';
+  for (const failure of ['wrong key', 'old nonce', 'wrong port', 'bad instance', 'uppercase proof', 'HTTP error', 'connection refused']) {
+    // Include both boundaries of the syntactically valid port range.
+    const port = failure === 'wrong key' ? 1 : 65535;
+    const f = navigationFixture(({nonce}) => {
+      if (failure === 'connection refused') throw TypeError('Failed to fetch');
+      const instance = failure === 'bad instance' ? 'broken' : 'ab'.repeat(16);
+      const key = failure === 'wrong key' ? 'another-listener' : secret;
+      const proof = createHmac('sha256', key)
+        .update(`arena-proof-v1|${failure === 'wrong port' ? 22 : port}|${instance}|${failure === 'old nonce' ? 'old' : nonce}`)
+        .digest('hex');
+      return {ok:failure !== 'HTTP error', json:async () => ({instance, proof: failure === 'uppercase proof' ? proof.toUpperCase() : proof})};
+    });
+    f.state.link.token = `AHB1:${port}→${secret}`;
+    const result = await f.send({type:'event', event:{id:'message', kind:'user', text:'private draft'}});
+    assert.equal(result.ok, false, failure);
+    assert.match(result.error, /\/arena-pair.*bind/i);
+    assert.equal(f.wire.length, 1);
+    assert.equal(f.wire[0].url, `http://127.0.0.1:${port}/v1/identity`);
+    assert.equal(new Headers(f.wire[0].opts.headers).has('Authorization'), false);
+    assert.deepEqual(Object.keys(f.wire[0].data), ['nonce']);
+    assert.doesNotMatch(JSON.stringify(f.wire), /persistent-test-token|private draft/);
+  }
+});
+
+test('a saved raw token sends only a challenge to a replacement or older listener on port 8766', async () => {
+  for (const oldServer of [false, true]) {
+    const f = navigationFixture(() => ({
+      ok:!oldServer, status:oldServer ? 404 : 200,
+      json:async () => ({instance:'aa'.repeat(16), proof:'bb'.repeat(32)})
+    }));
+    f.state.link.token = 'old-persistent-token';
+    const result = await f.send({type:'event', event:{id:'draft', kind:'user', text:'private message'}});
+    assert.equal(result.ok, false);
+    assert.equal(f.wire.length, 1);
+    const [challenge] = f.wire;
+    assert.equal(challenge.url, 'http://127.0.0.1:8766/v1/identity');
+    assert.deepEqual(Object.keys(challenge.data), ['nonce']);
+    assert.match(challenge.data.nonce, /^[0-9a-f]{32}$/);
+    assert.equal(new Headers(challenge.opts.headers).has('Authorization'), false);
+    assert.doesNotMatch(JSON.stringify(f.wire), /old-persistent-token|private message/);
+    assert.match(result.error, /update.*extension/i);
+    assert.match(result.error, /\/arena-pair.*terminal.*bind/i);
+  }
+});
 
 test('a stale same-origin sender URL accepts one delivery after the active document proves the binding',async()=>{
   const f=navigationFixture(),poll={type:'poll',ready:true};

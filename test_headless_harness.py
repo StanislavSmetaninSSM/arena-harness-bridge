@@ -2,7 +2,7 @@
 
 `dsh headless --json` runs the Harness without a window, loads desktop-plugin and
 starts arena_terminal.desktop_provider from this checkout or the packaged release. Only the Arena page is
-scripted: a thread speaks the extension's wire protocol on 127.0.0.1:8766 and plays
+scripted: a thread speaks the extension's wire protocol on its selected loopback port and plays
 prepared replies. browser-extension/ itself is covered by its own Node and Chrome tests.
 
 The suite is skipped unless ARENA_DSH_PREFIX names an npm prefix holding both packages:
@@ -15,6 +15,7 @@ The suite is skipped unless ARENA_DSH_PREFIX names an npm prefix holding both pa
 Use a Node version supported by the Harness under test. Node 24.22.3 works for both release targets. Port 8766 must be free.
 The release builder runs --release-check with the packaged plugin and treats skipped cases as failures.
 """
+import hmac
 import json
 import os
 import shutil
@@ -41,7 +42,7 @@ CHAT, TAB = "https://arena.ai/agent/headless-test", 1
 SEVERAL_COMMANDS = "Arena returned more than one marked tool command. No command was run."
 
 
-def port_is_free(patience=6):
+def port_is_free(port=PORT, patience=6):
     """Try the bind the companion will make. A companion outlives its Harness process by a moment."""
     deadline = time.monotonic() + patience
     while True:
@@ -49,7 +50,7 @@ def port_is_free(patience=6):
             if os.name != "nt":  # On Windows this option would let the probe share a busy port.
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                probe.bind(("127.0.0.1", PORT))
+                probe.bind(("127.0.0.1", port))
                 return True
             except OSError:
                 pass
@@ -77,20 +78,34 @@ def harness_environment(home, state, bridge_root, release):
 class ScriptedPage(threading.Thread):
     """Poll the companion as the extension does and answer each delivery from a prepared list."""
 
-    def __init__(self, token, binding, replies):
+    def __init__(self, token, port, binding, replies):
         super().__init__(daemon=True)
-        self.auth = "Bearer " + token
+        self.token = token
+        self.port = port
         self.address = {"chat":CHAT, "tab":TAB, "binding":binding}
         self.replies = list(replies)
         self.deliveries, self.refusals = [], []
         self.stop = threading.Event()
 
     def post(self, path, body):
-        connection = HTTPConnection("127.0.0.1", PORT, timeout=4)
+        nonce = uuid4().hex
+        identity = self.exchange("identity", {"nonce":nonce})
+        instance = identity["instance"]
+        key = self.token.encode("ascii")
+        proof = f"arena-proof-v1|{self.port}|{instance}|{nonce}".encode("ascii")
+        if not hmac.compare_digest(identity["proof"], hmac.digest(key, proof, "sha256").hex()):
+            raise AssertionError("Scripted page could not verify its companion")
+        context = f"arena-auth-v1|{self.port}|{instance}".encode("ascii")
+        credential = hmac.digest(key, context, "sha256").hex()
+        return self.exchange(path, body, credential)
+
+    def exchange(self, path, body, credential=None):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=4)
+        headers = {"Content-Type":"application/json", "Origin":"chrome-extension://" + "a" * 32}
+        if credential is not None:
+            headers["Authorization"] = "Bearer " + credential
         try:
-            connection.request("POST", "/v1/" + path, json.dumps(body).encode(),
-                               {"Content-Type":"application/json", "Origin":"chrome-extension://" + "a" * 32,
-                                "Authorization":self.auth})
+            connection.request("POST", "/v1/" + path, json.dumps(body).encode(), headers)
             response = connection.getresponse()
             data = json.load(response)
             if response.status != 200:
@@ -152,7 +167,10 @@ class HeadlessHarness(unittest.TestCase):
 
     def harness(self, task, *options):
         environment = harness_environment(self.home, self.state, self.bridge_root, RELEASE_CHECK)
-        self.assertTrue(port_is_free(), f"the previous companion still holds port {PORT}")
+        port_file = self.state / "desktop.port"
+        if port_file.is_file():
+            previous = int(port_file.read_text(encoding="ascii").strip())
+            self.assertTrue(port_is_free(previous), f"the previous test companion still holds port {previous}")
         run = subprocess.run([self.node, str(self.dsh), "headless", "--patch", str(self.patch), "--json",
                               "--approval-policy", "never", *options, task],
                              cwd=self.work, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=90)
@@ -176,7 +194,8 @@ class HeadlessHarness(unittest.TestCase):
             binding = journal.bind(CHAT, TAB)
         finally:
             journal.close()
-        self.page = ScriptedPage(token, binding, replies)
+        port = int((self.state / "desktop.port").read_text(encoding="ascii").strip())
+        self.page = ScriptedPage(token, port, binding, replies)
         self.page.start()
         return session
 
@@ -202,6 +221,19 @@ class HeadlessHarness(unittest.TestCase):
         self.assertIn("Read a.txt", request)
         self.assertIn(calls[0]["callId"], returned)
         self.assertIn(content, returned)
+
+    def test_busy_preferred_port_still_delivers_a_complete_harness_turn(self):
+        with socket.socket() as other:
+            other.bind(("127.0.0.1", PORT))
+            other.listen()
+            events, calls = self.turn("Check the connection", lambda delivery: {"text":"Fallback reached Desktop."})
+            self.assertNotEqual(self.page.port, PORT)
+            self.assertEqual(calls, [])
+            self.assertEqual(events[-1]["text"], "Fallback reached Desktop.")
+            self.assertEqual(events[-1]["reason"]["kind"], "completed")
+            other.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                other.accept()
 
     def test_two_marked_commands_in_one_reply_run_nothing_and_end_the_turn(self):
         # Current contract: one command per Arena reply. The page withholds the tool source,
@@ -230,7 +262,7 @@ class HeadlessHarness(unittest.TestCase):
 if __name__ == "__main__":
     if RELEASE_CHECK:
         result = unittest.main(argv=[sys.argv[0]], verbosity=2, exit=False).result
-        if not result.wasSuccessful() or result.skipped or result.testsRun < 3:
-            sys.exit("Release check requires all three headless scenarios to run and pass.")
+        if not result.wasSuccessful() or result.skipped or result.testsRun < 4:
+            sys.exit("Release check requires all four headless scenarios to run and pass.")
     else:
         unittest.main()

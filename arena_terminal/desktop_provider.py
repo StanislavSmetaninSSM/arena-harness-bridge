@@ -1,5 +1,7 @@
 """Private stdio companion for the DeepSeek Harness Desktop model provider."""
 import base64
+from contextlib import closing, contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -18,6 +20,7 @@ from .journal import (
 from .transport import Endpoint, ExtensionHandler
 
 
+DEFAULT_DESKTOP_PORT = 8766
 TOOL_RESULT_HEADER = "DeepSeek Harness tool result:"
 READ_BATCH = "arena_read_batch"
 READ_BATCH_TOOLS = {"read", "glob", "grep"}
@@ -272,8 +275,8 @@ class DesktopJournal(Journal):
     supports_image_choices = True
     supports_pairing_settlement = True
 
-    def __init__(self, path, root):
-        super().__init__(path, root)
+    def __init__(self, path, root, *, exclusive=False):
+        super().__init__(path, root, exclusive=exclusive)
         self.sql.executescript("""
           CREATE TABLE IF NOT EXISTS desktop_session(id TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, session TEXT, fingerprint TEXT,
@@ -984,16 +987,76 @@ class DesktopJournal(Journal):
         raise Problem("Select this skill using the native DeepSeek Harness Desktop interface")
 
 
+def bind_desktop_endpoint(preferred):
+    try:
+        return Endpoint(("127.0.0.1", preferred), ExtensionHandler)
+    except OSError as error:
+        if error.errno not in (errno.EADDRINUSE, errno.EACCES) and getattr(error, "winerror", None) not in (10048, 10013):
+            raise
+    try:
+        return Endpoint(("127.0.0.1", 0), ExtensionHandler)
+    except OSError as error:
+        raise Problem("ARENA_LOOPBACK_UNAVAILABLE: Could not bind a local Desktop port") from error
+
+
+def check_legacy_desktop_journal(path):
+    if os.name != "nt":
+        return
+    import _winapi
+
+    # Legacy companions hold this file open but can be idle between SQLite transactions.
+    # Deny write sharing to detect its SQLite handle while allowing ordinary readers.
+    share_read_delete = 0x00000001 | 0x00000004  # FILE_SHARE_READ | FILE_SHARE_DELETE
+    try:
+        handle = _winapi.CreateFile(str(path), _winapi.GENERIC_READ, share_read_delete, 0, _winapi.OPEN_EXISTING, 0, 0)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        if error.winerror == 32:  # ERROR_SHARING_VIOLATION
+            raise Problem("ARENA_DESKTOP_STATE_IN_USE: The Desktop journal is already open") from error
+        raise
+    _winapi.CloseHandle(handle)
+
+
+@contextmanager
+def desktop_endpoint(private):
+    # Opening the delivery journal recovers outstanding work. Only its serving owner may do that.
+    with closing(sqlite3.connect(private / "desktop-listener.sqlite", timeout=0)) as owner:
+        try:
+            owner.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError as error:
+            if getattr(error, "sqlite_errorname", "") == "SQLITE_BUSY" or str(error) == "database is locked":
+                raise Problem("ARENA_DESKTOP_STATE_IN_USE: Another companion owns this Desktop state") from error
+            raise
+        check_legacy_desktop_journal(private / "desktop.sqlite")
+        port_file = private / "desktop.port"
+        try:
+            saved = port_file.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, UnicodeError):
+            saved = ""
+        saved_port = int(saved) if re.fullmatch(r"[0-9]{1,5}", saved) else 0
+        preferred = saved_port if 1 <= saved_port <= 65535 else DEFAULT_DESKTOP_PORT
+        with bind_desktop_endpoint(preferred) as server:
+            actual = str(server.server_port)
+            if saved != actual:
+                temporary = private / "desktop.port.tmp"
+                temporary.write_text(actual + "\n", encoding="ascii")
+                temporary.replace(port_file)
+            yield server
+
+
 def serve():
     state = os.environ.get("ARENA_DESKTOP_STATE")
     home = Path(os.environ.get("DSH_HOME") or Path.home()/".dsh")
     private = Path(state) if state else home / "arena-bridge"
     private.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with Endpoint(("127.0.0.1",8766),ExtensionHandler) as server:
+    with desktop_endpoint(private) as server:
         pair = read_pairing(private)
-        db = DesktopJournal(private/"desktop.sqlite", private)
+        db = DesktopJournal(private/"desktop.sqlite", private, exclusive=True)
         server.journal, server.adapter = db, db
-        server.auth = ("Bearer "+pair).encode("ascii")
+        default_port = server.server_port == DEFAULT_DESKTOP_PORT
+        server.configure_pairing(pair, accept_legacy=default_port)
+        pair_code = pair if default_port else f"AHB1:{server.server_port}→{pair}"
         listener = threading.Thread(target=server.serve_forever,daemon=True)
         listener.start()
         try:
@@ -1009,11 +1072,11 @@ def serve():
                             db.pair_owner(params["sessionId"])
                         with db.lock:
                             bound = db.one("SELECT chat FROM binding")
-                        result = {"chat":bound["chat"] if bound else None, "port":8766, "supportsPngBatch":True, "supportsFiles":True,
+                        result = {"chat":bound["chat"] if bound else None, "port":server.server_port, "supportsPngBatch":True, "supportsFiles":True,
                                   "supportsResultView":True, "supportsOnDemandContext":True, "supportsToolHelp":True,
                                   "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
                         if "sessionId" in params:
-                            result["pairToken"] = pair
+                            result["pairToken"] = pair_code
                     elif method == "stageFileChunk":
                         result = db.stage_file_chunk(params)
                     elif method == "start":

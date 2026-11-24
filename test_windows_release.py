@@ -217,7 +217,7 @@ class WindowsReleaseTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(ROOT / "test_headless_harness.py"), "--release-check"],
                                 env=environment, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("skipped=3", result.stderr)
+        self.assertIn("skipped=4", result.stderr)
 
 
 if __name__ == "__main__":

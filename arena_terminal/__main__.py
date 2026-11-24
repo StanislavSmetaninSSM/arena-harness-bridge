@@ -152,7 +152,7 @@ def main():
         except BaseException:
             db.close()
             raise
-        server.auth = ("Bearer " + token).encode("ascii")
+        server.configure_pairing(token, accept_legacy=True)
         db.use_catalog(adapter.instructions())
         server.journal, server.adapter = db, adapter
         loop = ToolLoop(db, adapter)

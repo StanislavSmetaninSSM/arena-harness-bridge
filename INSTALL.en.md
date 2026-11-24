@@ -15,11 +15,11 @@ Click **Open Chrome extensions** in the wizard. If that button is unavailable, e
 ### 3. Connect your chats
 
 1. Sign in to [Arena](https://arena.ai/agent), open **Agent Mode**, and send “Hello”. Wait for the reply and refresh the tab.
-2. Open a conversation in Desktop, select the **Arena Agent Mode** model, type `/arena-pair`, and click **Copy pairing token**.
+2. Open a conversation in Desktop, select the **Arena Agent Mode** model, type `/arena-pair`, and click **Copy pairing token**. If port 8766 is busy, Desktop chooses an available port and includes it in the code.
 3. Return to the Arena tab. Open **Arena Harness Bridge** from Chrome’s extensions menu, paste the token, and click **Bind conversation**.
 4. Send “Hello” in **Desktop**. Arena’s reply will appear in that conversation.
 
-**Updating.** Quit Desktop completely and run the new installer for the same profile. If Chrome loads the extension from the wizard’s folder, click **Reload** on its extension card. If you originally installed from a ZIP, disable the old extension and add the new one as in step 2. In either case, refresh the original Arena tab. Run `/arena-pair` in the **original Desktop conversation** and bind the same Arena chat as in step 3.
+**Updating.** Quit Desktop completely and run the new installer for the same profile. Use the Chrome extension from the same release. If Chrome loads the extension from the wizard’s folder, click **Reload** on its extension card. If you originally installed from a ZIP, disable the old extension and add the new one as in step 2. Refresh the original Arena tab. Run `/arena-pair` in the **original Desktop conversation** and bind the same Arena chat as in step 3.
 
 <details>
 <summary>Manual installation from the ZIP</summary>

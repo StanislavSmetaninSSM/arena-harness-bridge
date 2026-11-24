@@ -222,11 +222,20 @@ class Journal:
     supports_native_questions = False
     supports_files = False
 
-    def __init__(self, path, root):
+    def __init__(self, path, root, *, exclusive=False):
         self.lock = threading.RLock()
         self.last_poll = None
         self.catalog = None
         self.sql = sqlite3.connect(path, check_same_thread=False)
+        if exclusive:
+            # Retain the write lock across commits until the serving Desktop closes this connection.
+            try:
+                self.sql.execute("PRAGMA locking_mode=EXCLUSIVE")
+                self.sql.execute("BEGIN EXCLUSIVE")
+                self.sql.commit()
+            except sqlite3.Error:
+                self.sql.close()
+                raise
         self.sql.row_factory = sqlite3.Row
         self.sql.executescript("""
           CREATE TABLE IF NOT EXISTS project(root TEXT PRIMARY KEY);

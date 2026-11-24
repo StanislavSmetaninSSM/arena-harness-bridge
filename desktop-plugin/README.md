@@ -2,9 +2,9 @@
 
 Плагин добавляет модель **Arena Agent Mode** и команду **Connect Arena / Подключить Arena** (`/arena-pair`). Установите его с Python-компаньоном и расширением Chrome по [инструкции Windows](../INSTALL.md).
 
-Пакет 0.1.22 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
+Пакет 0.1.23 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
 
-**English** — Plugin 0.1.22 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+**English** — Plugin 0.1.23 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
 
 Arena запрашивает справку через `arena_tool_help`. Пустой запрос показывает, какие инструменты на текущем шаге вызываются напрямую и какие доступны внутри `run_code`. Запрос `{"name":"read"}` возвращает способ вызова, параметры, сведения о результате и опубликованную Harness инструкцию. Ссылка на индивидуальную инструкцию `{"guide":"tool:read"}` открывает ту же справку. Запрос `{"sdk":true}` открывает штатный SDK. Если пришёл `nextCursor`, его передают как `cursor` с теми же аргументами. Справка о новом инструменте появляется, как только Harness допускает его к работе на этом шаге.
 
@@ -61,8 +61,7 @@ $harnessVersion = Read-Host 'Exact Harness version from --version'
 if ($LASTEXITCODE -eq 0) { & $dsh plugin --profile desktop add $package }
 ```
 
-- **WinError 10048.** Второй экземпляр моста может уже занимать порт 8766. / Check whether a second bridge instance is using port 8766.
-- **WinError 10013.** Windows запретила доступ к порту. Проверьте резервирование или ограничения Windows. / Windows denied access. Check port reservations and Windows restrictions.
+- **Сопряжение Desktop.** Если порт 8766 занят, Desktop подбирает свободный локальный порт. Обновите расширение из этого же комплекта, обновите прежнюю вкладку Arena и вставьте код из `/arena-pair` целиком. / If port 8766 is busy, Desktop selects an available local port. Update the extension from the same release, refresh the original Arena tab, and paste the entire code from `/arena-pair`.
 - **Удаление / Uninstall.** Выйдите из Desktop, удалите плагин штатной командой ниже и удалите Arena Harness Bridge в `chrome://extensions`. / Quit Desktop, remove the plugin using the command below, and remove Arena Harness Bridge in `chrome://extensions`.
 
 ```powershell

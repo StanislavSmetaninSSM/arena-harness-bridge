@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -14,6 +15,33 @@ class Endpoint(ThreadingHTTPServer):
     # On Windows SO_REUSEADDR lets a second process bind a port that is already
     # being served: it starts without an error and never receives a request.
     allow_reuse_address = os.name != "nt"
+    legacy_auth = None
+
+    def configure_pairing(self, token, *, accept_legacy):
+        self.identity = EndpointIdentity(token, self.server_port)
+        self.auth = self.identity.auth
+        self.legacy_auth = ("Bearer " + token).encode("ascii") if accept_legacy else None
+
+
+class EndpointIdentity:
+    """Prove ownership of a loopback endpoint and scope its browser credential to this process."""
+
+    def __init__(self, token, port):
+        self.key = token.encode("utf-8")
+        self.instance = secrets.token_hex(16)
+        self.port = port
+        bearer = self._mac(f"arena-auth-v1|{port}|{self.instance}")
+        self.auth = ("Bearer " + bearer).encode("ascii")
+
+    def _mac(self, message):
+        return hmac.digest(self.key, message.encode("ascii"), "sha256").hex()
+
+    def challenge(self, body):
+        nonce = body.get("nonce")
+        if set(body) != {"nonce"} or not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+            raise Problem("Expected a 32-digit lowercase hexadecimal nonce")
+        proof = self._mac(f"arena-proof-v1|{self.port}|{self.instance}|{nonce}")
+        return {"instance": self.instance, "proof": proof}
 
 
 class ExtensionHandler(BaseHTTPRequestHandler):
@@ -39,20 +67,30 @@ class ExtensionHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin is not None and not re.fullmatch("chrome-extension://[a-p]{32}", origin):
             return self.reply(403, {"error": "Extension origin required"})
-        provided = self.headers.get("Authorization", "").encode("utf-8")
-        if not hmac.compare_digest(provided, self.server.auth):
-            return self.reply(401, {"error": "Check pairing token"})
+        identity = getattr(self.server, "identity", None) if self.path == "/v1/identity" else None
+        if identity is not None:
+            if "Authorization" in self.headers:
+                return self.reply(401, {"error": "Identity requests take no authorization"})
+        else:
+            provided = self.headers.get("Authorization", "").encode("utf-8")
+            legacy = self.server.legacy_auth
+            if not hmac.compare_digest(provided, self.server.auth) and not (legacy is not None and hmac.compare_digest(provided, legacy)):
+                return self.reply(401, {"error": "Check pairing token"})
         if self.headers.get_content_type() != "application/json":
             return self.reply(415, {"error": "JSON expected"})
         try:
             size = int(self.headers.get("Content-Length", "-1"))
             # Bound image events before parsing base64 plus the optional Unicode caption.
             maximum = 13 * 1024**2 if self.path == "/v1/event" else 1_400_000
+            if identity is not None:
+                maximum = 256
             if not 1 <= size <= maximum:
                 return self.reply(413, {"error": "Invalid request size"})
             body = json.loads(self.rfile.read(size))
             if not isinstance(body, dict):
                 raise Problem("Expected an object")
+            if identity is not None:
+                return self.reply(200, identity.challenge(body))
             db = self.server.journal
             if self.path == "/v1/bind":
                 settlement = ({"settled_delivery":body.get("settledDelivery")}

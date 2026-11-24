@@ -1,13 +1,54 @@
 'use strict';
 importScripts('core.js');
 
-async function request(token, endpoint, body) {
-  const response = await fetch('http://127.0.0.1:8766/v1/' + endpoint, {
+const defaultPort = 8766;
+const reconnectBridge = 'Could not verify the local Arena bridge. Update the bridge and Chrome extension together. Get the current code from /arena-pair in Desktop or from the project terminal, then bind again.';
+
+function pairing(code) {
+  if (typeof code === 'string') {
+    if (/^[A-Za-z0-9_-]+$/.test(code)) return { port: defaultPort, secret: code };
+    const match = /^AHB1:([1-9][0-9]{0,4})→([A-Za-z0-9_-]+)$/.exec(code);
+    if (match) {
+      const port = Number(match[1]);
+      if (port <= 65535 && port !== defaultPort) return { port, secret: match[2] };
+    }
+  }
+  throw Error('Invalid pairing code. Copy the complete code from Desktop (/arena-pair) or the project terminal.');
+}
+
+function post(port, endpoint, body, bearer) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (bearer !== undefined) headers.Authorization = 'Bearer ' + bearer;
+  return fetch(`http://127.0.0.1:${port}/v1/${endpoint}`, {
     method: 'POST', credentials: 'omit', redirect: 'error', cache: 'no-store',
     referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(7000),
-    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    headers, body: JSON.stringify(body)
   });
+}
+
+const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
+
+async function verifiedBearer(port, secret) {
+  const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
+  try {
+    const response = await post(port, 'identity', { nonce });
+    if (!response.ok) throw Error();
+    const { instance, proof } = await response.json();
+    if (typeof instance !== 'string' || !/^[0-9a-f]{32}$/.test(instance) ||
+        typeof proof !== 'string' || !/^[0-9a-f]{64}$/.test(proof)) throw Error();
+    const utf8 = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', utf8.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify', 'sign']);
+    const signature = Uint8Array.from(proof.match(/../g), byte => parseInt(byte, 16));
+    const challenge = utf8.encode(`arena-proof-v1|${port}|${instance}|${nonce}`);
+    if (!await crypto.subtle.verify('HMAC', key, signature, challenge)) throw Error();
+    return hex(await crypto.subtle.sign('HMAC', key, utf8.encode(`arena-auth-v1|${port}|${instance}`)));
+  } catch { throw Error(reconnectBridge); }
+}
+
+async function request(code, endpoint, body) {
+  const { port, secret } = pairing(code);
+  const bearer = await verifiedBearer(port, secret);
+  const response = await post(port, endpoint, body, bearer);
   const result = await response.json();
   if (!response.ok) throw Error(result.error || 'Terminal returned HTTP ' + response.status);
   return result;
@@ -107,7 +148,7 @@ async function popup(message, link) {
   const tab = Number.isInteger(message.tab) && message.tab >= 0 ? await chrome.tabs.get(message.tab)
     : (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
   if (message.type === 'status') {
-    if (!link) return { status: 'Enter the pairing token from the project terminal.' };
+    if (!link) return { status: 'Paste the pairing code from Desktop (/arena-pair) or the project terminal.' };
     if (link.paused) return { status: link.chat + '\n' + link.paused };
     const page = await tabMessage(link.tab, { type: 'status', pageKey: link.pageKey });
     return { status: link.chat + '\n' + page.status };
@@ -116,7 +157,7 @@ async function popup(message, link) {
   if (!chat) throw Error('Open one saved Arena Agent Mode conversation (/agent/<id>).');
   if (message.type === 'bind') {
     if (tab.pendingUrl) throw Error(awaitingDocument);
-    if (!message.token?.trim()) throw Error('Enter the token from the terminal.');
+    if (!message.token?.trim()) throw Error('Enter the pairing code from Desktop or the project terminal.');
     const prepared = await tabMessage(tab.id, { type: 'prepare', chat });
     if (prepared.chat !== chat || !prepared.pageKey) throw Error('The Arena tab changed while pairing.');
     const token = message.token.trim();

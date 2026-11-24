@@ -40,7 +40,11 @@ export class Companion {
       if (this.child !== child) return
       this.child = null
       let message = 'Arena bridge companion disconnected. Check Python, the bridge installation path, and Connect Arena.'
-      if (/\bWinError\s+10013\b/i.test(diagnostic)) {
+      if (diagnostic.includes('ARENA_DESKTOP_STATE_IN_USE')) {
+        message = 'An Arena bridge is already running for this Desktop profile. Close the other Desktop instance and open Connect Arena again.'
+      } else if (diagnostic.includes('ARENA_LOOPBACK_UNAVAILABLE')) {
+        message = 'Arena bridge could not open a local port automatically. Check whether local connections are allowed, then open Connect Arena again.'
+      } else if (/\bWinError\s+10013\b/i.test(diagnostic)) {
         message = 'Windows denied access to port 8766 (WinError 10013). Check whether another service has reserved the port or Windows restricts its use, then open Connect Arena again.'
       } else if (/\b10048\b|EADDRINUSE|address already in use|port 8766/i.test(diagnostic)) {
         message = 'Port 8766 is busy. Stop the standalone Arena terminal or the other program using this port, then open Connect Arena again.'

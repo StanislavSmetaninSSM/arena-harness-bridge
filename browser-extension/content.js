@@ -352,7 +352,7 @@
     }
     if (state.issue && !state.issue.account) { suspend(s, state.issue); return; }
     const rows=page.rows();
-    const scanState = {...state,outgoing,verifyEcho,identityRows:rows,historySource:row=>page.historyReplySource?.(row)};
+    const scanState = {...state,outgoing,verifyEcho,identityRows:rows,historySource:(row,origin)=>page.historyReplySource?.(row,origin)};
     const oldIndex=s.log.seen.length;
     settleFinal(s,rows.slice(oldIndex).find(row=>row.role==='assistant'));
     if (s.passiveFollowupIndex===oldIndex && !s.log.waiting && !s.log.expected && rows[oldIndex]) {
@@ -507,7 +507,7 @@
             const rows = page.rows();
             const current = !s.log.fault && !s.log.expected && s.log.currentCommand(next,rows) &&
               !s.outbox.some(event => event.kind==='user' || event.kind==='sent');
-            if (next.toolSource !== undefined && (!current || !page.confirmToolReply(rows.at(-1)))) {
+            if (next.toolSource !== undefined && (!current || !page.confirmToolReply(rows.at(-1),s.log.replyRows.get(next)))) {
               // Keep the event ID so a lost acknowledgement cannot cause a second action.
               next.text = 'Arena changed or lost the original tool reply. Check the conversation before retrying.';
               delete next.toolSource;

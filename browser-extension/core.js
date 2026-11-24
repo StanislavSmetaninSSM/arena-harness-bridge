@@ -165,7 +165,11 @@ const ArenaBridge = (() => {
     const now = Date.now();
     if (!outgoing && old.missingSource?.text === row.text && now-old.missingSource.at < 700)
       return 'source unavailable';
-    const source = readSource?.(row);
+    const observed = readSource?.(row,old.sourceOrigin);
+    if (observed?.status === 'conflict') return 'original source';
+    if (observed?.status === 'incomplete') return 'source unavailable';
+    const source = old.sourceOrigin === 'stream' && observed?.status === 'unobserved'
+      ? old.originalMarkdown : observed;
     if (source === undefined) {
       if (!different) return null;
       old.missingSource = {text:row.text,at:now};
@@ -195,9 +199,13 @@ const ArenaBridge = (() => {
     }
 
     currentCommand(event,rows) {
-      const index = this.replyRows.get(event)?.index;
+      const receipt = this.replyRows.get(event);
+      const index = receipt?.index;
       if (index === undefined || rows.length !== index+1) return false;
       const row = rows[index], old = this.seen[index];
+      if (receipt.origin && receipt.command)
+        return row.complete && row.nativeMessage && row.role === 'assistant' && row.siteId === receipt.siteId &&
+          row.visibleToolMarker && uniqueRow(rows,row);
       return row.complete && !changedField(old,row) && (row.siteId || row.domKey === old.domKey) && uniqueRow(rows,row);
     }
 
@@ -210,8 +218,13 @@ const ArenaBridge = (() => {
       if (!receipt) return;
       this.replyRows.delete(event);
       const row = this.seen[receipt.index];
-      if (event.text === receipt.text && !!event.toolFrame === receipt.command && receipt.source !== undefined)
+      if (event.text === receipt.text && !!event.toolFrame === receipt.command && receipt.source !== undefined) {
         row.originalMarkdown = receipt.source;
+        row.sourceOrigin = receipt.origin;
+      } else if (receipt.origin) {
+        delete row.originalMarkdown;
+        delete row.sourceOrigin;
+      }
       // A settled command stays passive in history even if Arena redraws its controls.
       if ((event.toolFrame || receipt.command || receipt.rejected) && row.nativeMessage && row.siteId) {
         row.passiveNativeHistory = true;
@@ -305,8 +318,20 @@ const ArenaBridge = (() => {
       this.verificationRecovery = false;
       if (pending) {
         const field = changedField(pending, candidate, true);
-        if (field)
-          return this.fail('The current native command changed before publication (' + field + '). Inspect the chat and reconnect.');
+        if (field) {
+          // A rendered preview has no source yet. Let the same native reply finish
+          // rendering, then select its source under the normal publication checks.
+          const samePreview = field === 'text' && recoverReply && pending.nativeMessage && candidate?.nativeMessage &&
+            pending.siteId && pending.siteId === candidate.siteId && candidate === rows.at(-1) &&
+            uniqueRow(identityRows,candidate,this.seen);
+          if (samePreview && (generating || !publishNativeFinal || !candidate.complete)) {
+            this.pendingRows = true;
+            return [];
+          }
+          if (samePreview) readFinal(candidate);
+          if (!samePreview || !(candidate.sourceOrigin && candidate.toolFrame || candidate.nativeSourceRejected))
+            return this.fail('The current native command changed before publication (' + field + '). Inspect the chat and reconnect.');
+        }
         readFinal(candidate);
         if (!candidate.toolFrame && !candidate.nativeSourceRejected &&
             rows.length === this.seen.length + 1 && uniqueRow(rows,candidate,this.seen)) {
@@ -351,7 +376,7 @@ const ArenaBridge = (() => {
         const nativeMedia = media && this.waiting && row.role==='assistant' && row.nativeMessage &&
           (row.artifact || this.expectedImages);
         if (!row.text && !row.images?.length && !nativeUploadTurn && !nativeMedia) break;
-        let receipt, submittedSource;
+        let receipt, submittedSource, pendingProof;
         if (row.role === 'user') {
           if (this.expected?.receipt) {
             if (!uniqueRow(identityRows,row) || row.lastLine !== this.expected.receipt) {
@@ -384,6 +409,11 @@ const ArenaBridge = (() => {
           this.waiting = true;
         } else if (row.role === 'assistant' && this.waiting) {
           readFinal(row);
+          if (row.sourceIncomplete) {
+            if (this.incompleteSource?.siteId !== row.siteId)
+              this.incompleteSource = {siteId:row.siteId,since:Date.now()};
+            if (Date.now() - this.incompleteSource.since < 10000) break;
+          }
           const allowTool = row.toolFrame === true && !!this.commandDelivery && this.replyTo === this.commandDelivery &&
             this.expectsImage !== 'explicit' && i === rows.length-1 && uniqueRow(rows,row,this.seen);
           const reportedFailure = this.expectsImage && !allowTool && imageUnavailable(row.text);
@@ -412,8 +442,12 @@ const ArenaBridge = (() => {
             !row.artifact && !row.nativeQuestion && !row.imageChoices?.length && i===rows.length-1 && uniqueRow(rows,row)
             ? captureSource?.(row) : undefined;
           if (fields.toolFrame || row.nativeSourceRejected || typeof source === 'string' && source.length)
-            this.replyRows.set(reply,{index:i,source,text:fields.text,command:!!fields.toolFrame,rejected:row.nativeSourceRejected});
+            this.replyRows.set(reply,{index:i,source,origin:row.sourceOrigin,siteId:row.siteId,text:fields.text,
+              command:!!fields.toolFrame,rejected:row.nativeSourceRejected});
+          if (row.sourceOrigin && typeof source === 'string')
+            pendingProof = {originalMarkdown:source,sourceOrigin:row.sourceOrigin};
           output.push(reply);
+          this.incompleteSource = null;
           this.waiting = false;
           this.waitingJob = null;
           this.replyTo = null;
@@ -424,7 +458,7 @@ const ArenaBridge = (() => {
         } else {
           return output.concat(this.fail('Cannot pair this reply with a new user turn.'));
         }
-        this.seen.push(...rows.slice(i,end).map(consumed=>({...consumedRow(consumed),receipt,
+        this.seen.push(...rows.slice(i,end).map(consumed=>({...consumedRow(consumed),receipt,...pendingProof,
           ...(submittedSource === undefined ? {} : {originalMarkdown:submittedSource})})));
         i=end-1;
       }

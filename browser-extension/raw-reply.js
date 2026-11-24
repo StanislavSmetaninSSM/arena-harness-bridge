@@ -298,7 +298,10 @@
     const row = event.target;
     const messages = visibleReplies();
     const submitted = event.type === 'arena-harness-check-submitted';
-    const historical = submitted || event.type === 'arena-harness-check-history';
+    const streamHistory = event.type === 'arena-harness-check-stream';
+    const historical = submitted || streamHistory || event.type === 'arena-harness-check-history';
+    const streamOnly = streamHistory || event.type === 'arena-harness-confirm-stream';
+    const copyOnly = submitted || event.type === 'arena-harness-check-history' || event.type === 'arena-harness-confirm-copy';
     const path = currentChat();
     if (clickingCopy || typeof event.detail !== 'string' || !/^[a-f0-9-]{36}$/.test(event.detail) ||
         !(row instanceof HTMLElement) || !messages.includes(row) ||
@@ -309,38 +312,32 @@
     const selector = identities.map(id => '#'+id+',[data-chat-message-id="'+id+'"],[data-message-id="'+id+'"]').join(',');
     if (document.querySelectorAll(selector).length !== 1) return;
 
-    const copy = readCopy(row, submitted);
-    // Copy runs in the page. Verify the row and conversation again after the click.
+    const reply = replies.get(id);
+    const candidates = reply ? [reply.settled,...reply.streams.values()].filter(Boolean) : [];
+    const stream = candidates[0]?.text;
+    const conflict = candidates.some(proof=>proof.text === null || proof.text !== stream);
+    const incomplete = reply && (reply.pending.size || !candidates.some(proof=>proof.epoch > reply.interruptedAt));
+    let result;
+    if ((!historical || streamOnly) && conflict) result = {status:'conflict'};
+    else if ((!historical || streamOnly) && incomplete) result = {status:'incomplete'};
+    else if (!copyOnly && typeof stream === 'string') result = {source:stream,origin:'stream'};
+    else if (streamOnly) result = {status:'unobserved'};
+    else {
+      const copy = readCopy(row, submitted);
+      if (copy !== undefined) result = {source:copy,origin:'copy'};
+    }
     const latest = visibleReplies();
     if (path !== currentChat() || !row.isConnected || !latest.includes(row) ||
         !historical && row !== latest.at(-1) ||
         row.dataset.chatMessageId !== id || row.id !== 'chat-message-' + id ||
         document.querySelectorAll(selector).length !== 1) return;
-    const reply = submitted ? undefined : replies.get(id);
-    const candidates = reply ? [reply.settled,...reply.streams.values()].filter(Boolean) : [];
-    const stream = candidates[0]?.text;
-    const disagrees = candidates.some(proof=>proof.text === null || proof.text !== stream) ||
-      typeof stream === 'string' && copy !== undefined && stream !== copy;
-    const incomplete = reply && (reply.pending.size || !candidates.some(proof=>proof.epoch > reply.interruptedAt));
-    let result;
-    if (!historical && disagrees) result = {status:'conflict'};
-    else if (!historical && incomplete) result = {status:'incomplete'};
-    else if (!historical && typeof stream === 'string') result = {source:stream,origin:'stream'};
-    else if (copy !== undefined) result = {source:copy,origin:'copy'};
     if (result) {
       row.dispatchEvent(new CustomEvent('arena-harness-reply-source', {
         detail:JSON.stringify({nonce:event.detail,...result})
       }));
     }
-    if (!submitted && path && copy !== undefined) {
-      try {
-        const status = disagrees ? 'mismatch' : incomplete || !candidates.length ? 'unavailable' : 'match';
-        console.debug('[Arena Harness Bridge] Markdown comparison',status);
-      } catch {}
-    }
   }
-  document.addEventListener('arena-harness-read-reply',captureReply);
-  document.addEventListener('arena-harness-check-history',captureReply);
-  document.addEventListener('arena-harness-check-submitted',captureReply);
+  for (const action of ['read-reply','check-history','check-submitted','check-stream','confirm-stream','confirm-copy'])
+    document.addEventListener('arena-harness-'+action,captureReply);
   try { observeFetch(); } catch {}
 })();

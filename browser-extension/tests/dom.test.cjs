@@ -18,8 +18,9 @@ function serveRawReplyFixture() {
       const id = scenario || 'fixture';
       const command = JSON.stringify({$harness:'tool_call',turn_id:'a'.repeat(32),name:'read',
         arguments:{filePath:'fixture.txt'}});
-      const markdown = scenario ? 'Before\n\n\x60\x60\x60json\n' + command + '\n\x60\x60\x60\n\nAfter'
+      let markdown = scenario ? 'Before\n\n\x60\x60\x60json\n' + command + '\n\x60\x60\x60\n\nAfter'
         : '## Stream fixture\n\nSecond part \u{1F9EA}';
+      if (url.searchParams.has('edited')) markdown=markdown.replace('fixture.txt','changed.txt');
       const chunks = [
         {type:'start',messageId:id},
         {type:'text-start',id:'first'}, {type:'text-delta',id:'first',delta:markdown.slice(0,17)},
@@ -27,7 +28,7 @@ function serveRawReplyFixture() {
         {type:'text-delta',id:'second',delta:markdown.slice(17)}, {type:'text-end',id:'second'},
         {type:'finish',messageMetadata:{nodeId:id,pending:false}},
       ];
-      if (scenario==='interrupted') chunks.pop();
+      if (scenario==='interrupted' || scenario==='late-finish' && !url.searchParams.has('recovered')) chunks.pop();
       const records = chunks.map((data,seq_num)=>({seq_num,body:JSON.stringify({data})}));
       response.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8'});
       response.end('event: batch\ndata: ' + JSON.stringify({records}) + '\n\n');

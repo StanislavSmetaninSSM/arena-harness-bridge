@@ -26,7 +26,7 @@ const batch = (items, newline = '\n') => 'event: batch' + newline + 'data: ' +
 
 function fixture() {
   const listeners = new Map();
-  const results = [];
+  let copyClicks = 0;
   let sent, response, clipboardWrites = 0, fetchCalls = 0, source = raw;
   const location = new URL('https://arena.ai/agent/' + chat);
   const clipboard = {writeText: async () => { clipboardWrites++; }};
@@ -41,7 +41,7 @@ function fixture() {
         closest: selector => selector === '[id^="chat-message-"]' ? this : null,
         matches: () => false,
         checkVisibility: () => true,
-        click: () => clipboard.writeText(source),
+        click: () => { copyClicks++; return clipboard.writeText(source); },
       }];
     }
     dispatchEvent(event) { sent = JSON.parse(event.detail); }
@@ -56,9 +56,10 @@ function fixture() {
       querySelectorAll:()=>[row],
       addEventListener:(name,listener)=>listeners.set(name,listener),
     },
-    console:{debug:(...args)=>results.push(args)},
+    console,
   });
   function copy(text = raw, history = false, expected = history ? 'copy' : 'stream') {
+    const clicks = copyClicks;
     sent = undefined;
     source = text;
     listeners.get(history ? 'arena-harness-check-history' : 'arena-harness-read-reply')({
@@ -68,10 +69,8 @@ function fixture() {
       ? {status:expected} : {source:text,origin:expected};
     assert.deepEqual(sent,{nonce:message,...evidence});
     assert.equal(clipboardWrites,0);
-    const report = results.shift();
-    assert.deepEqual(results,[]);
-    assert.equal(report?.length,2,'the report contains only a label and a status');
-    return report[1];
+    assert.equal(copyClicks-clicks, expected === 'copy' ? 1 : 0);
+    return sent.origin ?? sent.status;
   }
   async function read(text, {url = endpoint, mime = 'text/event-stream; charset=utf-8',
     chunkSize = 4096, open = false, error = false, method = 'GET'} = {}) {
@@ -112,8 +111,8 @@ test('compares a complete reply while fetch is still open, including split UTF-8
   const page = fixture();
   const close = await page.read(batch(records,'\r\n'),{chunkSize:7,open:true});
   try {
-    assert.equal(page.copy(),'match');
-    assert.equal(page.copy(raw.replace('probe.txt','changed.txt'),true),'mismatch');
+    assert.equal(page.copy(),'stream');
+    assert.equal(page.copy(raw.replace('probe.txt','changed.txt'),true),'copy');
   } finally { close(); }
 });
 
@@ -124,7 +123,7 @@ test('assembles multiple parts in opening order and ignores exact repeated recor
     delta(14,'Explanation\n\n','first'), end(15,'first'), end(16,'second'), finish(17),
   ];
   await page.read(batch(parts.slice(0,5)) + batch(parts.slice(2)));
-  assert.equal(page.copy('Explanation\n\n' + raw),'match');
+  assert.equal(page.copy('Explanation\n\n' + raw),'stream');
 });
 
 test('a late start or a broken sequence never makes a complete reply', async () => {
@@ -135,14 +134,14 @@ test('a late start or a broken sequence never makes a complete reply', async () 
     [start(), begin(11), {seq_num:12,body:'{}'}, delta(13,raw), end(14), finish(15)]]) {
     const page = fixture();
     await page.read(batch(events));
-    assert.equal(page.copy(raw,false,events[0] === records[1] ? 'copy' : 'incomplete'),'unavailable');
+    assert.equal(page.copy(raw,false,events[0] === records[1] ? 'copy' : 'incomplete'),events[0] === records[1] ? 'copy' : 'incomplete');
   }
 });
 
 test('conflicting replay removes the affected observation', async () => {
   const page = fixture();
   await page.read(batch(records) + batch([delta(12,'a different record at the same sequence')]));
-  assert.equal(page.copy(raw,false,'incomplete'),'unavailable');
+  assert.equal(page.copy(raw,false,'incomplete'),'incomplete');
 });
 
 test('a valid independent observation survives a reader with an inconsistent replay', async () => {
@@ -150,40 +149,40 @@ test('a valid independent observation survives a reader with an inconsistent rep
   const bad = delta(12,'Invalidated text');
   await page.read(batch(records));
   await page.read(batch([start(),begin(11),bad,end(13),finish(14)]) + batch([records[2]]));
-  assert.equal(page.copy(),'match');
+  assert.equal(page.copy(),'stream');
 });
 
 test('a later response on the same long-lived connection remains observable', async () => {
   const page = fixture();
   const envelope = 'event: ping\ndata: ' + JSON.stringify({heartbeat:' '.repeat(64 * 1024)}) + '\n\n';
   await page.read(envelope.repeat(18) + batch(records),{chunkSize:65536});
-  assert.equal(page.copy(),'match');
+  assert.equal(page.copy(),'stream');
 });
 
 test('the cloned read-ahead is bounded and Copy still works after the limit', async () => {
   const page = fixture();
   const envelope = 'event: ping\ndata: ' + JSON.stringify({heartbeat:' '.repeat(64 * 1024)}) + '\n\n';
   await page.read(envelope.repeat(257) + batch(records),{chunkSize:65536});
-  assert.equal(page.copy(raw,false,'copy'),'unavailable');
+  assert.equal(page.copy(raw,false,'copy'),'copy');
 });
 
 test('an interrupted stream is separate from reconnect, and a fresh full replay can match', async () => {
   const page = fixture();
   await page.read(batch(records.slice(0,3)),{error:true});
-  assert.equal(page.copy(raw,false,'incomplete'),'unavailable');
+  assert.equal(page.copy(raw,false,'incomplete'),'incomplete');
   await page.read(batch(records.slice(3)));
-  assert.equal(page.copy(raw,false,'incomplete'),'unavailable');
+  assert.equal(page.copy(raw,false,'incomplete'),'incomplete');
   await page.read(batch(records));
-  assert.equal(page.copy(),'match');
+  assert.equal(page.copy(),'stream');
 });
 
 test('an incomplete replay of the same ID cannot revive an older completed response', async () => {
   const page = fixture();
   await page.read(batch(records));
   await page.read(batch([start(),begin(11),delta(12,'Unfinished new reply')]));
-  assert.equal(page.copy(raw,false,'incomplete'),'unavailable');
+  assert.equal(page.copy(raw,false,'incomplete'),'incomplete');
   await page.read(batch(records));
-  assert.equal(page.copy(),'match');
+  assert.equal(page.copy(),'stream');
 });
 
 test('a new source with the same native ID and different text reports a conflict even if Copy agrees', async () => {
@@ -191,8 +190,8 @@ test('a new source with the same native ID and different text reports a conflict
   await page.read(batch(records));
   const changed = raw + '\nAltered answer';
   await page.read(batch([start(),begin(11),delta(12,changed),end(13),finish(14)]));
-  assert.equal(page.copy(changed,true),'mismatch');
-  assert.equal(page.copy(changed,false,'conflict'),'mismatch');
+  assert.equal(page.copy(changed,true),'copy');
+  assert.equal(page.copy(changed,false,'conflict'),'conflict');
 });
 
 test('wrong route, method and media type stay unobserved', async () => {
@@ -202,8 +201,8 @@ test('wrong route, method and media type stay unobserved', async () => {
   await page.read(batch(records),{method:'POST'});
   await page.read(batch(records),{mime:'application/json'});
   await page.read(batch([start(otherChat),begin(11),delta(12,raw),end(13),finish(14,otherChat)]));
-  assert.equal(page.copy(raw,false,'copy'),'unavailable');
+  assert.equal(page.copy(raw,false,'copy'),'copy');
   await page.read(batch(records));
   page.location.pathname = '/agent/' + otherChat;
-  assert.equal(page.copy(raw,false,'copy'),'unavailable');
+  assert.equal(page.copy(raw,false,'copy'),'copy');
 });

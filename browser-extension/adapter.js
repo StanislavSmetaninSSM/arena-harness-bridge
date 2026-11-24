@@ -483,7 +483,7 @@ const ArenaPage = (() => {
         if (typeof reply.source === 'string' && reply.source.length <= 180000 &&
             (reply.origin === 'stream' || reply.origin === 'copy')) {
           result = {source:reply.source,origin:reply.origin};
-        } else if (reply.status === 'conflict' || reply.status === 'incomplete') {
+        } else if (reply.status === 'conflict' || reply.status === 'incomplete' || reply.status === 'unobserved') {
           result = {status:reply.status};
         }
       } catch {}
@@ -536,26 +536,31 @@ const ArenaPage = (() => {
       let reply;
       if (evidence?.status === 'conflict' && canReadTool) {
         reply = {toolFrame:false,toolSource:undefined,nativeSourceRejected:true,
-          responseText:'Arena’s streamed reply and its original source disagree. No command was run.'};
+          responseText:'Arena reported conflicting versions of the streamed reply. No command was run.'};
       } else if (raw === undefined && canReadTool) {
         const reason = evidence?.status === 'incomplete' ? 'Arena’s response stream was incomplete.'
           : 'Arena’s original tool reply is unavailable.';
-        reply = {toolFrame:false,toolSource:undefined,nativeSourceRejected:true,responseText:reason+' No command was run.'};
+        reply = {toolFrame:false,toolSource:undefined,nativeSourceRejected:true,sourceIncomplete:evidence?.status === 'incomplete',responseText:reason+' No command was run.'};
       } else if (raw !== undefined) {
         reply = canReadTool ? originalToolReply(raw) : {toolFrame:false,responseText:raw};
       } else return;
       row.copiedMarkdown = raw;
-      if (node) this.originalReplies.set(node,{siteId:row.siteId,text:row.text,raw,reply,delivery,origin:evidence?.origin});
+      row.sourceOrigin = evidence?.origin;
+      if (node && !reply.sourceIncomplete) this.originalReplies.set(node,{siteId:row.siteId,text:row.text,raw,reply,delivery,origin:evidence?.origin});
       Object.assign(row,reply);
     }
 
-    confirmToolReply(row) {
+    confirmToolReply(row, receipt) {
       const node = this.replyNodes.get(row);
       const original = this.originalReplies.get(node);
-      if (!original?.reply.toolSource || original.siteId !== row.siteId || original.reply.toolSource !== row.toolSource ||
-          !row.visibleToolMarker) return false;
-      const latest = readReply(node);
-      return latest?.source === original.raw && (original.origin !== 'stream' || latest.origin === 'stream');
+      const origin = receipt?.origin ?? original?.origin;
+      const source = receipt?.source ?? original?.raw;
+      const siteId = receipt?.siteId ?? original?.siteId;
+      if (!origin || !node || !row.complete || !row.visibleToolMarker || row.siteId !== siteId) return false;
+      if (!receipt && (!original?.reply.toolSource || original.reply.toolSource !== row.toolSource)) return false;
+      const latest = readReply(node,'arena-harness-confirm-'+origin);
+      return latest?.origin === origin && latest.source === source ||
+        origin === 'stream' && latest?.status === 'unobserved';
     }
 
     captureReplySource(row) {
@@ -564,16 +569,25 @@ const ArenaPage = (() => {
       if (row.copiedMarkdown !== undefined) return row.copiedMarkdown;
       const original = this.originalReplies.get(node);
       if (original && original.siteId === row.siteId && original.text === row.text &&
-          original.reply.toolSource && row.toolFrame && row.toolSource === original.reply.toolSource)
+          original.raw !== undefined && (!original.reply.toolFrame || row.toolFrame && row.toolSource === original.reply.toolSource)) {
+        row.sourceOrigin = original.origin;
         return original.raw;
-      return readReply(node)?.source;
+      }
+      const evidence = readReply(node);
+      row.sourceOrigin = evidence?.origin;
+      return evidence?.source;
     }
 
-    historyReplySource(row) {
+    historyReplySource(row, origin) {
       const submitted = this.submittedNodes.get(row);
       if (submitted) return readReply(submitted,'arena-harness-check-submitted')?.source;
       const node = this.replyNodes.get(row);
-      if (node && row.complete && row.text) return readReply(node,'arena-harness-check-history')?.source;
+      if (!node || !row.complete || !row.text) return;
+      if (origin === 'stream') {
+        const evidence = readReply(node,'arena-harness-check-stream');
+        return evidence?.source ?? evidence;
+      }
+      return readReply(node,'arena-harness-check-history')?.source;
     }
 
     rows() {
@@ -656,7 +670,7 @@ const ArenaPage = (() => {
           }
           const original = this.originalReplies.get(node);
           if (original && original.siteId === row.siteId && original.text === row.text &&
-              (!original.reply.toolFrame || row.visibleToolMarker)) Object.assign(row,original.reply);
+              (!original.reply.toolFrame || row.visibleToolMarker)) Object.assign(row,original.reply,{sourceOrigin:original.origin});
           return row;
         });
     }

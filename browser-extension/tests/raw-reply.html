@@ -101,7 +101,7 @@ try {
   wrapper.insertAdjacentHTML('beforeend','<span aria-label="Response ended">Done</span>');
   const log=new ArenaBridge.Transcript([]),receipt='Bridge delivery '+delivery;
   const user={role:'user',siteId:'from-operator',text:'Read the fixture\n'+receipt,lastLine:receipt};
-  const options={generating:false,captureSource:r=>page.captureReplySource?.(r),historySource:r=>page.historyReplySource?.(r)};
+  const options={generating:false,captureSource:r=>page.captureReplySource?.(r),historySource:(r,origin)=>page.historyReplySource?.(r,origin)};
   row=page.rows()[0];page.recoverToolReply(row,delivery);
   log.expect(delivery,'Read the fixture',null,receipt);
   const accepted=log.scan([user,row],options).find(e=>e.kind==='assistant');
@@ -163,26 +163,15 @@ try {
   check(row.toolSource===invalidFrame && !row.toolSource.startsWith('\x1e'),'copied malformed JSON cannot mint the transport prefix');
   const streamMarkdown = '## Stream fixture\n\nSecond part \u{1F9EA}';
   row=mount(streamMarkdown,'<p>Fixed visible reply</p>');
-  const compareStatuses = [], debug = console.debug;
-  try {
-    console.debug = (label,status) => {
-      if (label === '[Arena Harness Bridge] Markdown comparison') compareStatuses.push(status);
-    };
-    const stream = await fetch('/api/chat/fixture/events');
-    check((await stream.text()).includes('event: batch'),'Arena can still consume its original response');
-    for (let attempt=0; attempt<100; attempt++) {
-      check(page.captureReplySource(row)===streamMarkdown,'the source event still contains the exact Copy');
-      if (compareStatuses.at(-1)==='match') break;
-      await new Promise(resolve=>setTimeout(resolve,10));
-    }
-    check(compareStatuses.at(-1)==='match','the two settled stream parts match the native Copy');
-    currentSource += '\nActual edit to the original';
-    check(page.historyReplySource(row)===currentSource,'history checks still receive Copy after an edit');
-    check(compareStatuses.at(-1)==='mismatch','edited historical Copy no longer matches the completed stream');
-    check(clipboardWrites===0,'comparison did not write the system clipboard');
-  } finally {
-    console.debug = debug;
-  }
+  await (await fetch('/api/chat/fixture/events')).text();
+  await new Promise(resolve=>setTimeout(resolve,50));
+  currentSource += '\nExtra blank space in the Copy version';
+  const clicksBeforeStream = clicks;
+  check(page.captureReplySource(row)===streamMarkdown && clicks===clicksBeforeStream,
+    'stream selection skips Copy even when its text would differ');
+  check(page.historyReplySource(row,'copy')===currentSource,'a Copy snapshot can be checked using Copy');
+  check(page.historyReplySource(row,'stream')===streamMarkdown,'a streamed snapshot uses the stream');
+  check(clipboardWrites===0,'source selection leaves the clipboard untouched');
   const controlled = JSON.stringify({$harness:'tool_call',turn_id:delivery,name:'read',arguments:{filePath:'fixture.txt'}});
   const toolMarkdown = 'Before\n\n'+block(controlled)+'\n\nAfter';
   const fallback = '[Report](https://example.test/report)';
@@ -227,28 +216,93 @@ try {
     'a visible Copy action without an immediate write cannot block an independently complete stream');
 
   row = await withStream('conflict');
+  currentSource = 'Before\n\n' + toolMarkdown.slice('Before'.length);
   page.recoverToolReply(row,delivery);
-  check(row.toolSource===controlled,'the matching Copy and stream prove the original tool');
-  const conflictLog = new ArenaBridge.Transcript([user]);
-  conflictLog.waiting=true;
-  conflictLog.replyTo=conflictLog.commandDelivery=delivery;
-  const [queuedCommand] = conflictLog.scan([user,row],options);
-  currentSource=toolMarkdown.replace('fixture.txt','changed.txt');
-  check(!page.confirmToolReply(page.rows()[0]),'a late disagreement blocks the tool before publication');
-  // Use the same identifier for the downgraded publication, including after a lost acknowledgement.
-  queuedCommand.text='Arena changed or lost the original tool reply.';
-  delete queuedCommand.toolFrame;
-  delete queuedCommand.toolSource;
-  conflictLog.acknowledgeReply(queuedCommand);
-  row=mount(currentSource,visuallyBroken,'conflict');
-  check(conflictLog.scan([user,row],options).length===0 && !conflictLog.fault,
-    'a rejected command on the same redrawn row is passive history');
-  const freshPage = new ArenaPage(document);
-  row = freshPage.rows()[0];
-  freshPage.recoverToolReply(row,delivery);
-  check(!row.toolFrame && !row.toolSource && /disagree/i.test(row.responseText),
-    'a disagreement at collection yields a reason and no tool');
+  check(row.toolSource===controlled && row.responseText==='Before\n\nAfter',
+    'extra Copy line breaks cannot reject the exact streamed tool');
+  const pinnedLog = new ArenaBridge.Transcript([user]);
+  pinnedLog.waiting=true;
+  pinnedLog.replyTo=pinnedLog.commandDelivery=delivery;
+  const [queuedCommand] = pinnedLog.scan([user,row],options);
+  const beforeRedraw = page.rows()[0];
+  check(page.confirmToolReply(beforeRedraw),'stream can publish when Copy has extra newlines');
+  row=mount(currentSource,visuallyBroken+'<p>Redrawn</p>','conflict');
+  check(pinnedLog.scan([user,row],options).length===0 && !pinnedLog.historyChangedAt && !pinnedLog.fault,
+    'redraw before acknowledgement preserves the pending stream command');
+  check(pinnedLog.currentCommand(queuedCommand,[user,row]) &&
+    page.confirmToolReply(row,pinnedLog.replyRows.get(queuedCommand)),
+    'replacing the DOM node before publication preserves the pinned command');
+  pinnedLog.acknowledgeReply(queuedCommand);
+  check(pinnedLog.scan([user,row],{...options,outgoing:true}).length===0 && !pinnedLog.fault,
+    'outgoing delivery after acknowledgement checks the pinned source');
+  const nextUserTurn={role:'user',siteId:'followup',text:'Continue'};
+  const nextReply={role:'assistant',siteId:'done',complete:true,text:'Final answer'};
+  const followup=pinnedLog.scan([user,row,nextUserTurn,nextReply],options);
+  check(followup.at(-1)?.text==='Final answer' && !followup.some(event=>event.toolFrame),
+    'next turn delivers one final without replay');
 
+  const beforeAcceptance = new ArenaBridge.Transcript([user]);
+  beforeAcceptance.waiting=true;
+  beforeAcceptance.replyTo=beforeAcceptance.commandDelivery=delivery;
+  const renderCommand = '<pre><code class="language-json">'+controlled+'</code></pre>';
+  row=mount(toolMarkdown,renderCommand,'conflict');
+  const collectFinal={...options,recoverReply:(r,id)=>page.recoverToolReply(r,id)};
+  beforeAcceptance.scan([user,row],{...collectFinal,publishNativeFinal:false});
+  check(beforeAcceptance.pendingNativeCommand,'fixture must first observe a pending rendered command');
+  row=mount(toolMarkdown,'<p>Reflowed</p>'+renderCommand,'conflict');
+  const newlyAccepted=beforeAcceptance.scan([user,row],collectFinal);
+  check(newlyAccepted[0]?.toolSource===controlled && !beforeAcceptance.fault,
+    'a redraw before first source selection waits for the completed source');
+
+  row=mount(streamMarkdown,'<p>Ordinary reply</p>','fixture');
+  const ordinaryLog=new ArenaBridge.Transcript([user]);
+  ordinaryLog.waiting=true;
+  ordinaryLog.replyTo=ordinaryLog.commandDelivery=delivery;
+  const [ordinaryReply]=ordinaryLog.scan([user,row],collectFinal);
+  row=mount('Different Copy presentation','<p>Ordinary</p><p>reply</p>','fixture');
+  ordinaryLog.scan([user,row],options);
+  check(ordinaryReply.text===streamMarkdown && !ordinaryLog.fault && !ordinaryLog.historyChangedAt,
+    'a plain reply can redraw before its HTTP acknowledgement');
+  ordinaryLog.acknowledgeReply(ordinaryReply);
+  row=await withStream('history-replay');
+  const replayLog=new ArenaBridge.Transcript([user]);
+  replayLog.waiting=true;
+  replayLog.commandDelivery=replayLog.replyTo=delivery;
+  const [replayCommand]=replayLog.scan([user,row],collectFinal);
+  check(replayCommand.toolSource===controlled,'initial stream command was queued');
+  await (await fetch('/api/chat/fixture/events?case=history-replay&edited=1')).text();
+  await new Promise(resolve=>setTimeout(resolve,50));
+  check(!page.confirmToolReply(page.rows()[0],replayLog.replyRows.get(replayCommand)),
+    'conflicting replay within the selected stream blocks publication');
+  replayLog.acknowledgeReply(replayCommand);
+  replayLog.scan([user,page.rows()[0]],{...options,outgoing:true});
+  check(replayLog.transcriptChanged,'history detects a changed replay from the selected stream');
+
+  row=await withStream('evicted');
+  const archive=new ArenaBridge.Transcript([user]);
+  archive.waiting=true;
+  archive.commandDelivery=archive.replyTo=delivery;
+  const [archived]=archive.scan([user,row],collectFinal);
+  for(let n=0;n<8;n++) await (await fetch('/api/chat/fixture/events?case=other-'+n)).text();
+  await new Promise(resolve=>setTimeout(resolve,50));
+  row=mount('Copy differs after cache eviction',visuallyBroken+'<p>New layout</p>','evicted');
+  check(page.historyReplySource(row,'stream')?.status==='unobserved','the stream was actually evicted');
+  check(page.confirmToolReply(row,archive.replyRows.get(archived)),'queued source survives stream cache eviction');
+  archive.acknowledgeReply(archived);
+  archive.scan([user,row],{...options,outgoing:true});
+  check(!archive.fault && !archive.historyChangedAt,'cache eviction preserves the accepted native reply');
+
+  row=await withStream('late-finish');
+  const lateLog=new ArenaBridge.Transcript([user]);
+  lateLog.waiting=true;
+  lateLog.commandDelivery=lateLog.replyTo=delivery;
+  check(lateLog.scan([user,row],collectFinal).length===0 && lateLog.waiting,
+    'a missing finish gets a chance to arrive before settling the turn');
+  await (await fetch('/api/chat/fixture/events?case=late-finish&recovered=1')).text();
+  await new Promise(resolve=>setTimeout(resolve,50));
+  row=page.rows()[0];
+  const [recoveredAnswer]=lateLog.scan([user,row],collectFinal);
+  check(recoveredAnswer?.toolSource===controlled,'a full replay settles a waiting command without another request');
   row = await withStream('interrupted');
   page.recoverToolReply(row,delivery);
   check(!row.toolFrame && !row.toolSource && /incomplete/i.test(row.responseText),
@@ -257,6 +311,10 @@ try {
   const interruptedLog = new ArenaBridge.Transcript([user]);
   interruptedLog.waiting=true;
   interruptedLog.replyTo=interruptedLog.commandDelivery=delivery;
+  check(interruptedLog.scan([user,row],options).length===0,'incomplete reply initially waits');
+  now+=8000;
+  interruptedLog.scan([user,page.rows()[0]],{...options,publishNativeFinal:false});
+  now+=2001;
   const rejected=interruptedLog.scan([user,row],options);
   check(rejected.length===1 && !rejected[0].toolFrame && /incomplete/i.test(rejected[0].text),
     'the incomplete turn settles as an ordinary error without a command');

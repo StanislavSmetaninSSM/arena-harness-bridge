@@ -1,7 +1,7 @@
 """Acceptance test with the real DeepSeek Harness, the real Desktop plugin and the real companion.
 
 `dsh headless --json` runs the Harness without a window, loads desktop-plugin and
-starts arena_terminal.desktop_provider from this checkout. Only the Arena page is
+starts arena_terminal.desktop_provider from this checkout or the packaged release. Only the Arena page is
 scripted: a thread speaks the extension's wire protocol on 127.0.0.1:8766 and plays
 prepared replies. browser-extension/ itself is covered by its own Node and Chrome tests.
 
@@ -60,6 +60,18 @@ def port_is_free(patience=6):
 
 def marked(delivery, name, arguments):
     return json.dumps({"$harness":"tool_call", "turn_id":delivery, "name":name, "arguments":arguments})
+
+
+def harness_environment(home, state, bridge_root, release):
+    env = {**os.environ, "DSH_HOME":str(home), "ARENA_DESKTOP_STATE":str(state)}
+    if release and os.name == "nt":
+        env.pop("ARENA_BRIDGE_ROOT", None)
+        env.pop("ARENA_PYTHON", None)
+        env["PATH"] = os.pathsep.join(entry for entry in os.get_exec_path(env)
+                                      if not (Path(entry.strip('"')) / "python.exe").exists())
+    else:
+        env.update(ARENA_BRIDGE_ROOT=str(bridge_root), ARENA_PYTHON=sys.executable)
+    return env
 
 
 class ScriptedPage(threading.Thread):
@@ -139,8 +151,7 @@ class HeadlessHarness(unittest.TestCase):
             self.assertFalse(self.page.is_alive())
 
     def harness(self, task, *options):
-        environment = {**os.environ, "DSH_HOME":str(self.home), "ARENA_DESKTOP_STATE":str(self.state),
-                       "ARENA_BRIDGE_ROOT":str(self.bridge_root), "ARENA_PYTHON":sys.executable}
+        environment = harness_environment(self.home, self.state, self.bridge_root, RELEASE_CHECK)
         self.assertTrue(port_is_free(), f"the previous companion still holds port {PORT}")
         run = subprocess.run([self.node, str(self.dsh), "headless", "--patch", str(self.patch), "--json",
                               "--approval-policy", "never", *options, task],

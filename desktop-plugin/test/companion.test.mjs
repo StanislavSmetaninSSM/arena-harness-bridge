@@ -1,6 +1,33 @@
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
-import { Companion } from '../companion.mjs'
+import { Companion, companionOptions } from '../companion.mjs'
+
+test('packaged Windows plugin uses its private Python and honors explicit developer overrides', t => {
+  const project = mkdtempSync(join(tmpdir(), 'arena companion '))
+  t.after(() => rmSync(project, { recursive: true, force: true }))
+  const pkg = join(project, 'plugin')
+  const companion = join(pkg, 'arena_terminal')
+  const runtime = join(pkg, 'windows-python')
+  mkdirSync(runtime, { recursive: true })
+  const options = (config = {}, env = {}, platform = 'win32') => companionOptions(pkg, config, env, platform)
+  assert.equal(options().command, 'python')
+  assert.equal(options().cwd, project)
+  mkdirSync(companion)
+  writeFileSync(join(companion, 'desktop_provider.py'), '')
+  assert.equal(options().cwd, pkg)
+  assert.equal(options().command, 'python')
+  const python = join(runtime, 'python.exe')
+  writeFileSync(python, '')
+  assert.equal(options().command, python)
+  assert.equal(options({}, {}, 'linux').command, 'python')
+  assert.equal(options({}, {ARENA_PYTHON:'from-env'}).command, 'from-env')
+  assert.equal(options({python:'from-config'}, {ARENA_PYTHON:'from-env'}).command, 'from-config')
+  assert.equal(options({bridgeRoot:project}, {ARENA_BRIDGE_ROOT:pkg}).cwd, project)
+  assert.equal(options({}, {ARENA_BRIDGE_ROOT:project}).cwd, project)
+})
 
 // Stand-ins for the Python companion: wait for the first request, write a diagnostic, exit.
 const dying = diagnostic => new Companion({ command:process.execPath, cwd:process.cwd(),

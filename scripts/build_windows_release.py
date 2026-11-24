@@ -1,6 +1,7 @@
-"""Build the Windows release ZIP from the bridge source checkout."""
+"""Build the Windows installer and its manual ZIP from the bridge source checkout."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,10 +10,16 @@ import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from urllib.request import urlopen
+import xml.etree.ElementTree as ET
 import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SETUP_NAME = "Arena-Harness-Bridge-Setup.exe"
+# Windows embeddable package (64-bit), https://www.python.org/downloads/release/python-31410/
+PYTHON_URL = "https://www.python.org/ftp/python/3.14.10/python-3.14.10-embed-amd64.zip"
+PYTHON_SHA256 = "90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159"
 PLUGIN_FILES = (
     "companion.mjs", "cordis.patch.yml", "index.mjs", "outgoing-image.mjs",
     "original-files.mjs", "original-files.client.js",
@@ -50,10 +57,62 @@ def check_headless_release(npm, package, plugin_manifest):
                            cwd=prefix, env={**os.environ, "ARENA_DSH_PREFIX": prefix}, check=True)
 
 
+def stage_python(plugin, archive):
+    """Verify the official archive before extracting its runtime, extensions and license."""
+    if archive is None:
+        archive = plugin.parent / "python-embed.zip"
+        with urlopen(PYTHON_URL, timeout=60) as response, archive.open("wb") as downloaded:
+            shutil.copyfileobj(response, downloaded)
+    with archive.open("rb") as source:
+        if hashlib.sha256(source.read()).hexdigest() != PYTHON_SHA256:
+            raise ValueError(f"CPython embeddable ZIP failed SHA-256 verification: {archive}")
+        with zipfile.ZipFile(source) as runtime:
+            directory = plugin / "windows-python"
+            runtime.extractall(directory)
+    # Embeddable CPython ignores PYTHONPATH and the working directory. Add only
+    # our package directory, keeping the upstream stdlib paths and isolation.
+    with (directory / "python314._pth").open("a", encoding="ascii", newline="\r\n") as paths:
+        paths.write("\n..\n")
+
+
+def compile_setup(archive, exe):
+    """Compile the per-user GUI with the verified distribution as its manifest resource."""
+    framework = Path(os.environ.get("SystemRoot", "C:/Windows")) / "Microsoft.NET/Framework64/v4.0.30319"
+    compiler = framework / "csc.exe"
+    if not compiler.is_file():
+        raise FileNotFoundError(f"The 64-bit .NET Framework C# compiler is required: {compiler}")
+    documentation = exe.with_suffix(".xml")
+    references = ("System.Windows.Forms", "System.Drawing", "System.IO.Compression",
+                  "System.IO.Compression.FileSystem", "System.Web.Extensions")
+    subprocess.run([str(compiler), "/nologo", "/target:winexe", "/platform:x64", "/optimize+", "/warnaserror+",
+                    "/codepage:65001", f"/out:{exe}", f"/doc:{documentation}", f"/resource:{archive},bridge.zip",
+                    *(f"/reference:{name}.dll" for name in references),
+                    *map(str, sorted((ROOT / "windows-setup").glob("*.cs")))], check=True, cwd=framework)
+    ET.parse(documentation)
+
+
+def publish_release(archive, setup, output):
+    """Replace the verified pair, restoring the previous ZIP if the installer is locked."""
+    previous = archive.parent / "previous.zip"
+    target = output / archive.name
+    if target.exists():
+        shutil.copyfile(target, previous)
+    archive.replace(target)
+    try:
+        setup.replace(output / setup.name)
+    except OSError:
+        if previous.exists():
+            previous.replace(target)
+        else:
+            target.unlink()
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="Release version without a leading v")
     parser.add_argument("--output", type=Path, default=ROOT / "dist")
+    parser.add_argument("--python-embed", type=Path, help="Use a locally cached, SHA-256-verified CPython ZIP")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
         parser.error("Expected a version like 0.1.0")
@@ -75,6 +134,7 @@ def main():
         companion.mkdir()
         for source in (ROOT / "arena_terminal").glob("*.py"):
             shutil.copyfile(source, companion / source.name)
+        stage_python(plugin, args.python_embed)
 
         result = subprocess.run(
             [npm, "pack", ".", "--ignore-scripts", "--json", "--pack-destination", str(stage)],
@@ -94,7 +154,10 @@ def main():
                 entry.external_attr = 0o100644 << 16
                 archive.writestr(entry, source.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
         check_headless_release(npm, package, json.loads((plugin / "package.json").read_text(encoding="utf-8")))
-        temporary_zip.replace(output / filename)
+        setup = stage / SETUP_NAME
+        compile_setup(temporary_zip, setup)
+        publish_release(temporary_zip, setup, output)
+    print(output / SETUP_NAME)
     print(output / filename)
 
 

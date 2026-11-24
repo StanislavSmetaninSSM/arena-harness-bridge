@@ -2,9 +2,9 @@
 
 Плагин добавляет модель **Arena Agent Mode** и команду **Connect Arena / Подключить Arena** (`/arena-pair`). Установите его с Python-компаньоном и расширением Chrome по [инструкции Windows](../INSTALL.md).
 
-Пакет 0.1.21 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
+Пакет 0.1.22 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
 
-**English** — Plugin 0.1.21 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+**English** — Plugin 0.1.22 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
 
 Arena запрашивает справку через `arena_tool_help`. Пустой запрос показывает, какие инструменты на текущем шаге вызываются напрямую и какие доступны внутри `run_code`. Запрос `{"name":"read"}` возвращает способ вызова, параметры, сведения о результате и опубликованную Harness инструкцию. Ссылка на индивидуальную инструкцию `{"guide":"tool:read"}` открывает ту же справку. Запрос `{"sdk":true}` открывает штатный SDK. Если пришёл `nextCursor`, его передают как `cursor` с теми же аргументами. Справка о новом инструменте появляется, как только Harness допускает его к работе на этом шаге.
 
@@ -45,4 +45,26 @@ npm test
 
 Для интерактивной проверки окна сопряжения в Windows задайте `ARENA_TEST_NATIVE_WINDOW=1` перед запуском тестов. Эта проверка открывает диалог с синтетическим токеном.
 
-В установленном архиве компаньон запускается из каталога самого пакета. Для разработки можно задать `ARENA_BRIDGE_ROOT` или свойство `bridgeRoot` в конфигурации плагина. Путь к Python настраивается через `ARENA_PYTHON` или свойство `python`.
+В установленном архиве компаньон запускается из каталога самого пакета. Для разработки можно задать `ARENA_BRIDGE_ROOT` или свойство `bridgeRoot` в конфигурации плагина. Windows-пакет включает приватный Python. Путь к другому интерпретатору настраивается через `ARENA_PYTHON` или свойство `python`.
+
+## Ручная установка и диагностика
+
+Пакет проверяется на версиях Harness из `peerDependencies` в [package.json](package.json). Если вы сознательно проверяете другую версию, используйте CLI именно этой установки Desktop. При ручной установке из ZIP можно продолжить в том же окне PowerShell, где заданы `$dsh` и `$package`. Укажите фактические версии из имени TGZ и вывода `--version`.
+
+For a manual compatibility test with another Desktop build, use its own CLI. Continue in the PowerShell window used for the ZIP installation. Enter the plugin version from the TGZ filename and the exact Harness version printed by the CLI. The exemption applies to this pair only.
+
+```powershell
+& $dsh --version
+$pluginVersion = Read-Host 'Plugin version from the .tgz filename'
+$harnessVersion = Read-Host 'Exact Harness version from --version'
+& $dsh plugin --profile desktop allow-version "dsh-arena-desktop@$pluginVersion" --dsh-version $harnessVersion --accept-risk
+if ($LASTEXITCODE -eq 0) { & $dsh plugin --profile desktop add $package }
+```
+
+- **WinError 10048.** Второй экземпляр моста может уже занимать порт 8766. / Check whether a second bridge instance is using port 8766.
+- **WinError 10013.** Windows запретила доступ к порту. Проверьте резервирование или ограничения Windows. / Windows denied access. Check port reservations and Windows restrictions.
+- **Удаление / Uninstall.** Выйдите из Desktop, удалите плагин штатной командой ниже и удалите Arena Harness Bridge в `chrome://extensions`. / Quit Desktop, remove the plugin using the command below, and remove Arena Harness Bridge in `chrome://extensions`.
+
+```powershell
+& $dsh plugin --profile desktop remove dsh-arena-desktop
+```

@@ -1,85 +1,38 @@
-# Install Arena Harness Bridge on Windows
+# Install on Windows
 
-[Инструкция на русском](INSTALL.md)
+[Русский](INSTALL.md) · Windows x64 · Google Chrome
 
-You’ll need **DeepSeek Harness Desktop**, Google Chrome, and Python. The supported Desktop versions are **0.2.2-rc.5** and **0.2.3-alpha.2**. Bundle **v0.1.11** contains Desktop plugin 0.1.21 with its Python companion and Chrome extension 0.1.44. [DeepSeek Harness Desktop](https://deepseek.com/harness/) · [Bridge releases](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases)
+### 1. Install the bridge
 
-## 1. Download and extract the ZIP
+1. Download and run [Arena-Harness-Bridge-Setup.exe](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest/download/Arena-Harness-Bridge-Setup.exe).
+2. If you need DeepSeek Harness Desktop, use the wizard’s download button. Install Desktop and open it once. Before installing the bridge, quit Desktop completely from the app menu or system tray.
+3. Check that the wizard has selected your Desktop installation and click **Install**. When the extension folder appears, copy its path.
 
-1. Under **Assets** on the release page, find `arena-harness-bridge-v<version>-windows.zip` for your bridge version. Extract it to a folder you plan to keep, such as `C:\Tools\Arena Bridge`. Desktop stores the path to the plugin archive, and Chrome loads the extension from the extracted folder.
-2. Install Python and run `python --version` in PowerShell to check that it is on your PATH. The plugin installer also needs access to the npm registry to install dependencies.
+### 2. Add the Chrome extension
 
-## 2. Install the Desktop plugin
+Click **Open Chrome extensions** in the wizard. If that button is unavailable, enter `chrome://extensions` in Chrome’s address bar. Turn on **Developer mode**, click **Load unpacked**, paste the path into the folder picker’s address bar, press Enter, then click **Select Folder**. **Arena Harness Bridge** will appear in the extension list.
 
-1. Start DeepSeek Harness Desktop once so it creates its profile. On the welcome screen, you can choose **Add API key → Set up later**. Then quit Desktop completely from its application menu or system tray icon.
-2. Open PowerShell in the extracted folder. Replace the example path with the actual path to `DeepSeek Harness.exe` to use the CLI bundled with that installation.
+### 3. Connect your chats
 
-   ```powershell
-   $desktop = 'C:\Program Files\DeepSeek Harness\DeepSeek Harness.exe'
-   $dsh = Join-Path (Split-Path -Parent $desktop) 'resources\runtime\cli\bin\dsh.cmd'
-   ```
+1. Sign in to [Arena](https://arena.ai/agent), open **Agent Mode**, and send “Hello”. Wait for the reply and refresh the tab.
+2. Open a conversation in Desktop, select the **Arena Agent Mode** model, type `/arena-pair`, and click **Copy pairing token**.
+3. Return to the Arena tab. Open **Arena Harness Bridge** from Chrome’s extensions menu, paste the token, and click **Bind conversation**.
+4. Send “Hello” in **Desktop**. Arena’s reply will appear in that conversation.
 
-   If the `dsh` command on your PATH belongs to that Desktop installation, you can set `$dsh = 'dsh'`.
+**Updating.** Quit Desktop completely and run the new installer for the same profile. If Chrome loads the extension from the wizard’s folder, click **Reload** on its extension card. If you originally installed from a ZIP, disable the old extension and add the new one as in step 2. In either case, refresh the original Arena tab. Run `/arena-pair` in the **original Desktop conversation** and bind the same Arena chat as in step 3.
 
-   If you launch Desktop with a custom `DSH_HOME`, set `$env:DSH_HOME` to that same directory in this PowerShell window before installation. This installs the plugin into the profile your app uses.
+<details>
+<summary>Manual installation from the ZIP</summary>
 
-3. Print the exact Harness version and install the plugin. Set `$pluginVersion` to the version in the extracted `.tgz` filename.
-
-   ```powershell
-   & $dsh --version
-   $pluginVersion = '0.1.21'
-   $package = (Resolve-Path -LiteralPath ".\dsh-arena-desktop-$pluginVersion.tgz").Path
-   & $dsh plugin --profile desktop add $package
-   ```
-
-4. Restart Desktop. Create or open a session for your workspace and select **Arena Agent Mode** in the model picker.
-
-### If Harness rejects the plugin version
-
-If the CLI reports a compatibility error and you want to try the plugin with that version, enter the full version from `& $dsh --version` in the same PowerShell window, including any suffix such as `-rc.5`. The exemption lifts the version check for that exact pair of Harness and plugin versions. You’ll still need to test the plugin on that version. [DeepSeek Harness version compatibility](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/boot/plugin-manager/README.md#version-compatibility-and-exemptions)
+Extract the Windows ZIP to a folder you plan to keep. Quit Desktop completely. Open PowerShell in the extracted folder and enter the commands below, using the path to your own `DeepSeek Harness.exe`. If Desktop uses a custom profile, first set `$env:DSH_HOME` to the same directory you use to launch Desktop.
 
 ```powershell
-$harnessVersion = Read-Host 'Exact DeepSeek Harness version from --version'
-& $dsh plugin --profile desktop allow-version "dsh-arena-desktop@$pluginVersion" --dsh-version $harnessVersion --accept-risk
-if ($LASTEXITCODE -eq 0) {
-    & $dsh plugin --profile desktop add $package
-}
+$desktop = Read-Host 'Full path to DeepSeek Harness.exe'
+$dsh = Join-Path (Split-Path -Parent $desktop) 'resources\runtime\cli\bin\dsh.cmd'
+$package = (Get-Item -Path '.\dsh-arena-desktop-*.tgz').FullName
+& $dsh plugin --profile desktop add $package
 ```
 
-## 3. Load the extension and pair the chat
+In step 2, select the ZIP’s `browser-extension` folder. Plugin installation requires access to the npm registry.
 
-1. In Chrome, open `chrome://extensions`. Turn on **Developer mode**, click **Load unpacked**, and select the `browser-extension` folder from the ZIP.
-2. Sign in to Arena and open **Agent Mode**. For a new chat, send the first message in Chrome and wait for a reply. Once the URL looks like `https://arena.ai/agent/<id>`, refresh the tab.
-3. In your Desktop session, run `/arena-pair` and click **Copy pairing token**.
-4. In the Arena tab, open the **Arena Harness Bridge** extension. Select your Arena conversation, paste the token, and click **Bind conversation**. Use the token only for local pairing.
-
-## 4. Send your first message
-
-In Desktop, type “Reply on one line: THE BRIDGE IS WORKING.” The message should appear in the Arena tab, and the reply should appear in Desktop. For file tasks, choose the workspace and permissions in Desktop. Messages you send, selected attachments, and tool results from the session are sent to Arena.
-
-At the start of a paired conversation Arena receives a short explanation of Desktop and a help example. Ordinary conversation uses plain text. On request, Desktop shows the tool's parameters and how to call it on the current step. If Arena tries to call an available program tool directly, the bridge can ask it once to correct the call before execution. Computer Use guidance is also available on request and can contain a local library path.
-
-To send files from your computer, choose **Arena Agent Mode** in the conversation, click **+ → File**, select one or more files, and send the message. The bridge attaches the originals in order, including animated GIFs, PDFs, and files without an extension. Desktop displays any upload error reported by Arena. To retry a GIF created as a preview in an older Desktop message, select the original file from disk again.
-
-To get an image, ask Arena to generate it in an ordinary Desktop message. The bridge automatically delivers the finished images from Arena’s reply. If Arena offers several variants, pick one in the Desktop choice card. If your profile cannot open the card, Desktop shows the previews. In that case you can pick a variant in the original Arena tab while its panel is open.
-
-## Upgrade from a previous release
-
-1. Let the current turn finish. Extract the new Windows ZIP to a separate folder you plan to keep.
-2. Quit Desktop completely, open PowerShell in the new folder, and install `dsh-arena-desktop-0.1.21.tgz` using the [plugin installation steps](#2-install-the-desktop-plugin). Restart Desktop with the same profile.
-3. Open **Arena Harness Bridge** in `chrome://extensions`. If you already have version **0.1.44** from v0.1.10, continue to step 4. If you have an earlier version, copy the contents of the new ZIP’s `browser-extension` folder into the folder Chrome loads, click **Reload** on the extension card, and refresh the Arena tab.
-4. Continue your existing Desktop conversation. To check local file access, ask Arena to read a short text file in your workspace and compare its reply with the file. If the conversation has lost its pairing, run `/arena-pair` there and bind the original Arena chat using the [pairing instructions](#3-load-the-extension-and-pair-the-chat).
-
-If an unsent request in the old format was still queued during the upgrade, Desktop shows `Resubmit this request in Desktop`. Send that request again.
-
-## Troubleshooting
-
-- **Arena Agent Mode or `/arena-pair` is missing.** Check that you installed the plugin with the CLI bundled with your Desktop into the `desktop` profile, then restart the app. The installer may warn about the `@deepseek-ai/dsh-llm` peer dependency on the tested Desktop build, which resolves it from its own runtime.
-- **The companion does not start.** Check that Python is on your PATH. If needed, set `ARENA_PYTHON` to the full path to `python.exe` in the environment used to launch Desktop.
-- **Port 8766 is in use (WinError 10048).** Check which process is listening on `127.0.0.1:8766`. If it is a second bridge instance you started, close it and open **Connect Arena** again.
-- **Windows denied access to port 8766 (WinError 10013).** Check whether a service has reserved the port or Windows restricts access to it. Once you resolve the cause, open **Connect Arena** again.
-- **The original Desktop session was deleted, or you need to change the pairing.** Run `/arena-reset` in any Desktop session in the same profile. This clears the pairing and stops pending deliveries. A send already handed to Chrome may finish in the old chat. Run `/arena-pair` in the intended session and bind the Arena tab.
-- **Arena asks for verification.** Complete it in the Chrome tab.
-- **The extension asks you to reload the Arena tab.** Open the saved chat at `/agent/<id>` and refresh the Chrome tab itself. Then reopen the extension, paste the token, and click **Bind conversation**. Refreshing the tab after installing or updating the extension starts the bridge script on that page.
-
-To uninstall the plugin, quit Desktop and run `dsh plugin --profile desktop remove dsh-arena-desktop` with the same CLI. Remove the extension from `chrome://extensions`.
+</details>

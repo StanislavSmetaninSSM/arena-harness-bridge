@@ -1,61 +1,15 @@
 # Arena Harness Bridge
 
-Мост подключает один веб-чат Arena Agent Mode к одному разговору в штатном DeepSeek Harness Desktop. Задания вводятся в обычном поле Desktop, ответы Arena приходят в тот же разговор. Штатные инструменты Harness выполняют локальные действия с разрешениями выбранного профиля.
+Подключите чат Arena к DeepSeek Harness Desktop. Пишите задания в Desktop, получайте там ответы и изображения. Когда Arena работает с файлами на вашем компьютере, действуют разрешения выбранного проекта в Harness.
 
-Arena Harness Bridge connects an Arena Agent Mode browser chat to the standard DeepSeek Harness Desktop app. Type in Desktop and get Arena’s replies there. Arena can request documentation for tools available in the current profile, including Computer Use.
+**Windows x64** · [Скачать установщик](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest/download/Arena-Harness-Bridge-Setup.exe) · [Как установить и подключить чат](INSTALL.md)
 
-**Проверено на Windows с Chrome и DeepSeek Harness Desktop 0.2.2-rc.5 и 0.2.3-alpha.2.** [Последний релиз и ZIP для Windows](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest) · [Инструкция на русском](INSTALL.md) · [English installation guide](INSTALL.en.md)
+Use an Arena chat from DeepSeek Harness Desktop. Send messages, receive images, and let Arena use the local tools your Harness profile permits.
 
-## Возможности
+**Windows x64** · [Download the installer](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest/download/Arena-Harness-Bridge-Setup.exe) · [Installation and pairing](INSTALL.en.md)
 
-- Обычные сообщения, ответы и локальные вызовы инструментов с подтверждениями Desktop.
-- Справка по запросу показывает, как вызвать каждый доступный инструмент на текущем шаге и какие параметры ему передать. Новые инструменты подхватываются из Harness автоматически.
-- Штатные цели, режим плана, карточки вопросов, вложения и скиллы текущего профиля.
-- Файлы с компьютера можно прикреплять через **+ → Файл**. В Arena передаются исходные байты и имена выбранных файлов, включая анимированные GIF, документы и файлы без расширения. Сгенерированные Arena изображения возвращаются в Desktop.
-- Команда `/arena-reset` освобождает привязку к Arena из любого диалога Desktop в том же профиле, даже если исходный диалог удалён.
-- При подтверждённом изменении исходного ответа мост останавливает старый ход. Новое сообщение из Desktop восстанавливает работу в том же документе Arena. Старые доставки остаются закрытыми.
+Для работы нужны Google Chrome, доступ к Arena Agent Mode и DeepSeek Harness Desktop. Мост передаёт в связанный чат ваши сообщения, выбранные вложения и результаты запрошенных инструментов. Подключение можно сбросить командой `/arena-reset` в Desktop.
 
-Ход цели, доступные инструменты и действия с файлами определяются профилем Desktop. Транспорт зависит от интерфейса Arena в браузере. Доступ к Agent Mode и условия текущей сессии определяются Arena.
+[Возможности плагина](desktop-plugin/README.md) · [Терминальный режим](harness-adapter/README.md) · [Сборка и тесты](BUILD.md) · [Релизы](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest)
 
-## Данные и разрешения
-
-Мост слушает `127.0.0.1:8766` и привязывает вкладку по локальному токену. В начале диалога Arena узнаёт, как запросить справку и выполнить действие через Desktop. В чат передаются сообщения пользователя, выбранные вложения и результаты вызовов. Описания инструментов и руководство Computer Use поступают по запросу. Для локальной работы выберите нужную рабочую папку и профиль разрешений в Desktop.
-
-## Дополнительный CLI
-
-Терминальный режим использует отдельный профиль проекта и закреплённую ревизию upstream DeepSeek Harness. Установите зависимости по [инструкции терминального адаптера](harness-adapter/README.md), загрузите это же расширение в Chrome и запустите из корня репозитория:
-
-```powershell
-python -m arena_terminal --root 'C:\путь\к\проекту'
-```
-
-Откройте конкретный чат Arena Agent Mode, введите `/pair` в терминале и привяжите чат через расширение. Доступные команды показывает `/help`. Desktop и CLI используют один локальный порт и запускаются по очереди.
-
-## Исходники и сборка
-
-| Каталог | Назначение |
-|---|---|
-| `browser-extension/` | Расширение Chrome и тесты браузерной разметки |
-| `desktop-plugin/` | Провайдер Arena и команда сопряжения Desktop |
-| `arena_terminal/` | Python-компаньон, журнал доставки и терминальный клиент |
-| `harness-adapter/` | Исполнитель для дополнительного терминального режима |
-
-Для подготовки релиза нужны Python, npm и доступ к npm-реестру. Для обеих текущих версий Harness подходит Node.js 24.22.3. Освободите порт `127.0.0.1:8766` перед запуском. Скрипт устанавливает собранный плагин во временный каталог npm для каждой поддерживаемой версии Harness, подключает его к чистому профилю и последовательно запускает три теста Ивана через `dsh headless`. Страницу Arena в этих тестах заменяют подготовленные ответы. Итоговый ZIP появляется в `dist/` после успешного выполнения всех сценариев. Ошибка или пропуск останавливает сборку.
-
-```powershell
-$bridgeVersion = Read-Host 'Версия нового релиза без v'
-python scripts/build_windows_release.py --version $bridgeVersion
-```
-
-**Pre-release check (Windows).** Run the build command above with the new release version. Use Python, npm with registry access, and a free loopback port 8766. Node.js 24.22.3 is supported by both current Harness versions. The build tests the packaged plugin and companion on each supported Harness version. All three scripted headless scenarios must pass before the candidate ZIP replaces the output file.
-
-Комплектацию ZIP и обычные тесты можно проверить отдельно.
-
-```powershell
-python -m unittest test_arena_desktop test_arena_terminal test_windows_release
-node --test browser-extension/tests/*.test.cjs
-```
-
-Для полной проверки Python через `python -m unittest discover` сначала установите зависимости и закреплённые исходники DSH по [инструкции терминального адаптера](harness-adapter/README.md). Те же исходники используются в интеграционной [проверке плагина](desktop-plugin/README.md#проверка-из-исходников).
-
-Лицензия проекта — [MIT](LICENSE). Часть селекторов Arena адаптирована из [Skainet Bridge](https://github.com/IvanSkainet/arena-agent). [Уведомление](browser-extension/THIRD_PARTY_NOTICES.txt)
+[MIT License](LICENSE) · [Skainet Bridge](https://github.com/IvanSkainet/arena-agent) · [Third-party notices](browser-extension/THIRD_PARTY_NOTICES.txt)

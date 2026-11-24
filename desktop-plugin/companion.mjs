@@ -1,6 +1,24 @@
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+export function companionOptions(packageRoot, config = {}, env = process.env, platform = process.platform) {
+  const bundledCompanion = existsSync(resolve(packageRoot, 'arena_terminal', 'desktop_provider.py'))
+  const cwd = config.bridgeRoot || env.ARENA_BRIDGE_ROOT || (bundledCompanion ? packageRoot : resolve(packageRoot, '..'))
+  const embedded = resolve(packageRoot, 'windows-python', 'python.exe')
+  const command = config.python || env.ARENA_PYTHON || (platform === 'win32' && existsSync(embedded) ? embedded : 'python')
+  let args = ['-u', '-m', 'arena_terminal.desktop_provider']
+  if (command === embedded && resolve(cwd) !== packageRoot) {
+    // An explicit source checkout takes precedence over the isolated runtime's ._pth file.
+    args = ['-u', '-c', 'import os, runpy, sys; sys.path.insert(0, os.getcwd()); runpy.run_module("arena_terminal.desktop_provider", run_name="__main__", alter_sys=True)']
+  }
+  const allowed = ['PATH', 'SystemRoot', 'WINDIR', 'PATHEXT', 'USERPROFILE', 'HOME', 'LOCALAPPDATA',
+    'TEMP', 'TMP', 'TMPDIR', 'DSH_HOME', 'ARENA_DESKTOP_STATE']
+  const childEnv = Object.fromEntries(allowed.filter(key => env[key]).map(key => [key, env[key]]))
+  return { command, args, cwd, env: { ...childEnv, PYTHONUTF8: '1' } }
+}
 
 export class Companion {
   constructor(options) {

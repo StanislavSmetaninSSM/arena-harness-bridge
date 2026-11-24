@@ -1,0 +1,117 @@
+<!doctype html><meta charset="utf-8"><title>Original Arena uploads</title>
+<main></main><output id="out">running</output>
+<script src="../core.js"></script><script src="../generated-images.js"></script><script src="../native-questions.js"></script><script src="../adapter.js"></script>
+<script>
+(async () => {
+  const main=document.querySelector('main');
+  const page=new ArenaPage(document);
+  const assert=(value,message)=>{if (!value) throw Error(message);};
+  // GIF89a, black and white pixels in two distinct frames.
+  const gif=Uint8Array.from(('47494638396101000100800000000000ffffff' +
+    '21f90400050000002c0000000001000100000202440100' +
+    '21f90400050000002c00000000010001000002024c01003b').match(/../g),hex=>parseInt(hex,16));
+  const data=[gif,new Uint8Array([0,255,34,19]),new Uint8Array([17,24]),new Uint8Array()];
+  const names=['движение.gif','binary','binary','empty.unknown'];
+  const types=['image/gif','application/x-example','application/octet-stream',''];
+  const digest=async bytes=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),x=>x.toString(16).padStart(2,'0')).join('');
+  const manifest=await Promise.all(data.map(async(bytes,i)=>({name:names[i],mediaType:types[i],size:bytes.length,sha256:await digest(bytes)})));
+  async function chunks(index,offset) {
+    const part=data[index].slice(offset,offset+17);
+    return {data:btoa(String.fromCharCode(...part)),nextOffset:offset+part.length};
+  }
+  function form(onFiles) {
+    main.innerHTML='<form><textarea></textarea><input type="file" multiple><button type="button" aria-label="Send">Send</button></form>';
+    const input=main.querySelector('input'),field=main.querySelector('textarea');
+    const result={calls:0, sent:0, received:[]};
+    input.onchange=()=>{
+      result.calls++;
+      result.received.push(...input.files);
+      onFiles(input, Array.from(input.files),field);
+    };
+    main.querySelector('button').onclick=()=>{result.sent++;};
+    return result;
+  }
+  function chip(input,file,generic=false) {
+    const card=document.createElement('div'), label=document.createElement('span'),remove=document.createElement('button');
+    label.textContent=file.name;
+    remove.type='button';
+    remove.setAttribute('aria-label',generic ? 'Remove attachment' : 'Remove '+file.name);
+    if (!generic) remove.style.opacity='0'; // hover-only action; the filename is visible at rest
+    card.append(label,remove); input.form.append(card);
+    return card;
+  }
+  const job={id:'originals',text:'Mixed files',files:manifest};
+  const submit=(j,read=chunks)=>page.submit(j,'',()=>true,()=>{},null,false,null,read);
+  let result=form((input,files)=>{files.forEach(file=>chip(input,file));input.value='';});
+  await submit(job);
+  assert(result.sent===1 && result.received.length===4,'one Send must contain all four original attachments');
+  for (const [i,file] of result.received.entries()) {
+    assert(file.name===names[i] && file.type===types[i] && await digest(await file.arrayBuffer())===manifest[i].sha256,
+      'file '+i+' must retain original name, MIME and bytes');
+  }
+  result=form((input,files)=>{files.forEach(file=>chip(input,file,true));});
+  await submit({...job,files:manifest.slice(0,2)});
+  assert(result.calls===1 && result.sent===1,'distinct mixed files use one native selection, with generic remove controls and intact FileList');
+  result=form((input,files,field)=>{
+    const other=document.createElement('div');
+    other.dataset.testid='attachment-preview';other.textContent='other-'+files[0].name;
+    input.value='';input.form.append(other);
+    setTimeout(()=>{field.value='cancel fixture';},250);
+  });
+  let error;
+  try {await submit({...job,files:[manifest[0]]});} catch(e) {error=e;}
+  assert(error && result.sent===0,'a cleared picker with a different filename sharing the same suffix cannot confirm the upload');
+  result=form((input,files,field)=>{
+    for (const file of files) {
+      const card=chip(input,file),preview=document.createElement('div');
+      preview.dataset.testid='attachment-preview'; preview.textContent=file.name; card.prepend(preview);
+    }
+    input.value='';
+    field.oninput=()=>{ const other=document.createElement('div');
+      other.dataset.testid='attachment-preview';other.textContent='unrelated.gif';input.form.append(other); };
+  });
+  error=null;
+  try {await submit({...job,files:[manifest[0]]});} catch(e) {error=e;}
+  assert(result.sent===0 && /changed/i.test(error?.message),'a new preview beside confirmed removal controls must stop Send');
+  result=form((input,files,field)=>{
+    const card=chip(input,files[0]), img=document.createElement('img');
+    img.src='data:image/gif;base64,'+btoa(String.fromCharCode(...gif));card.prepend(img);input.value='';
+    field.oninput=()=>img.replaceWith(img.cloneNode());
+  });
+  error=null;
+  try {await submit({...job,files:[manifest[0]]});} catch(e) {error=e;}
+  assert(result.sent===0 && /changed/i.test(error?.message),'replaced preview inside an unchanged named removal card must stop Send');
+  result=form(()=>{});
+  const foreign=new File(['private note'],'unrelated.txt');
+  const foreignCard=chip(main.querySelector('input'),foreign);
+  error=null;
+  try {await submit(job);} catch(e) {error=e;}
+  assert(error && result.calls===0 && result.sent===0 && foreignCard.isConnected,'preserve a pre-existing file chip after the site cleared its picker');
+  result=form((input)=>{input.form.insertAdjacentHTML('beforeend','<div role="alert">File type not supported here</div>');});
+  error=null;
+  try {await submit(job);} catch(e) {error=e;}
+  assert(result.sent===0 && error?.message.includes('File type not supported here'),'preserve Arena rejection and do not send');
+  result=form((input,files,field)=>{
+    const cards=files.map(file=>chip(input,file));input.value='';
+    field.oninput=()=>cards[0].replaceWith(cards[0].cloneNode(true));
+  });
+  error=null;
+  try {await submit(job);} catch(e) {error=e;}
+  assert(result.sent===0 && /changed/i.test(error?.message),'replaced native file chips stop Send');
+  result=form(()=>{});
+  error=null;
+  try {await submit(job,(index,offset)=>index===1 ? {data:'AAAAAA==',nextOffset:4} : chunks(index,offset));} catch(e) {error=e;}
+  assert(result.sent===0 && /digest|hash|integrity/i.test(error?.message),'corrupt upload must stop before Send');
+  result=form(()=>{});
+  error=null;
+  try {
+    await submit(job,async(index,offset)=>{
+      if (!index && !offset) main.querySelector('textarea').value='my draft';
+      return chunks(index,offset);
+    });
+  } catch(e) {error=e;}
+  assert(error && result.sent===0 && result.calls===0 && main.querySelector('textarea').value==='my draft',
+    'preserve a draft edited while the original bytes are being fetched');
+  document.querySelector('#out').textContent='All fixture checks passed';
+})().catch(error=>document.querySelector('#out').textContent=error.stack || error.message);
+</script>

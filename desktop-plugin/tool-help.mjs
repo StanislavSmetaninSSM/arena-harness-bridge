@@ -90,24 +90,38 @@ function batchReference(members) {
     type:'object', additionalProperties:false, required:['name','arguments'],
     properties:{name:{enum:members},arguments:{type:'object'}},
   }
-  return JSON.stringify({
+  return {
     name:batchName,
     description:'Send two or more independent text inspections in one Desktop call. Use the native arguments for each tool. Results arrive in call order with individual IDs, status and output.',
     parameters:{type:'object', additionalProperties:false, required:['calls'],
       properties:{calls:{type:'array',minItems:2,items:member}}},
-  },null,2)
+  }
+}
+
+// Both supported PTC executors build the runtime's tools namespace from the
+// step view. Their reserved transport and scoped SDK sections identify it;
+// an unrelated schema named run_code does not establish any nested bindings.
+export function programToolRoutes(ctx, agent, toolSet, directTools, sections) {
+  if (!agent || !toolSet || !directTools?.some(tool=>tool.name==='run_code')) return
+  const active = key => sections?.some(item => item.name === key && !item.retire && !item.complete && item.text?.trim())
+  if (!active('tools:ptc-only') || !active('tools:sdk')) return
+  const language = ctx.get?.('ptcRuntime')?.language
+  if (language !== 'typescript' && language !== 'python') return
+  return {language,names:[...toolSet.view(agent).keys()].sort()}
 }
 
 // Harness publishes per-tool and shared tool:* instructions without a family
 // membership field. Shared topics are discoverable by their own section IDs.
-function reference(ctx, assembly, visible, agent, args, bindingSdk) {
-  const runCode = assembly.tools.find(tool => tool.name === 'run_code')
+function reference(ctx, assembly, visible, agent, args, program, bindingSdk) {
   const active = assembly.sections.filter(section => !section.retire && !section.complete && section.text?.trim())
   const render = section => renderPrompt({...assembly, sections:[section]})
-  const hasCua = cuaNames.some(toolName => visible.has(toolName))
   // The bridge's batch and literal script forms operate on direct wire calls.
-  const direct = new Set(assembly.tools.map(tool => tool.name))
-  const batchMembers = [...batchTools].filter(toolName => direct.has(toolName) && visible.has(toolName)).sort()
+  const direct = new Map(assembly.tools.filter(tool=>tool.name!==batchName).map(tool=>[tool.name,tool]))
+  const nested = new Set(program?.names)
+  const callable = toolName => direct.has(toolName) || nested.has(toolName)
+  const hasCua = cuaNames.some(toolName => callable(toolName) && visible.has(toolName))
+  const batchMembers = [...batchTools].filter(toolName => direct.has(toolName)).sort()
+  if (batchMembers.length) direct.set(batchName,batchReference(batchMembers))
   const cua = hasCua && active.find(section => section.name === cuaTopic)
   const cuaHelp = () => cua ? render(cua) : 'Computer Use guidance is unavailable in this step. Wait for current guidance before using Computer Use.'
   // A scope mask also hides a registration from get(name, agent). Check its
@@ -116,44 +130,51 @@ function reference(ctx, assembly, visible, agent, args, bindingSdk) {
   const guides = active.filter(section => {
     if (!section.name.startsWith('tool:')) return false
     const owner = section.name.slice(5)
-    if (cuaNames.includes(owner)) return visible.has(owner)
-    return visible.has(owner) || !scopes.some(scope => ctx.tools.get(owner, scope))
+    if (owner === batchName && !nested.has(owner)) return false
+    if (visible.has(owner)) return callable(owner)
+    if (cuaNames.includes(owner)) return false
+    return !scopes.some(scope => ctx.tools.get(owner, scope))
   })
   if (args.guide !== undefined) {
     if (args.guide === cuaTopic) return cuaHelp()
-    if (args.guide === imageTopic) return "For image generation, use Arena's own image tool and include the image in your final answer for Desktop."
+    if (args.guide === imageTopic) return [
+      "Generate images with Arena's own image tool. When Arena shows a choice panel, the bridge sends its previews to Desktop.",
+      "The user chooses a variant. Wait for their choice, then continue in Arena.",
+      "Once Arena shows the finished images in your reply, finish your answer normally. The bridge automatically delivers each displayed image to Desktop.",
+    ].join(' ')
     const guide = guides.find(section => section.name === args.guide)
     return guide ? render(guide) : 'Tool guide unavailable. Request {} for published topics.'
   }
 
   const definition = visible.get(args.name)
-  const sdk = runCode && active.find(section => section.name === 'tools:sdk')
+  const sdk = program && active.find(section => section.name === 'tools:sdk')
   if (args.sdk && (args.name === undefined || args.name === 'run_code')) {
     return sdk ? render(sdk) : 'No program executor SDK is available in this step.'
   }
   if (args.name === undefined) {
-    const names = new Set(visible.keys())
-    if (!runCode) names.delete(batchName)
-    if (batchMembers.length) names.add(batchName)
-    if (runCode) names.add(runCode.name)
-    const intro = runCode ? 'Inside run_code use await tools[name](args). Request {sdk:true} for the program SDK.'
-      : 'Use the listed Harness tools directly.'
     const topics = [imageTopic,...guides.map(section => section.name)]
     if (cua) topics.push(cuaTopic)
-    const lines = [intro, 'Tools (request with name):', ...[...names].sort(), '',
-      'Published instructions (request with guide):', ...topics.sort()]
-    if (visible.has('skill')) lines.push('', 'For available skills, request {name:"skill"}.')
+    const lines = ['Direct Desktop calls (request help with name):', ...[...direct.keys()].sort()]
+    if (program) lines.push('', 'Inside run_code ('+program.language+'), request help with name:', ...program.names,
+      'Request {sdk:true} for the native program SDK.')
+    lines.push('', 'Published instructions (request with guide):', ...topics.sort())
+    if (callable('skill') && visible.has('skill')) lines.push('', 'For available skills, request {name:"skill"}.')
     return lines.join('\n')
   }
-  if (args.name === batchName && !runCode) {
-    if (!batchMembers.length) return 'Tool unavailable in this step. Request the current list with {}.'
-    return args.sdk ? 'The read batch is a direct Desktop call.' : batchReference(batchMembers)
-  }
-  const tool = definition ?? (args.name === runCode?.name ? runCode : undefined)
-  if (!tool) return 'Tool unavailable in this step. Request the current list with {}.'
-  const entry = {name:tool.name, description:tool.description, parameters:tool.parameters}
+  if (args.sdk && args.name === batchName && batchMembers.length && !nested.has(batchName))
+    return 'The read batch is a direct Desktop call.'
+  const outer = direct.get(args.name)
+  const binding = nested.has(args.name) && definition
+  if (!outer && !binding) return 'Tool unavailable in this step. Request the current list with {}.'
+  const schema = (tool, output) => JSON.stringify({
+    name:tool.name,description:tool.description,parameters:tool.parameters,canonicalOutput:output,
+  },null,2)
   const parts = []
-  if (definition && sdk && bindingSdk) {
+  if (outer) parts.push('Direct Desktop call: use '+JSON.stringify(args.name)+' as the tool name.\n'+
+    schema(outer,binding || args.name === batchName ? undefined : definition?.output.schema))
+  if (binding) parts.push('Inside run_code ('+program.language+'): await tools['+JSON.stringify(args.name)+'](args). Pass the arguments below as one '+
+    (program.language==='python'?'Python dictionary.':'object.')+'\n'+schema(binding,binding.output.schema))
+  if (binding && sdk && bindingSdk) {
     // A presentation shortcut only. When the native renderer changes its
     // layout, the lossless per-binding SDK remains available in full.
     const outputMap = /^interface ToolOutputMap \{[\s\S]*?^\}/m.exec(bindingSdk)?.[0]
@@ -163,16 +184,14 @@ function reference(ctx, assembly, visible, agent, args, bindingSdk) {
   } else if (args.sdk) {
     return 'No program executor SDK is available in this step.'
   }
-  if (definition) entry.canonicalOutput = definition.output.schema
   if (cuaNames.includes(args.name)) parts.push(cuaHelp())
   if (args.name === 'pwsh' && direct.has('pwsh')) parts.push(literalScriptHelp)
-  if (args.name === 'skill') {
+  if (args.name === 'skill' && definition) {
     const skills = currentSkills(agent)
     parts.push(skills.length ? ['Available skills:',...skills.map(entry => entry.name+' — '+entry.description)].join('\n') : 'No skills are listed in the current catalog.')
   }
   const guide = guides.find(section => section.name === 'tool:'+args.name)
   if (guide) parts.push(guide.name+'\n'+render(guide))
-  parts.push(JSON.stringify(entry,null,2))
   return parts.join('\n\n')
 }
 
@@ -207,14 +226,17 @@ export function registerToolHelp(ctx) {
     const context = {agent,scope:agent,session:agent.session,toolSet,signal,modelSelection:selection}
     const assembly = await ctx.systemPrompt.assemble(context)
     signal.throwIfAborted()
-    const bindingSdk = admitted.has(args.name) && assembly.tools.some(tool => tool.name === 'run_code')
-      ? await singleBindingSdk(ctx,context,args.name) : undefined
+    const program = programToolRoutes(ctx,agent,toolSet,assembly.tools,assembly.sections)
+    const alias = args.guide?.startsWith('tool:') ? args.guide.slice(5) : undefined
+    const query = alias && (assembly.tools.some(tool=>tool.name===alias || (alias===batchName && batchTools.has(tool.name))) || program?.names.includes(alias))
+      ? {name:alias} : args
+    const bindingSdk = program?.names.includes(query.name) ? await singleBindingSdk(ctx,context,query.name) : undefined
     signal.throwIfAborted()
     const visible = toolSet.view(agent)
     if (visible.get(name)!==help) throw Error('Tool help is no longer available in this step.')
     if (visible.size !== admitted.size || [...admitted].some(([key, definition]) => visible.get(key) !== definition))
       throw Error('The set of admitted tools changed while preparing help. Request the current page again.')
-    return page(reference(ctx,assembly,visible,agent,args,bindingSdk), [args.name??null,args.guide??null,args.sdk===true], args.cursor)
+    return page(reference(ctx,assembly,visible,agent,query,program,bindingSdk), [args.name??null,args.guide??null,args.sdk===true], args.cursor)
   }}
   ctx.tools.register(help,{when:({modelSelection})=>modelSelection.provider===selection.provider && modelSelection.model===selection.model})
   ctx.systemPrompt.section({name:sectionName,order:ctx.systemPrompt.getSectionOrder('TOOLS_SDK'),interpolate:false,

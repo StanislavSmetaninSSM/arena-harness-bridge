@@ -26,6 +26,13 @@ class InvalidToolSource(Problem):
         self.retryable = retryable
 
 
+class UnavailableTool(InvalidToolSource):
+    """An intact current command whose name is outside the direct tool catalog."""
+    def __init__(self, frame):
+        super().__init__("Arena sent an invalid or unavailable local tool command. The tool was not run.")
+        self.frame = frame
+
+
 def new_id():
     return uuid.uuid4().hex
 
@@ -176,8 +183,10 @@ def source_tool_frame(source, delivery, allowed=TERMINAL_TOOL_NAMES):
     except (ValueError, RecursionError):
         raise InvalidToolSource("Arena sent invalid JSON for a local tool. The tool was not run.") from None
     frame = _validated_tool_object(data, delivery)
-    if not frame or frame["name"] not in allowed:
+    if not frame:
         raise InvalidToolSource("Arena sent an invalid or unavailable local tool command. The tool was not run.")
+    if frame["name"] not in allowed:
+        raise UnavailableTool(frame)
     return frame
 
 
@@ -211,6 +220,7 @@ def tool_frame(text, delivery, allowed=TERMINAL_TOOL_NAMES):
 
 class Journal:
     supports_native_questions = False
+    supports_files = False
 
     def __init__(self, path, root):
         self.lock = threading.RLock()
@@ -394,6 +404,8 @@ class Journal:
             elif ready is True and not address.get("nativeQuestionId"):
                 row = self.one("SELECT * FROM jobs WHERE id=?", (row["id"],))
                 job = {k: row[k] for k in ("id", "text", "png") if row[k] is not None}
+                if not self.prepare_delivery(job, address):
+                    return None
                 images = self.sql.execute("SELECT bytes FROM outgoing_pngs WHERE job=? ORDER BY position", (row["id"],))
                 pngs = [base64.b64encode(image["bytes"]).decode("ascii") for image in images]
                 if pngs:
@@ -419,11 +431,16 @@ class Journal:
             self.sql.execute("UPDATE jobs SET state='offered' WHERE id=?", (row["id"],))
             return job
 
+    def prepare_delivery(self, job, address):
+        """Attach additional payloads supported by this journal before offering the job."""
+        return True
+
     def _queued_job(self, supports_png_batch):
         if self.paused() or self.one("SELECT id FROM jobs WHERE state IN ('offered','waiting','uncertain','tool','held','limited')"):
             return None
         row = self.one("""SELECT id,state,EXISTS(SELECT 1 FROM outgoing_pngs WHERE job=jobs.id) AS has_batch
-                          FROM jobs WHERE state IN ('queued','question_queued') ORDER BY (parent IS NULL),rowid LIMIT 1""")
+                          FROM jobs WHERE state IN ('queued','question_queued') OR (state='files_queued' AND ?)
+                          ORDER BY (parent IS NULL),rowid LIMIT 1""", (self.supports_files,))
         if row and row["has_batch"] and supports_png_batch is not True:
             raise Problem("Update the Arena Bridge extension to receive the queued multi-image turn")
         return row

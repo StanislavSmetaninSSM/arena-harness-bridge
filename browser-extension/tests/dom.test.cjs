@@ -47,6 +47,8 @@ function serveRawReplyFixture() {
 for (const [fixture, description] of [
   ['fixture.html', 'sending, completion, PNG verification and draft protection'],
   ['batch.html', 'atomic ordered PNG uploads and upload rejection'],
+  ['files.html', 'original user files, mixed formats and native upload rejection'],
+  ['../../desktop-plugin/test/original-files-client.html', 'Desktop picker, paste and drop route original files to the addressed composer'],
   ['questions.html', 'native single-choice question controls and terminal widgets'],
   ['image-choices.html', 'native image choice previews and exact controls'],
   ['status-authority.html', 'standalone final tool frames after native status rows'],

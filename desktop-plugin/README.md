@@ -2,13 +2,13 @@
 
 Плагин добавляет модель **Arena Agent Mode** и команду **Connect Arena / Подключить Arena** (`/arena-pair`). Установите его с Python-компаньоном и расширением Chrome по [инструкции Windows](../INSTALL.md).
 
-Пакет 0.1.17 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
+Пакет 0.1.20 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
 
-**English** — Plugin 0.1.17 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+**English** — Plugin 0.1.20 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
 
-Перед работой с незнакомым инструментом Arena может запросить справку через `arena_tool_help`. Пустой запрос перечисляет доступные инструменты. Запрос `{"name":"read"}` возвращает описание, схему аргументов и результата, а также отдельную штатную инструкцию `tool:read`, если она опубликована. В программном режиме справка вызывается внутри `run_code`. Запрос `{"sdk":true}` открывает штатный SDK. Если пришёл `nextCursor`, его передают как `cursor` с теми же аргументами. Новые зарегистрированные инструменты появляются при следующем ходе, в котором Harness разрешил их использовать.
+Arena запрашивает справку через `arena_tool_help`. Пустой запрос показывает, какие инструменты на текущем шаге вызываются напрямую и какие доступны внутри `run_code`. Запрос `{"name":"read"}` возвращает способ вызова, параметры, сведения о результате и опубликованную Harness инструкцию. Ссылка на индивидуальную инструкцию `{"guide":"tool:read"}` открывает ту же справку. Запрос `{"sdk":true}` открывает штатный SDK. Если пришёл `nextCursor`, его передают как `cursor` с теми же аргументами. Справка о новом инструменте появляется, как только Harness допускает его к работе на этом шаге.
 
-**English** — Arena can look up unfamiliar tools with `arena_tool_help`. Call it with `{}` to list the current step's tools, or with `{"name":"read"}` to get the description, input and available output schema, and the published `tool:read` instructions when present. In program mode call the helper inside `run_code`. Use `{"sdk":true}` for the native SDK. Pass a returned `nextCursor` as `cursor` with the same query to continue. Newly registered tools appear on the next step that admits them.
+**English** — Call `arena_tool_help` with `{}` to see which tools can be called directly and which are available inside `run_code` on the current step. Use `{"name":"read"}` for its call route, arguments, return information and any instructions published by Harness. A link to an individual tool guide such as `{"guide":"tool:read"}` opens the same reference. Use `{"sdk":true}` for the native SDK. Pass a returned `nextCursor` as `cursor` with the same query to continue. New tools appear as soon as the active Harness step admits them.
 
 Пустой запрос также показывает общие инструкции. Например, `{"guide":"tool:schedule"}` возвращает опубликованные правила планировщика. Для одного программного вызова запрос `{"name":"read_image","sdk":true}` показывает тип результата, который получает программа.
 
@@ -27,7 +27,7 @@ At the start of a conversation the bridge explains how to use Desktop and gives 
 - В обычном режиме пишите задания в поле чата Desktop. Запросы инструментов проходят через штатный исполнитель и разрешения рабочего профиля.
 - В режиме `/plan` Arena получает инструкцию текущего режима. Готовый план открывает штатную карточку согласования. После утверждения следующая доставка сообщает модели, что можно приступить к работе.
 - `/goal` использует штатные раунды Harness. Число раундов, пауза и продолжение управляются в Desktop.
-- Для файлов можно передать ссылку на путь, а содержимое возвращает доступный локальный инструмент. Статические изображения отправляются отдельными PNG в одном сообщении, до 20 кадров в пределах 4 МиБ на кадр и 32 МиБ суммарно. Arena может задать меньший предел. Сгенерированные изображения Arena появляются в Desktop отдельными вложениями.
+- В разговоре с моделью Arena Agent Mode нажмите **+ → Файл**, выберите файлы с диска и отправьте сообщение. Мост передаёт выбранные оригиналы в порядке прикрепления и сохраняет анимацию GIF. Проверку загрузки выполняет форма Arena. Введённый вручную путь остаётся текстом. Изображения, которые Arena сгенерировала в ответ, появляются в Desktop отдельными вложениями.
 - На поддерживаемых карточках Arena варианты отображаются в Desktop через штатный `ask_user_question`. Управление подбором инструмента зависит от включённого набора инструментов сессии.
 
 ## Маршрутизация ответа

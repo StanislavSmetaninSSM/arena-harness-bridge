@@ -26,6 +26,7 @@ const ArenaPage = (() => {
   const quota = /\b(?:413|429)\b|too many (?:requests|messages|files|attachments|images)|(?:rate|daily|usage|upload|attachment|file|image|message|character|token)[ -]?(?:limit|quota).*(?:exceed|reach|exhaust)|(?:reach|exceed|exhaust).{0,40}(?:limit|quota)|rate[- ]limit|(?:file|image|payload|attachment|request|message) (?:is )?too (?:large|long)|(?:maximum|max).{0,20}(?:files|attachments|images) (?:allowed|reached)|лимит.{0,20}(?:исчерпан|превышен|достигнут)|(?:достиг|превыш|исчерп).{0,35}лимит|слишком (?:много|больш|длин)/iu;
   const quotaWarning = /\b(?:limit|quota)\s+(?:is\s+)?(?:almost|nearly)\s+(?:reached|exhausted)\b|(?:лимит|квота)\s+почти\s+\p{L}+/giu;
   const failed = /(?:upload|attachment|request|send|message|file).{0,25}(?:failed|error|rejected)|(?:failed|unable|could not) to (?:send|upload|attach)|ошибка.{0,20}(?:отправки|загрузки)|не удалось (?:отправить|загрузить)/iu;
+  const rejectedFile = /(?:file|format|attachment).{0,35}(?:unsupported|not supported|not allowed|invalid)|(?:unsupported|invalid|disallowed) (?:file|format|attachment)|(?:тип|формат) файла.{0,30}(?:не поддерживается|запрещён)/iu;
   const sanitized = text => String(text || '').replace(/[\p{Cc}\p{Cf}\s]+/gu, ' ').trim().slice(0, 320);
   const issueError = issue => Object.assign(new Error(issue.text), { kind: issue.kind });
   const limited = text => issueError({ kind:'limited', text });
@@ -89,7 +90,7 @@ const ArenaPage = (() => {
       if (el === credit || ownDetail && detail.contains(el) || !visible(el) || el.closest(transcript) || el.querySelector(transcript)) continue;
       const message = sanitized([el.innerText,el.title,el.getAttribute('aria-label')].filter(Boolean).join(' '));
       if (quota.test(message.replace(quotaWarning,''))) return { kind:'limited', text:message };
-      if (failed.test(message) || el.dataset.uploadStatus === 'error') return { kind:'blocked', text:message || 'Arena reported an upload error.' };
+      if (failed.test(message) || rejectedFile.test(message) || el.dataset.uploadStatus === 'error') return { kind:'blocked', text:message || 'Arena reported an upload error.' };
     }
     return credit ? {kind:'limited', text:ownDetail ? description : label, account:true} : null;
   }
@@ -134,6 +135,89 @@ const ArenaPage = (() => {
 
   function previewNames(preview) {
     return [preview.alt, preview.title, preview.getAttribute('aria-label'), preview.textContent].filter(Boolean);
+  }
+
+  function removalButtons(scope, includeHidden = false) {
+    // A filename stays visible when its removal button is transparent until hover.
+    return all(scope,'button[aria-label],button[title]').filter(button =>
+      /^(?:Remove|Удалить)\s/i.test(button.getAttribute('aria-label') || button.title) &&
+      (includeHidden || !button.closest('[hidden],[inert],[aria-hidden="true" i]') &&
+        button.checkVisibility({visibilityProperty:true}) && button.getClientRects().length));
+  }
+
+  function originalFileChips(scope, attached, selection) {
+    if (all(scope,pendingUpload).some(visible)) return null;
+    const current = all(scope,'input[type="file"]').flatMap(input => Array.from(input.files));
+    if (current.length && (current.length !== selection.length || current.some((file,i) => file !== selection[i]))) return null;
+    const buttons = removalButtons(scope);
+    const previews = previewNodes(scope);
+    if (!buttons.length) {
+      if (previews.length!==attached.length || !previews.every((node,i)=>
+        (node.tagName!=='IMG' || node.complete && node.naturalWidth>0) &&
+        (previewNames(node).includes(attached[i].name) || node.tagName==='IMG' && current.length && attached.length===1))) return null;
+      return previews.map(preview=>({preview,source:previewSource(preview)}));
+    }
+    if (buttons.length !== attached.length) return null;
+    const remaining = new Set(previews);
+    const chips = [];
+    for (const [index,button] of buttons.entries()) {
+      const label = button.getAttribute('aria-label') || button.title;
+      const name = attached[index].name;
+      let card = button.closest('[data-testid="attachment-preview"],[data-upload-status="complete"]') || button.parentElement;
+      if (label !== 'Remove '+name && label !== 'Удалить '+name) {
+        if (!/^(?:remove (?:file|image|attachment)|удалить (?:файл|изображение|вложение))$/i.test(label)) return null;
+        while (card && card!==scope && !buttons.some(other=>other!==button && card.contains(other))) {
+          if (all(card,'[title],[alt],span,p,div').some(el =>
+            el.title === name || el.alt === name || !el.children.length && el.textContent === name)) break;
+          card=card.parentElement;
+        }
+        if (!card || card===scope || buttons.some(other=>other!==button && card.contains(other))) return null;
+      }
+      // A separate preview anywhere else in the composer belongs to another attachment.
+      const owned = card && card!==scope ? previews.filter(node=>card.contains(node)) : [];
+      if (owned.length>1) return null;
+      const preview = owned[0];
+      if (preview && !remaining.delete(preview)) return null;
+      chips.push({button,preview,source:preview && previewSource(preview)});
+    }
+    return remaining.size ? null : chips;
+  }
+
+  const sameFileChip = (first,next) => first?.button===next?.button && first?.preview===next?.preview &&
+    first?.source===next?.source;
+
+
+  async function originalFile(entry, index, readChunk) {
+    if (!entry || typeof entry.name !== 'string' || !entry.name || typeof entry.mediaType !== 'string' ||
+        !Number.isSafeInteger(entry.size) || entry.size < 0 || !/^[0-9a-f]{64}$/.test(entry.sha256))
+      throw Error('Invalid Desktop attachment metadata.');
+    const chunks = [];
+    let offset = 0;
+    do {
+      const part = await readChunk(index,offset);
+      if (typeof part?.data !== 'string' || !Number.isSafeInteger(part.nextOffset) ||
+          part.nextOffset < offset || part.nextOffset === offset && offset < entry.size || part.nextOffset > entry.size)
+        throw Error('Invalid Desktop file chunk.');
+      const raw = atob(part.data);
+      if (raw.length !== part.nextOffset-offset) throw Error('Incomplete Desktop file chunk.');
+      const bytes=new Uint8Array(raw.length);
+      for (let i=0; i<raw.length; i++) bytes[i]=raw.charCodeAt(i);
+      chunks.push(bytes);
+      offset=part.nextOffset;
+    } while (offset<entry.size);
+    const file=new File(chunks,entry.name,{type:entry.mediaType});
+    const hash=new Uint8Array(await crypto.subtle.digest('SHA-256',await file.arrayBuffer()));
+    if (Array.from(hash,byte=>byte.toString(16).padStart(2,'0')).join('') !== entry.sha256)
+      throw Error('Desktop file digest mismatch. No attachment was submitted.');
+    return file;
+  }
+
+  function originalInput(scope) {
+    const inputs=all(scope,'input[type="file"]').filter(input=>!input.disabled);
+    if (inputs.length===1) return inputs[0];
+    const general=inputs.filter(input=>!input.accept.trim() || input.accept.trim()==='*/*');
+    if (general.length===1) return general[0];
+    throw Error('Cannot identify the file picker in the Arena composer.');
   }
 
   function pngPayloads(job) {
@@ -709,7 +793,8 @@ const ArenaPage = (() => {
       const value = field ? draft(field) : null;
       const emptyTipTap = scope && field?.matches('.tiptap.ProseMirror') && value === '' && buttons.length === 0;
       const idle = !!(active(field) && !field.readOnly && (button || emptyTipTap) && !generating && !review && !issue && !verification);
-      const upload = scope && (all(scope, attachments + ',' + pendingUpload).some(visible) || all(scope, 'input[type="file"]').some(el => el.files.length));
+      const upload = scope && (all(scope, attachments + ',' + pendingUpload).some(visible) || removalButtons(scope).length>0 ||
+        all(scope, 'input[type="file"]').some(el => el.files.length));
       const hiddenEditors = review ? editorsOutsideChat.filter(el => !visible(el)) : [];
       return { field, scope, button, ambiguous: fields.length > 1, generating, idle, value, upload, review, hiddenEditors, verification,
         reviewAction: reviewers.length === 1 ? reviewAction(reviewers[0]) : null,
@@ -726,7 +811,7 @@ const ArenaPage = (() => {
         const contents = draft(field);
         if (contents && (field !== ownedField || contents !== ownedText)) return false;
         const scope = composerScope(field);
-        if (scope && scope !== attachmentScope && (scope.querySelector(attachments + ',' + pendingUpload) ||
+        if (scope && scope !== attachmentScope && (scope.querySelector(attachments + ',' + pendingUpload) || removalButtons(scope,true).length ||
             all(scope,'input[type="file"]').some(el => el.files.length))) return false;
       }
       this.continuedReview = true;
@@ -752,12 +837,14 @@ const ArenaPage = (() => {
       };
     }
 
-    async submit(job, expectedDraft, sameContext, beforeClick, retained = null, recover = false, discardStagedText = null) {
+    async submit(job, expectedDraft, sameContext, beforeClick, retained = null, recover = false, discardStagedText = null, readChunk = null) {
       const suffix = typeof job.receipt==='string' && /^Bridge delivery [a-f\d]{32}$/.test(job.receipt) ?
         '\n\n'+job.receipt : '';
       const payloadText = suffix && job.text.endsWith(suffix) ? job.text.slice(0,-suffix.length) : job.text;
       if (payloadText.length > 180000 && Array.from(payloadText).length > 180000) throw limited('The bridge allows 180000 Unicode characters per turn.');
       const payloads = pngPayloads(job);
+      if ('files' in job && (!Array.isArray(job.files) || !job.files.length || payloads.length || retained || !readChunk))
+        throw Error('Invalid Desktop file delivery.');
       const checkLimit = field => {
         const siteMax = textLimit(field);
         if (job.text.length > siteMax) throw limited('Arena composer allows ' + siteMax + ' UTF-16 units. Draft requires ' + job.text.length + '.');
@@ -830,7 +917,34 @@ const ArenaPage = (() => {
       ({field, scope} = await wait(state => state, 7000, 'Arena did not restore an idle composer before Send.'));
       checkLimit(field);
       let accepted = retained || (() => true);
-      if (payloads.length) {
+      if (job.files) {
+        const input=originalInput(scope), limits=fileLimits(input);
+        if (job.files.length>limits.count || job.files.some(file=>file.size>limits.bytes))
+          throw limited('The selected files exceed the limits shown by the Arena file picker.');
+        const files=[];
+        for (const [index,entry] of job.files.entries()) files.push(await originalFile(entry,index,readChunk));
+        // Some forms clear their FileList. Add repeated names one at a time so
+        // each removal control can be tied to the specific original we appended.
+        const separate=!input.multiple || new Set(files.map(file=>file.name)).size!==files.length;
+        const batches=separate ? files.map(file=>[file]) : [files];
+        const attached=[];
+        let confirmed=[];
+        for (const selection of batches) {
+          if (!check() || !accepted()) throw Error('The Arena draft changed during file preparation.');
+          const picker=originalInput(scope), transfer=new DataTransfer();
+          for (const file of selection) transfer.items.add(file);
+          attaching=true;
+          picker.files=transfer.files;
+          picker.dispatchEvent(new Event('change',{bubbles:true}));
+          attached.push(...selection);
+          const previous=confirmed;
+          confirmed=await wait(()=>originalFileChips(scope,attached,selection),120000,
+            'Arena did not confirm all selected files in order. Inspect its attachment list.');
+          if (!previous.every((chip,i)=>sameFileChip(chip,confirmed[i]))) throw Error('Attached files changed while adding the next original.');
+          accepted=()=>originalFileChips(scope,attached,selection)?.every((chip,i)=>
+            sameFileChip(chip,confirmed[i]));
+        }
+      } else if (payloads.length) {
         const inputs = all(scope, 'input[type="file"]').filter(el => !el.disabled && (!el.accept || /image\/(?:\*|png)|\.png\b/i.test(el.accept)));
         if (inputs.length !== 1) throw Error('Cannot identify one PNG attachment input.');
         const files = pngFiles(payloads, inputs[0]);

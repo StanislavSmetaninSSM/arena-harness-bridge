@@ -19,7 +19,7 @@ const secret = 'UNRELATED_PRIVATE_CONTENT'
 const tool = (name, description) => ({name, description, parameters:{type:'object', required:['file'], properties:{file:{type:'string',description:'local file'}}},
   output:{schema:{type:'integer'},render:()=>[]},execute(){throw Error('Documented tool executed')}})
 
-async function harness(t, ptc=false, parent) {
+async function harness(t, ptc=false, parent, language='typescript') {
   const ctx = new Context()
   t.after(()=>ctx.fiber.dispose())
   await ctx.plugin((await import('@deepseek-ai/dsh-session')).default)
@@ -30,8 +30,12 @@ async function harness(t, ptc=false, parent) {
   ctx.systemPrompt.section({name:'persona',order:4,text:secret})
   ctx.systemPrompt.context({name:'cwd',order:4,text:secret})
   const runCode = {name:'run_code',description:'Runtime syntax',parameters:{type:'object'}}
-  if (ptc) ctx.tools.setExecutor({describe:()=>({schemas:[runCode]}),sections:[
-    {name:'tools:sdk',order:5,text:typeof ptc === 'function' ? ptc : defs=>'Native SDK\n'+defs.map(d=>d.name).join('\n')}]})
+  if (ptc) {
+    ctx.provide('ptcRuntime',{language})
+    ctx.tools.setExecutor({describe:()=>({schemas:[runCode]}),sections:[
+      {name:'tools:ptc-only',order:4,text:'Use run_code for SDK bindings.'},
+      {name:'tools:sdk',order:5,text:typeof ptc === 'function' ? ptc : defs=>'Native SDK\n'+defs.map(d=>d.name).join('\n')}]})
+  }
   else await ctx.plugin(await import('@deepseek-ai/dsh-tool-executor-native'))
   const { Session } = await import('@deepseek-ai/dsh-session')
   const agent = {session:Session.create('help-fixture')}
@@ -170,6 +174,90 @@ async function fullHelp(call, query) {
   return document
 }
 
+test('full reference follows current direct and program routes for previously unknown tools', async t=>{
+  for (const language of ['typescript','python']) {
+    const {ctx,prepare} = await harness(t,true,undefined,language)
+    ctx.tools.register(tool('new-reader.v2','New plugin reader'))
+    ctx.tools.register(tool('disabled_now','Never mention this'),{when:()=>false})
+    ctx.systemPrompt.section({name:'tool:new-reader.v2',order:5,text:'Use the configured workspace.'})
+    const outer = {name:'side_channel',description:'Independent provider schema',parameters:{type:'object'}}
+    ctx.systemPrompt.tools(()=>({schemas:[outer]}))
+    const {call} = await prepare()
+    const list = await fullHelp(call,{})
+    assert.match(list,/Direct[^\n]*:\nrun_code\nside_channel(?:\n|$)/)
+    assert.match(list,new RegExp('Inside run_code \\('+language+'\\)[^\\n]*:\\narena_tool_help\\nnew-reader\\.v2','i'))
+    assert.doesNotMatch(list,/disabled_now|New plugin reader/)
+    const individual = await fullHelp(call,{name:'new-reader.v2'})
+    assert.match(individual,new RegExp('^Inside run_code \\('+language+'\\)','i'))
+    assert.match(individual,/await tools\["new-reader\.v2"\]\(args\)/)
+    for (const expected of ['New plugin reader','local file','required','integer','Use the configured workspace.']) assert.ok(individual.includes(expected),expected)
+    assert.equal(await fullHelp(call,{guide:'tool:new-reader.v2'}),individual)
+    assert.match(await fullHelp(call,{name:'side_channel'}),/^Direct Desktop call[\s\S]*Independent provider schema/)
+  }
+})
+
+test('the direct tool alias also returns its parameters if Harness publishes no usage section',async t=>{
+  const {ctx,prepare} = await harness(t)
+  ctx.tools.register(tool('unpinned','Visible this step'))
+  const {call} = await prepare()
+  const page = await fullHelp(call,{name:'unpinned'})
+  assert.match(page,/^Direct Desktop call[\s\S]*local file/)
+  assert.equal(await fullHelp(call,{guide:'tool:unpinned'}),page)
+})
+
+test('a run_code schema alone cannot turn every registration into a program binding',async t=>{
+  const {ctx,prepare} = await harness(t)
+  ctx.tools.register(tool('direct_reader','Native reader'))
+  ctx.provide('ptcRuntime',{language:'typescript'})
+  ctx.systemPrompt.tools(()=>({schemas:[{name:'run_code',description:'Other provider',parameters:{type:'object'}}]}))
+  const {call} = await prepare()
+  const catalog = await fullHelp(call,{})
+  assert.match(catalog,/Direct[^\n]*:[\s\S]*direct_reader/)
+  assert.doesNotMatch(catalog,/Inside run_code/)
+  assert.doesNotMatch(await fullHelp(call,{name:'direct_reader'}),/Inside run_code/)
+})
+
+test('overlapping routes keep each executor schema when their arguments differ',async t=>{
+  const {ctx,prepare} = await harness(t,true)
+  ctx.tools.register(tool('mixed_tool','Inner tool expecting a file'))
+  ctx.systemPrompt.tools(()=>({schemas:[{name:'mixed_tool',description:'Direct query by id',parameters:{
+    type:'object',required:['id'],properties:{id:{type:'integer'}}}}]}))
+  const {call} = await prepare()
+  const doc = await fullHelp(call,{name:'mixed_tool'})
+  assert.match(doc,/Direct Desktop call[\s\S]*Direct query by id[\s\S]*"id"/)
+  assert.match(doc,/Inside run_code[\s\S]*Inner tool expecting a file[\s\S]*"file"/)
+})
+
+test('a shadowing direct schema does not publish a disabled registration’s named guide',async t=>{
+  const {ctx,prepare} = await harness(t)
+  ctx.tools.register(tool('overlap','Disabled registration'),{when:()=>false})
+  ctx.systemPrompt.section({name:'tool:overlap',order:5,text:'PRIVATE DISABLED GUIDE'})
+  ctx.systemPrompt.section({name:'tool:independent',order:5,text:'Independent published guidance'})
+  ctx.systemPrompt.tools(()=>({schemas:[{name:'overlap',description:'Admitted outer schema',parameters:{type:'object'}}]}))
+  const {call} = await prepare()
+  for (const query of [{name:'overlap'},{guide:'tool:overlap'}]) {
+    const result = await fullHelp(call,query)
+    assert.match(result,/Direct Desktop call[\s\S]*Admitted outer schema/)
+    assert.doesNotMatch(result,/Disabled registration|PRIVATE DISABLED GUIDE/)
+  }
+  const index = await fullHelp(call,{})
+  assert.doesNotMatch(index,/tool:overlap/)
+  assert.match(index,/tool:independent/)
+  assert.match(await fullHelp(call,{guide:'tool:independent'}),/Independent published guidance/)
+})
+
+test('batch documentation uses the same offered direct read tools as the provider in mixed mode',async t=>{
+  const {ctx,prepare} = await harness(t,true)
+  ctx.tools.register(tool('read','Program-only reader'))
+  ctx.tools.register(tool('arena_read_batch','Unrelated installed SDK binding'))
+  ctx.systemPrompt.tools(()=>({schemas:[{name:'glob',description:'Direct search',parameters:{type:'object'}}]}))
+  const {call} = await prepare()
+  const doc = await fullHelp(call,{name:'arena_read_batch'})
+  assert.match(doc,/Direct Desktop call[\s\S]*"glob"/)
+  assert.doesNotMatch(doc,/"read"/)
+  assert.match(doc,/Inside run_code[\s\S]*Unrelated installed SDK binding[\s\S]*"file"/)
+})
+
 const cuaTopic = 'computer-use:dsh-cua'
 for (const [ptc, cuaName] of [[false,'cua_run_code'],[true,'cua']]) {
   test('only an explicit query reads the current Computer Use guide for '+cuaName, async t=>{
@@ -236,7 +324,12 @@ test('image generation instructions are discoverable as their own bridge topic',
   const {call} = await prepare()
   assert.match(await fullHelp(call,{}),/bridge:images/)
   assert.doesNotMatch(await fullHelp(call,{name:'read'}),/image generation/)
-  assert.match(await fullHelp(call,{guide:'bridge:images'}),/Arena.*image.*final answer/is)
+  const guide = await fullHelp(call,{guide:'bridge:images'})
+  assert.match(guide,/Arena.*image.*finish your answer normally/is)
+  assert.match(guide,/user.*chooses|user.*selects/i)
+  assert.match(guide,/bridge.*previews/i)
+  assert.match(guide,/automatically delivers each displayed image/i)
+  assert.doesNotMatch(guide,/attach each|upload each/i)
 })
 
 test('only help for the admitted skill loader exposes the current skill catalog', async t=>{
@@ -282,7 +375,7 @@ test('a child cannot reclassify a masked parent registration as a shared guide',
 
 for (const mode of ['native','ptc']) {
   test('Arena receives help from the Harness '+mode+' execution loop', {timeout:20000}, async t=>{
-    const { mkdtemp, rm } = await import('node:fs/promises')
+    const { mkdtemp, rm, writeFile } = await import('node:fs/promises')
     const { tmpdir } = await import('node:os')
     const { join } = await import('node:path')
     const { ArenaAdapter } = await import('../provider.mjs')
@@ -296,6 +389,8 @@ for (const mode of ['native','ptc']) {
     }
     await ctx.plugin((await import('@deepseek-ai/dsh-fs-local')).default,{cwd:root})
     await ctx.plugin((await import('@deepseek-ai/dsh-working-directory')).default)
+    await ctx.plugin(await import('@deepseek-ai/dsh-fs-observation-policy'))
+    await ctx.plugin(await import('@deepseek-ai/dsh-tool-fs'),{readImage:false,write:false})
     if (mode==='ptc') {
       for (const service of ['subprocess-local','sandbox-local','sandbox-policy','ptc-runtime-node']) {
         await ctx.plugin((await import('@deepseek-ai/dsh-'+service)).default,service==='sandbox-policy' ? {mode:'danger-full-access'} : {})
@@ -306,9 +401,22 @@ for (const mode of ['native','ptc']) {
     await ctx.plugin({name:'reference-registration',inject:['systemPrompt','tools'],apply:registerToolHelp})
     ctx.tools.register(tool(target,'Dynamic reference entry'))
     const requests = []
+    const reads = []
+    ctx.on('tools/execute',(exec,next)=>{
+      if (exec.name==='read') reads.push(exec.arguments.file_path)
+      return next()
+    })
+    let reading = false
     const peer = {async rpc(method,request) {
       if (method==='setup') return {supportsOnDemandContext:true,supportsToolHelp:true,supportsResultView:true}
       if (method==='start') {requests.push(request);return {id:request.requestId}}
+      if (reading) {
+        const fixture = fileURLToPath(new URL('./file-route-probe.py',import.meta.url))
+        const python = process.env.ARENA_PYTHON || (process.platform==='win32' ? 'python' : 'python3')
+        return JSON.parse(execFileSync(python,[fixture,root,mode],{
+          input:JSON.stringify(requests.at(-1)),encoding:'utf8',windowsHide:true,
+        }))
+      }
       if (requests.length===1) {
         const fixture = fileURLToPath(new URL('./first-help-command.py',import.meta.url))
         const python = process.env.ARENA_PYTHON || (process.platform==='win32' ? 'python' : 'python3')
@@ -336,5 +444,13 @@ for (const mode of ['native','ptc']) {
     assert.match(result.text,/Dynamic reference entry/)
     assert.match(result.text,/local file/)
     assert.match(result.text,/integer/)
+    reading = true
+    await writeFile(join(root,'probe.txt'),'route verification 7318')
+    agent.followup(createUserMessage({source:{kind:'user'},content:[{type:'text',text:'Read probe.txt.'}]}))
+    await agent.whenIdle()
+    assert.deepEqual(reads,['probe.txt'])
+    assert.equal(requests.length,5)
+    const final = agent.session.deriveMessages().findLast(row=>row.role==='assistant')
+    assert.ok(final.content.some(block=>block.type==='text' && block.text.includes('route verification 7318')))
   })
 }

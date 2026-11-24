@@ -1,0 +1,150 @@
+<!doctype html><meta charset="utf-8"><title>Original file intake</title>
+<main data-slot="main.conversation"><div data-conversation-content id="main"></div></main>
+<div role="dialog" aria-modal="true" id="secondary"><div data-conversation-content id="inside"></div></div>
+<input id="unrelated"><button id="outside">Outside</button><output id="out">running</output>
+<script>
+let definition
+window.__ModuleLoader__ = {load(module) {definition = module}}
+</script>
+<script src="../original-files.client.js"></script>
+<script>
+(async () => {
+  const make = (tag, attrs = {}) => Object.assign(document.createElement(tag),attrs)
+  const applied = [], added = []
+  let marker, cleanup, registration, component
+  const react = {
+    useRef() {return {current:marker}},
+    useLayoutEffect(effect) {cleanup = effect()},
+    createElement() {},
+  }
+  const plugin = definition.factory(name => {if (name === 'react') return react; throw Error(name)})
+  const models = {main:{provider:'arena',model:'agent-mode'},second:{provider:'arena',model:'agent-mode'}}
+  plugin.apply({
+    slots:{inject:(_,fn) => fn(),register:(reg,comp) => {registration=reg; component=comp}},
+    modelDirectories:{directoryFor:id=>({store:{getSnapshot:()=>({current:models[id]})}})},
+  })
+  function mount(container,id) {
+    const card=make('section'); card.setAttribute('data-composer-card','')
+    const input=make('input',{type:'file',multiple:true,hidden:true})
+    const editor=make('div',{contentEditable:'true',tabIndex:0}); editor.setAttribute('data-composer-input','')
+    marker=make('span',{hidden:true}); const notice=marker
+    card.append(editor, input, marker); container.append(card)
+    component(registration.inject(id)); applied.push(cleanup)
+    input.addEventListener('change',() => {
+      if (input.files.length) added.push({id,files:[...input.files]})
+      input.value=''
+    })
+    return {card,input,editor,notice}
+  }
+  const check = (condition,why) => {if (!condition) throw Error(why)}
+  const transfer = (...files) => {
+    const data=new DataTransfer()
+    for (const file of files) data.items.add(file)
+    return data
+  }
+  const gesture = (target,kind,data) => {
+    const props = {bubbles:true,cancelable:true}
+    const event = kind==='paste' ? new ClipboardEvent(kind,{...props,clipboardData:data})
+      : new DragEvent(kind,{...props,dataTransfer:data})
+    target.dispatchEvent(event)
+    return event
+  }
+  const gif=Uint8Array.from(atob('R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAIfkEAQAAAAAsAAAAAAEAAQAAAgJEAQA7'),c=>c.charCodeAt(0))
+  const originals=[new File([gif],'два кадра.gif',{type:'image/gif'}),new File([Uint8Array.of(0,255,17,0)],'без расширения'),new File([],'без расширения')]
+  const main=mount(document.querySelector('#main'),'main')
+  const secondary=mount(document.querySelector('#inside'),'second')
+  const popup=document.querySelector('#secondary')
+  popup.remove()
+  async function expectFiles(id) {
+    check(added.length===1,'exactly one addressed batch '+id+'; got '+added.map(x=>x.id))
+    const actual=added.pop(); check(actual.id===id,'wrong recipient')
+    check(actual.files.length===originals.length,'lost or split files')
+    for (const [i,file] of actual.files.entries()) {
+      check(file.name===originals[i].name && file.type==='application/octet-stream','name, ordering or intake route')
+      const raw=new Uint8Array(await file.arrayBuffer()),expected=new Uint8Array(await originals[i].arrayBuffer())
+      check(raw.length===expected.length && raw.every((x,j)=>x===expected[j]),'bytes changed at '+i)
+    }
+  }
+
+  main.input.files=transfer(...originals).files
+  main.input.dispatchEvent(new Event('change',{bubbles:true})); await expectFiles('main')
+  gesture(main.editor,'paste',transfer(...originals)); await expectFiles('main')
+  gesture(document.querySelector('#outside'),'paste',transfer(...originals)); await expectFiles('main')
+  gesture(document.querySelector('#unrelated'),'paste',transfer(...originals))
+  check(!added.length,'outside input paste')
+  const text=new DataTransfer(); text.setData('text/plain','@file.gif')
+  check(!gesture(main.editor,'paste',text).defaultPrevented && !added.length,'ordinary text/@path was captured')
+
+  let overlay=false
+  document.addEventListener('dragenter',()=>overlay=true)
+  window.addEventListener('dragend',()=>overlay=false)
+  gesture(main.card,'dragenter',transfer(...originals))
+  check(overlay,'drag fixture setup')
+  gesture(main.card,'drop',transfer(...originals)); await expectFiles('main')
+  check(!overlay,'stuck drag overlay')
+
+  document.body.append(popup); secondary.editor.focus()
+  gesture(secondary.editor,'paste',transfer(...originals)); await expectFiles('second')
+  gesture(secondary.card,'drop',transfer(...originals)); await expectFiles('second')
+  const menu=make('div'); menu.setAttribute('role','menu'); document.body.append(menu)
+  let menuDrops=0, backgroundDrops=0
+  menu.addEventListener('drop',()=>menuDrops++)
+  document.addEventListener('drop',()=>backgroundDrops++)
+  gesture(menu,'paste',transfer(...originals)); gesture(menu,'drop',transfer(...originals))
+  check(!added.length && menuDrops===1 && backgroundDrops===0,'drop/paste behind modal or swallowed modal control')
+  menu.remove()
+
+  // Each mounted native attachment view listens on document, including the
+  // Arena composer hidden behind this ordinary model's foreground composer.
+  models.second={provider:'other',model:'regular'}
+  const nativeDrop=transfer(originals[0],new File([],'fixture-folder'))
+  nativeDrop.setData('text/plain','an OS drag label, not content to paste')
+  const nativeFiles=[...nativeDrop.files]
+  const nativePaths=new Map(nativeFiles.map(file=>[file,'local/'+file.name]))
+  let modelPasteCount=0
+  secondary.editor.addEventListener('paste',event=>{
+    const items=[...event.clipboardData.items].filter(item=>item.kind==='file')
+    const files=items.map(item=>item.getAsFile())
+    check(files.length===2 && files[0].type==='image/gif','lost original file or MIME')
+    check(files.every(file=>nativePaths.has(file)),'native path lost through cloned File objects')
+    check(items[1].webkitGetAsEntry()?.isDirectory,'lost directory identity')
+    check(event.clipboardData.getData('text/plain')==='','unexpected drag label appended to the draft')
+    modelPasteCount++
+    event.preventDefault()
+  },{once:true})
+  const originalEntry=DataTransferItem.prototype.webkitGetAsEntry
+  DataTransferItem.prototype.webkitGetAsEntry=function(){return {isDirectory:this.getAsFile().name==='fixture-folder'}}
+  try {
+    gesture(secondary.card,'dragenter',nativeDrop)
+    gesture(secondary.card,'drop',nativeDrop)
+  } finally {DataTransferItem.prototype.webkitGetAsEntry=originalEntry}
+  check(backgroundDrops===0 && !added.length,'foreign-provider drop leaked into the background Arena composer')
+  check(modelPasteCount===1 && !overlay,'ordinary foreground composer lost its native intake or retained overlay')
+  popup.remove()
+
+  const mixed=new DataTransfer()
+  mixed.items.add(originals[0]);mixed.items.add(new File([],'folder'))
+  const directory=DataTransferItem.prototype.webkitGetAsEntry
+  DataTransferItem.prototype.webkitGetAsEntry=function(){return {isDirectory:this.getAsFile().name==='folder'}}
+  try { gesture(main.card,'drop',mixed) } finally {DataTransferItem.prototype.webkitGetAsEntry=directory}
+  check(!added.length && !main.notice.hidden && /folder/i.test(main.notice.textContent),'partial file/folder batch')
+  const longName='я'.repeat(140)+'.txt'
+  main.input.files=transfer(originals[0],new File([],longName)).files
+  main.input.dispatchEvent(new Event('change',{bubbles:true}))
+  const batch=added.pop()?.files
+  check(batch?.length===2 && batch[0].name===originals[0].name,'all files must survive a long Unicode name')
+  const stored=batch[1], match=/^arena-file-([0-9a-f-]{36})-([0-9]+)\.bin$/.exec(stored.name)
+  check(match,'unsupported native filename needs a reversible stored name')
+  const header=JSON.parse(await stored.slice(0,Number(match[2])).text())
+  check(header.name===longName && header.id===match[1],'exact original name on disk')
+  gesture(main.editor,'paste',transfer(...originals)); await expectFiles('main')
+  check(main.notice.hidden,'stale notice')
+
+  models.main={provider:'other',model:'another'}
+  main.input.files=transfer(...originals).files
+  main.input.dispatchEvent(new Event('change',{bubbles:true}))
+  check(added.length===1 && added.pop().files[0].type==='image/gif','changed another model intake')
+  for(const dispose of applied) dispose()
+  document.querySelector('#out').textContent='All fixture checks passed'
+})().catch(error=>document.querySelector('#out').textContent=error.stack)
+</script>

@@ -5,12 +5,14 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import sys
 import threading
 
 from .__main__ import read_pairing
+from .desktop_files import DesktopFileStore
 from .journal import (
-    InvalidToolSource, Journal, Problem, decode_generated_images,
+    InvalidToolSource, UnavailableTool, Journal, Problem, decode_generated_images,
     new_id, source_tool_frame, tool_frame,
 )
 from .transport import Endpoint, ExtensionHandler
@@ -23,7 +25,9 @@ DESKTOP_CANCELLED = "Desktop cancelled this request"
 CONNECTION = "DeepSeek Harness Desktop is connected."
 INTRO = (
     "You are the assistant for the user working in DeepSeek Harness Desktop. The user sends you their task "
-    "from Desktop and reads your answer there. You decide how to carry out the task and give the user the outcome.\n"
+    "from Desktop and reads your answer there. You decide how to carry out the task and give the user the outcome. "
+    "The bridge automatically delivers each generated image that Arena displays in your reply to Desktop. "
+    "Once Arena shows the finished images in your reply, finish your answer normally.\n"
     "Answer conversational questions in plain text or in the format the user asks for. When a task needs "
     "the user's local project, files or programs, request the needed action yourself through this bridge. "
     "The bridge reads your normal, visible reply in this Arena chat and passes the tool request to Desktop. "
@@ -43,7 +47,8 @@ HELP_PROGRAMS = {
     "typescript": "(typeof inspect === 'function' ? inspect : console.log)(JSON.stringify(await tools.arena_tool_help({})))",
     "python": "print(await tools.arena_tool_help({}))",
 }
-INTRO_VERSION = "desktop-intro-v2/"
+PROGRAM_LANGUAGES = {"typescript":"TypeScript", "python":"Python"}
+INTRO_VERSION = "desktop-intro-v4/"
 LEGACY_RESUBMIT = "Desktop updated the Arena message format. Resubmit this request in Desktop."
 TEXT_ARGUMENTS = {"pwsh": "command"}
 TEXT_BLOCK_NAME = r"[A-Za-z][A-Za-z0-9_-]{0,31}"
@@ -74,8 +79,20 @@ def help_entry_point(route):
     }
     example = {"$harness":"tool_call", "turn_id":"CURRENT_DELIVERY_ID", "name":name, "arguments":arguments}
     return ("If you need to discover a Desktop tool, the example below requests the current list. "
+            "Request help by name for its calling route and parameters. "
             "Replace CURRENT_DELIVERY_ID with the current ID and send the example in a json fence.\n```text\n"
             + json.dumps(example, separators=(",", ":")) + "\n```")
+
+
+def program_tool_routes(request, direct_names):
+    routes = request.get("programToolRoutes")
+    if routes is None or "run_code" not in direct_names:
+        return None
+    if (not isinstance(routes, dict) or not isinstance(routes.get("language"), str)
+            or routes["language"] not in PROGRAM_LANGUAGES or not isinstance(routes.get("names"), list)
+            or not all(isinstance(name, str) and name for name in routes["names"])):
+        raise Problem("Invalid Desktop program tool routes")
+    return routes
 
 
 def bind_argument_text(frame, block):
@@ -250,6 +267,7 @@ def selected_option(card, result):
 
 
 class DesktopJournal(Journal):
+    supports_files = True
     supports_native_questions = True
     supports_image_choices = True
     supports_pairing_settlement = True
@@ -269,9 +287,12 @@ class DesktopJournal(Journal):
             job TEXT PRIMARY KEY, confirmed INTEGER NOT NULL, card TEXT);
           CREATE TABLE IF NOT EXISTS desktop_tool_retries(
             request TEXT PRIMARY KEY, rejected_job TEXT UNIQUE NOT NULL);
+          CREATE TABLE IF NOT EXISTS desktop_program_routes(
+            request TEXT PRIMARY KEY, language TEXT NOT NULL, names TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS desktop_transcript_faults(
             binding TEXT PRIMARY KEY, event TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS desktop_prompts(job TEXT PRIMARY KEY, plan_mode INTEGER, sent INTEGER DEFAULT 0);
+          CREATE TABLE IF NOT EXISTS desktop_program_galleries(job TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS desktop_mode_sync(id INTEGER PRIMARY KEY CHECK(id=1));
           -- Even an older companion performing a retry must keep this answer out of its ordinary text queue.
           CREATE TRIGGER IF NOT EXISTS requeue_site_answer AFTER UPDATE OF state ON jobs
@@ -279,6 +300,7 @@ class DesktopJournal(Journal):
             BEGIN UPDATE jobs SET state='question_queued' WHERE id=NEW.id; END;
           UPDATE jobs SET state='question_queued' WHERE state='queued' AND id IN (SELECT answer_job FROM site_questions);
         """)
+        self.files = DesktopFileStore(self.sql)
 
         # Old queued jobs combine user text with generated instructions. Their original
         # boundary is unknown, so resubmit them instead of editing their contents.
@@ -310,17 +332,37 @@ class DesktopJournal(Journal):
         self.sql.execute("""DELETE FROM desktop_mode_sync WHERE EXISTS
             (SELECT 1 FROM desktop_prompts WHERE job=? AND plan_mode IS NOT NULL)""", (job,))
 
-    def pending_intro(self, route):
+    def pending_intro(self, route, names, program_routes):
         # The extension treats the context ID as opaque and acknowledges it only on
-        # a confirmed send. The ID depends only on the advertised help entry point.
-        context_id = INTRO_VERSION + route
+        # a confirmed send. Catalog changes within the same mode do not resend it.
+        program = program_routes["language"] if program_routes else route
+        if program in PROGRAM_LANGUAGES:
+            language = PROGRAM_LANGUAGES[program]
+            if program_routes and not program_routes["names"]:
+                mode = "empty-" + program
+                routing = f"The run_code tool accepts {language} code. No program tools are exposed on this step."
+            elif any(name != "run_code" for name in names):
+                mode = "mixed-" + program
+                routing = ("Use a direct tool's name in the top-level name field. Call program tools "
+                           f"inside the {language} code of run_code.")
+            else:
+                mode = "program-" + program
+                routing = ("Only run_code goes in the top-level name field on this step. "
+                           f"Call Desktop SDK tools inside its {language} code.")
+        elif names:
+            mode = "direct"
+            routing = "Use a direct tool's name in the top-level name field."
+        else:
+            mode = "none"
+            routing = "No Desktop tools are offered on this step."
+        context_id = INTRO_VERSION + route + "/" + mode
         ack = self.one("SELECT digest FROM catalog")
         if ack and ack["digest"] == context_id:
             return None
         text = CONNECTION
-        if not ack or not ack["digest"].startswith(INTRO_VERSION):
+        if not ack or not ack["digest"].startswith((INTRO_VERSION, "desktop-intro-v3/")):
             text += " " + INTRO
-        return {"id": context_id, "text": text + " " + help_entry_point(route)}
+        return {"id": context_id, "text": text + " " + routing + " " + help_entry_point(route)}
 
     def context(self):
         with self.lock:
@@ -330,7 +372,7 @@ class DesktopJournal(Journal):
                 JOIN desktop_prompts p ON p.job=o.job JOIN requests r ON r.job=o.job
                 JOIN request_context c ON c.id=r.id JOIN binding b ON b.id=c.binding
                 JOIN jobs j ON j.id=o.job WHERE r.error IS NULL AND r.reply IS NULL
-                AND j.state IN ('queued','offered','uncertain')
+                AND j.state IN ('queued','files_queued','offered','uncertain')
                 AND o.digest NOT IN (SELECT digest FROM catalog)""")
             return dict(meta) if meta else None
 
@@ -384,13 +426,47 @@ class DesktopJournal(Journal):
             # turn while disconnected may have no journal event, even at the
             # same URL and Chrome tab ID. Invalidate work from that interval.
             binding = new_id()
+            self.files.discard_uncommitted()
             self.sql.execute("UPDATE binding SET id=?", (binding,))
             self.sql.execute("DELETE FROM desktop_cancelled_deliveries")
             self.sql.execute("DELETE FROM desktop_transcript_faults")
             self.sql.execute("UPDATE requests SET error='Browser reconnected. Inspect the prior turn in Arena.' WHERE reply IS NULL AND error IS NULL")
-            self.sql.execute("UPDATE jobs SET state='done' WHERE state IN ('queued','question_queued','held')")
+            self.sql.execute("UPDATE jobs SET state='done' WHERE state IN ('queued','files_queued','question_queued','held')")
             self.sql.execute("UPDATE jobs SET state='uncertain' WHERE state IN ('offered','waiting')")
             return binding
+
+    def stage_file_chunk(self, chunk):
+        rid, session = chunk.get("requestId"), chunk.get("sessionId")
+        if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in (rid,session)):
+            raise Problem("Desktop request and session IDs are required for original files")
+        with self.lock:
+            bound = self.one("SELECT b.id FROM binding b JOIN desktop_session s ON s.id=?", (session,))
+            if not bound:
+                raise Problem("Pair the selected Desktop conversation before attaching original files")
+            return self.files.stage(chunk, bound["id"])
+
+    def file_chunk(self, address):
+        with self.lock:
+            self.check(address)
+            return self.files.read(address)
+
+    def prepare_delivery(self, job, address):
+        files = self.files.manifest(job["id"])
+        if not files:
+            return True
+        active = self.one("""SELECT 1 FROM requests r JOIN request_context c ON c.id=r.id
+            JOIN desktop_session s ON s.id=r.session WHERE r.job=? AND c.binding=?
+            AND r.error IS NULL AND r.reply IS NULL""", (job["id"], address["binding"]))
+        if not active:
+            self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (job["id"],))
+            return False
+        if address.get("supportsFiles") is not True:
+            reason = "Update the Arena Bridge extension for original file attachments, then resend the message in Desktop."
+            self.sql.execute("UPDATE requests SET error=? WHERE job=?", (reason, job["id"]))
+            self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (job["id"],))
+            return False
+        job["files"] = files
+        return True
 
     def start(self, request):
         rid, session = request.get("requestId"), request.get("sessionId")
@@ -406,13 +482,20 @@ class DesktopJournal(Journal):
         if "planMode" in request and not isinstance(plan_mode, bool):
             raise Problem("Expected Desktop plan mode as a boolean")
         images = desktop_pngs(request)
+        has_files = "files" in request
+        if has_files and (images or result is not None):
+            raise Problem("Original user files must be sent together as files in a Desktop user message")
         tools = request.get("tools", [])
         if not isinstance(tools, list) or not all(isinstance(t,dict) and isinstance(t.get("name"),str) for t in tools):
             raise Problem("Invalid active Desktop tool catalog")
         names = desktop_tool_names(tools, request.get("supportsReadBatch"))
+        program_routes = program_tool_routes(request, names)
         help_route = "unavailable"
-        if "arena_tool_help" in names:
+        if "arena_tool_help" in names and request.get("toolHelpDirect", True) is True:
             help_route = "direct"
+        elif program_routes is not None:
+            if request.get("toolHelpViaCode") is True and "arena_tool_help" in program_routes["names"]:
+                help_route = program_routes["language"]
         elif "run_code" in names and request.get("toolHelpViaCode") is True:
             help_route = request.get("toolHelpProgram", "typescript")
             if not isinstance(help_route, str) or help_route not in HELP_PROGRAMS:
@@ -426,7 +509,9 @@ class DesktopJournal(Journal):
         # Capability negotiation affects the initial catalog only. Replaying a
         # previously admitted request must retain its original catalog and ID.
         presentation = request.get("toolResultView")
-        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView", "computerUseGuidance", "toolHelpViaCode", "toolHelpProgram"))
+        capabilities = ("computerUseGuidance", "toolHelpDirect", "toolHelpViaCode", "toolHelpProgram",
+                        "galleryViaCode", "programToolRoutes")
+        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView", *capabilities))
         with self.lock, self.sql:
             owner = self.one("SELECT id FROM desktop_session")
             if not owner or owner["id"] != session:
@@ -439,7 +524,7 @@ class DesktopJournal(Journal):
             if old:
                 # Older companions may have included a presentation or capability hint in the digest.
                 if old["session"] != session or (old["fingerprint"] != fingerprint and not any(
-                    old["fingerprint"] == request_fingerprint(request, (*omitted, "computerUseGuidance", "toolHelpViaCode", "toolHelpProgram"))
+                    old["fingerprint"] == request_fingerprint(request, (*omitted, *capabilities))
                     for omitted in ((), ("supportsReadBatch",), ("toolResultView",))
                 )):
                     raise Problem("Desktop request ID reused with different content")
@@ -483,13 +568,26 @@ class DesktopJournal(Journal):
                         raise Problem("The original Arena question card has closed. No choice was sent.")
                     if images or request.get("text"):
                         raise Problem("A native Arena answer must contain only the Desktop selection")
-                    selection = selected_option(json.loads(site["card"]), tool_data)
+                    if reply["kind"] == "image-choice" and "ask_user_question" not in json.loads(prior["names"]):
+                        settled = request.get("galleryAnswer")
+                        if ("run_code" not in names or request.get("galleryViaCode") is not True
+                                or tool_data.get("failed") is not False or not isinstance(settled, dict)
+                                or settled.get("callId") != tool_data.get("toolCallId")
+                                or settled.get("arguments") != reply["arguments"]):
+                            raise Problem("Desktop has no admitted native answer for this Arena gallery. No choice was sent.")
+                        selection = selected_option(json.loads(site["card"]), {"failed":False,"text":settled.get("text")})
+                    else:
+                        if reply["kind"] == "image-choice" and "ask_user_question" not in names:
+                            raise Problem("Desktop's gallery permission changed. No choice was sent.")
+                        selection = selected_option(json.loads(site["card"]), tool_data)
             else:
+                if not text.strip() and has_files:
+                    text = "See the attached files."
                 if not text and images:
                     text = "Review the attached image." if len(images) == 1 else "Review the attached images."
                 if not text.strip():
                     raise Problem("Expected a message of at most 180000 characters")
-            meta = self.pending_intro(help_route) if selection is None else None
+            meta = self.pending_intro(help_route, names, program_routes) if selection is None else None
             if selection is None and plan_mode is True:
                 text += "\n\n" + PLAN_ACTIVE
                 if "exit_plan_mode" in names:
@@ -510,7 +608,10 @@ class DesktopJournal(Journal):
                 raise Problem(self.paused())
             if self.one("SELECT id FROM jobs WHERE state NOT IN ('done','superseded')"):
                 raise Problem("A previous turn is still active. Inspect Arena and the connection status first.")
-            job = self._insert_job(text,request.get("png"),prior_job,"question_queued" if selection is not None else "queued")
+            queue = "files_queued" if has_files else "question_queued" if selection is not None else "queued"
+            job = self._insert_job(text,request.get("png"),prior_job,queue)
+            if has_files:
+                self.files.attach(job, request["files"], session, rid, binding["id"])
             if selection is not None:
                 self.sql.execute("UPDATE site_questions SET answer_job=?,answer=? WHERE job=?", (job,selection,prior_job))
             if len(images) > 1:
@@ -521,7 +622,12 @@ class DesktopJournal(Journal):
                 self.sql.execute("INSERT INTO outgoing_context VALUES(?,?,?)", (job,meta["id"],meta["text"]))
             self.sql.execute("INSERT INTO desktop_prompts(job,plan_mode) VALUES(?,?)",
                              (job, plan_mode if selection is None else None))
+            if request.get("galleryViaCode") is True and "run_code" in names:
+                self.sql.execute("INSERT INTO desktop_program_galleries(job) VALUES(?)", (job,))
             self.sql.execute("INSERT INTO requests VALUES(?,?,?,?,?,NULL,NULL)", (rid,session,fingerprint,job,json.dumps(names)))
+            if program_routes and program_routes["names"]:
+                self.sql.execute("INSERT INTO desktop_program_routes VALUES(?,?,?)",
+                                 (rid, program_routes["language"], json.dumps(program_routes["names"])))
             self.sql.execute("INSERT INTO request_context VALUES(?,?,?,?)",(rid,binding["id"],browser_turn,origin))
             return {"id":rid}
 
@@ -560,12 +666,13 @@ class DesktopJournal(Journal):
                 return False
             return bool(self.one("""SELECT 1 FROM jobs j JOIN requests r ON r.job=j.id
                                     JOIN request_context c ON c.id=r.id JOIN desktop_session s ON s.id=r.session
-                                    WHERE c.binding=? AND c.origin IS NULL AND j.state='queued'
+                                    WHERE c.binding=? AND c.origin IS NULL AND j.state IN ('queued','files_queued')
                                       AND r.reply IS NULL AND r.error IS NULL""", (address["binding"],)))
 
     def poll(self, address, ready):
         with self.lock:
             self.check(address)
+            self.files.sweep_abandoned()
             fault = self.one("SELECT event FROM desktop_transcript_faults WHERE binding=?", (address["binding"],))
             if fault and fault["event"] != address.get("recoveredTranscript"):
                 return None
@@ -621,13 +728,17 @@ class DesktopJournal(Journal):
             raise Problem("Arena question does not belong to the waiting Desktop request")
         self.sql.execute("INSERT INTO site_questions(job,binding,card_id,card) VALUES(?,?,?,?)",
                          (origin,data["binding"],card["id"],json.dumps(card)))
-        if "ask_user_question" in json.loads(request["names"]):
+        if ("ask_user_question" in json.loads(request["names"]) or
+                previews is not None and self.one("SELECT 1 FROM desktop_program_galleries WHERE job=?", (origin,))):
             question = {"id":card["id"],"question":card["question"],"options":[{"label":label} for label in card["options"]]}
             reply = {"kind":"tool","name":"ask_user_question","arguments":{"questions":[question]}}
             if previews is not None:
                 reply.update(kind="image-choice", previews=previews)
         else:
-            text = card["question"] + "\n" + "\n".join(card["options"]) + "\nDesktop's active profile does not offer ask_user_question."
+            hint = ("Desktop cannot open a choice for this gallery. If the panel is still open in the original Arena tab, "
+                    "choose an option there." if previews is not None else
+                    "Desktop's active profile does not offer ask_user_question.")
+            text = "\n".join([card["question"], *card["options"], hint])
             reply = {"kind":"text","text":text}
             if previews is not None:
                 reply["images"] = previews
@@ -734,7 +845,20 @@ class DesktopJournal(Journal):
                 command, separator, block = tool_source[1:].partition("\x1e")
                 if not separator:
                     raise InvalidToolSource("Invalid browser transport for a text argument.")
-            frame = source_tool_frame(command, delivery, names)
+            try:
+                frame = source_tool_frame(command, delivery, names)
+            except UnavailableTool as error:
+                routes = self.one("SELECT language,names FROM desktop_program_routes WHERE request=?", (request["id"],))
+                if block is not None or not routes or error.frame["name"] not in json.loads(routes["names"]):
+                    raise
+                bind_argument_text(error.frame, None)
+                name = json.dumps(error.frame["name"])
+                language = PROGRAM_LANGUAGES[routes["language"]]
+                raise InvalidToolSource(
+                    f"{name} is a program tool on this Desktop step. The tool was not run. "
+                    f"Set the top-level name to run_code. In its {language} code, use "
+                    f"await tools[{name}](args), where args is the intended argument object.",
+                    retryable=True) from None
             if text.strip():
                 frame["text"] = text
         else:
@@ -757,7 +881,7 @@ class DesktopJournal(Journal):
         if not request or not self.sql.execute("INSERT OR IGNORE INTO desktop_tool_retries VALUES(?,?)",
                                                (request["id"], job)).rowcount:
             return False
-        prompt = (diagnostic + " Reissue the single intended tool call as valid JSON. "
+        prompt = (diagnostic + " Submit one corrected tool request. "
                   "Use the fresh ID on the final Bridge delivery line. Keep the current task and plan mode. "
                   "Return one command and wait for its result.")
         retry = self._insert_job(prompt, None, request["parent"], "queued")
@@ -799,16 +923,21 @@ class DesktopJournal(Journal):
             if state in ("superseded","held"):
                 return {"state":"failed","error":"A different browser turn replaced the Desktop request; inspect the native result in Desktop"}
             paused = self.paused()
-            if paused and state in ("queued","question_queued"):
+            if paused and state in ("queued","files_queued","question_queued"):
                 return {"state":"limited","error":paused}
             if state in ("limited","uncertain"):
                 issue = self.one("SELECT reason FROM delivery_issues WHERE job=?", (r["job"],))
                 reason = paused or (issue["reason"] if issue else None)
                 return {"state":state,"error":reason or "Inspect the Arena chat before resuming this delivery"}
-            return {"state":"queued" if state in ("queued","question_queued") else "waiting"}
+            return {"state":"queued" if state in ("queued","files_queued","question_queued") else "waiting"}
 
     def cancel(self, rid, session):
         with self.lock, self.sql:
+            if not all(isinstance(value, str) and value for value in (rid, session)):
+                raise Problem("Desktop request and session IDs are required for cancellation")
+            if self.files.discard_uncommitted(session, rid) and not self.one(
+                    "SELECT 1 FROM requests WHERE id=? AND session=?", (rid, session)):
+                return {"ok":True}
             r = self.lookup(rid, session)
             if (r["reply"] and not r["error"] and json.loads(r["reply"])["kind"] == "tool-batch"
                     and not self.one("SELECT 1 FROM request_context WHERE origin=?", (rid,))):
@@ -817,7 +946,7 @@ class DesktopJournal(Journal):
                 state = self.state(r["job"])
                 # An exact, later reply may settle a confirmed ordinary send.
                 # A selection on an Arena question has no outbound turn stamp.
-                target = "done" if state in ("queued","question_queued") else "uncertain"
+                target = "done" if state in ("queued","files_queued","question_queued") else "uncertain"
                 self.sql.execute("UPDATE jobs SET state=? WHERE id=?", (target,r["job"]))
                 self.sql.execute("UPDATE requests SET error=? WHERE id=?", (DESKTOP_CANCELLED, rid))
                 if state in ("offered","waiting") and not self.one(
@@ -835,6 +964,7 @@ class DesktopJournal(Journal):
             if owner and owner["id"] != session and not reset:
                 raise Problem("Only the original Desktop conversation can disconnect its bridge")
             reason = "Operator reset the Arena connection" if reset else "Operator disconnected the original Arena conversation"
+            self.files.discard_uncommitted()
             if reset and (binding := self.one("SELECT id FROM binding")):
                 self._stop_pending_requests(binding["id"], reason)
             self.sql.execute("UPDATE requests SET error=? WHERE reply IS NULL AND error IS NULL", (reason,))
@@ -879,11 +1009,13 @@ def serve():
                             db.pair_owner(params["sessionId"])
                         with db.lock:
                             bound = db.one("SELECT chat FROM binding")
-                        result = {"chat":bound["chat"] if bound else None, "port":8766, "supportsPngBatch":True,
+                        result = {"chat":bound["chat"] if bound else None, "port":8766, "supportsPngBatch":True, "supportsFiles":True,
                                   "supportsResultView":True, "supportsOnDemandContext":True, "supportsToolHelp":True,
                                   "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
                         if "sessionId" in params:
                             result["pairToken"] = pair
+                    elif method == "stageFileChunk":
+                        result = db.stage_file_chunk(params)
                     elif method == "start":
                         result = db.start(params)
                     elif method == "status":
@@ -899,6 +1031,8 @@ def serve():
                     reply = {"jsonrpc":"2.0","id":rid,"result":result}
                 except (ValueError, KeyError, TypeError, RecursionError) as error:
                     reply = {"jsonrpc":"2.0","id":rid,"error":{"code":-32602,"message":str(error)}}
+                except sqlite3.Error as error:
+                    reply = {"jsonrpc":"2.0","id":rid,"error":{"code":-32603,"message":f"Desktop journal: {error}"}}
                 sys.stdout.buffer.write(json.dumps(reply,ensure_ascii=True).encode("ascii")+b"\n")
                 sys.stdout.buffer.flush()
         finally:

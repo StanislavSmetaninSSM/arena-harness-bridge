@@ -68,6 +68,9 @@ test('binding pins the source tab and document, keeps token in worker, and restr
   assert.notEqual(requests.at(-1).data.supportsPngBatch, true, 'a stale content script cannot lease a batch');
   await send(tab,{...poll,supportsPngBatch:true});
   assert.equal(requests.at(-1).data.supportsPngBatch,true,'the current content script can lease a batch');
+  assert.notEqual(requests.at(-1).data.supportsFiles,true,'stale tabs cannot lease original files');
+  await send(tab,{...poll,supportsFiles:true});
+  assert.equal(requests.at(-1).data.supportsFiles,true);
   const card={id:'chat-message-card',question:'Which color?',options:['Amber','Indigo']};
   const native=await send(tab,{...poll,ready:false,supportsNativeQuestions:true,nativeQuestionId:card.id});
   assert.equal(native.supportsNativeQuestions,true);
@@ -115,6 +118,14 @@ test('binding pins the source tab and document, keeps token in worker, and restr
   assert.ok(tabMessages.some(m => m.type === 'applySkill' && m.content === 'local instruction'));
   offered = {id:'job1',text:'hello'};
   assert.equal((await send(tab,poll)).job.id,'job1');
+  const fileChunk={...poll,type:'fileChunk',job:'job1',index:0,offset:0};
+  const readsBefore=requests.length;
+  for(const changes of [{job:'other'},{index:-1},{offset:1.1},{binding:'other'},{pageKey:'old'}])
+    assert.equal((await send(tab,{...fileChunk,...changes})).ok,false);
+  assert.equal(requests.length,readsBefore);
+  assert.equal((await send(tab,fileChunk)).ok,true);
+  assert.equal(requests.at(-1).url,'http://127.0.0.1:8766/v1/file-chunk');
+  assert.deepEqual(requests.at(-1).data,{chat,binding:'bind1',tab:7,job:'job1',index:0,offset:0});
   loseSentAck = true;
   assert.equal((await send(tab,{...poll,type:'event',event:{id:'sent-original',kind:'sent',job:'job1'}})).ok,false);
   assert.equal((await send(tab,{...poll,type:'depart'})).ok,true);

@@ -188,7 +188,8 @@ async function dispatch(message, sender) {
     const result = await request(link.token, 'poll', {
       ...address(link), ready: message.ready === true && !link.lease,
       recoveredTranscript:message.recoveredTranscript,
-      supportsPngBatch: message.supportsPngBatch === true, supportsNativeQuestions, nativeQuestionId,
+      supportsPngBatch: message.supportsPngBatch === true, supportsFiles: message.supportsFiles === true,
+      supportsNativeQuestions, nativeQuestionId,
       nativeQuestionClosed:Boolean(nativeQuestionId && message.nativeQuestionClosed===true)
     });
     if (result.job) { link.lease = result.job.id; await save(link); }
@@ -197,6 +198,13 @@ async function dispatch(message, sender) {
       supportsNativeQuestions:supportsNativeQuestions && result.supportsNativeQuestions===true,
       supportsImageChoices:supportsNativeQuestions && result.supportsImageChoices===true,
       nativeQuestionClosed:result.nativeQuestionClosed };
+  }
+  if (message.type === 'fileChunk') {
+    const {job,index,offset}=message;
+    if (!job || job !== link.lease || link.receipt || !Number.isSafeInteger(index) || index < 0 ||
+        !Number.isSafeInteger(offset) || offset < 0) throw Error('File chunk does not belong to the offered delivery.');
+    const result=await request(link.token,'file-chunk',{...address(link),job,index,offset});
+    return {data:result.data,nextOffset:result.nextOffset};
   }
   if (message.type !== 'event' || !message.event) throw Error('Invalid content request.');
   const { id, kind, text, job } = message.event;

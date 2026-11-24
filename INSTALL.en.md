@@ -2,7 +2,7 @@
 
 [Инструкция на русском](INSTALL.md)
 
-You’ll need **DeepSeek Harness Desktop**, Google Chrome, and Python. The supported Desktop versions are **0.2.2-rc.5** and **0.2.3-alpha.2**. This bundle contains Desktop plugin 0.1.17 with its Python companion and Chrome extension 0.1.43. [DeepSeek Harness Desktop](https://deepseek.com/harness/) · [Bridge releases](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases)
+You’ll need **DeepSeek Harness Desktop**, Google Chrome, and Python. The supported Desktop versions are **0.2.2-rc.5** and **0.2.3-alpha.2**. Bundle **v0.1.10** contains Desktop plugin 0.1.20 with its Python companion and Chrome extension 0.1.44. [DeepSeek Harness Desktop](https://deepseek.com/harness/) · [Bridge releases](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases)
 
 ## 1. Download and extract the ZIP
 
@@ -27,7 +27,7 @@ You’ll need **DeepSeek Harness Desktop**, Google Chrome, and Python. The suppo
 
    ```powershell
    & $dsh --version
-   $pluginVersion = '0.1.17'
+   $pluginVersion = '0.1.20'
    $package = (Resolve-Path -LiteralPath ".\dsh-arena-desktop-$pluginVersion.tgz").Path
    & $dsh plugin --profile desktop add $package
    ```
@@ -57,13 +57,17 @@ if ($LASTEXITCODE -eq 0) {
 
 In Desktop, type “Reply on one line: THE BRIDGE IS WORKING.” The message should appear in the Arena tab, and the reply should appear in Desktop. For file tasks, choose the workspace and permissions in Desktop. Messages you send, selected attachments, and tool results from the session are sent to Arena.
 
-At the start of a paired conversation Arena receives a short explanation of Desktop and a help example for this profile. Ordinary conversation uses plain text. When Arena requests documentation for a tool, Desktop returns its reference from the current profile. This includes the Computer Use guide, which can contain a local library path.
+At the start of a paired conversation Arena receives a short explanation of Desktop and a help example. Ordinary conversation uses plain text. On request, Desktop shows the tool's parameters and how to call it on the current step. If Arena tries to call an available program tool directly, the bridge can ask it once to correct the call before execution. Computer Use guidance is also available on request and can contain a local library path.
+
+To send files from your computer, choose **Arena Agent Mode** in the conversation, click **+ → File**, select one or more files, and send the message. The bridge attaches the originals in order, including animated GIFs, PDFs, and files without an extension. Desktop displays any upload error reported by Arena. To retry a GIF created as a preview in an older Desktop message, select the original file from disk again.
+
+To get an image, ask Arena to generate it in an ordinary Desktop message. The bridge automatically delivers the finished images from Arena’s reply. If Arena offers several variants, pick one in the Desktop choice card. If your profile cannot open the card, Desktop shows the previews. In that case you can pick a variant in the original Arena tab while its panel is open.
 
 ## Upgrade from a previous release
 
 1. Let the current turn finish. Extract the new Windows ZIP to a separate folder you plan to keep.
-2. Quit Desktop completely, open PowerShell in the new folder, and install `dsh-arena-desktop-0.1.17.tgz` using the [plugin installation steps](#2-install-the-desktop-plugin). Restart Desktop with the same profile.
-3. Check **Arena Harness Bridge** in `chrome://extensions`. Extension **0.1.43** from v0.1.6 already works with this release. If your version is older, copy the contents of the new `browser-extension` folder into the folder Chrome loads, click **Reload** on the extension card, and refresh the Arena tab.
+2. Quit Desktop completely, open PowerShell in the new folder, and install `dsh-arena-desktop-0.1.20.tgz` using the [plugin installation steps](#2-install-the-desktop-plugin). Restart Desktop with the same profile.
+3. Open **Arena Harness Bridge** in `chrome://extensions`. Original file uploads require extension **0.1.44** from this ZIP. Copy the contents of its `browser-extension` folder into the folder Chrome loads, click **Reload** on the extension card, and refresh the Arena tab.
 4. Continue your existing Desktop conversation. The bridge includes the new introduction with the first message after the upgrade. To check local file access, ask Arena to read a short text file in your workspace and compare its reply with the file. If the conversation has lost its pairing, run `/arena-pair` there and bind the original Arena chat using the [pairing instructions](#3-load-the-extension-and-pair-the-chat).
 
 If an unsent request in the old format was still queued during the upgrade, Desktop shows `Resubmit this request in Desktop`. Send that request again.

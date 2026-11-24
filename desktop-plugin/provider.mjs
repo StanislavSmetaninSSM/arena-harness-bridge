@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto'
 import { win32 } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { z } from 'zod'
+import { fileMetadata, selectedFileRefs, stageFiles } from './original-files.mjs'
 import { outgoingPng } from './outgoing-image.mjs'
-import { batchName, batchTools, hasHelpHint } from './tool-help.mjs'
+import { batchName, batchTools, hasHelpHint, programToolRoutes } from './tool-help.mjs'
 
 export const route = 'arena'
 const model = { provider: route, id: 'agent-mode', name: 'Arena Agent Mode', inputModalities: ['text', 'image'] }
@@ -15,6 +17,34 @@ const maxOutgoingImages = 20 // Default DSH LocalAttachments limit per native me
 const maxOutgoingBytes = 32 * 1024 ** 2
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const isBatch = items => Array.isArray(items) && items.length >= 2
+
+const galleryProof = z.object({arguments:z.object({questions:z.tuple([z.object({
+  id:z.string(), question:z.string(), options:z.array(z.object({label:z.string()}).strict()),
+}).strict()])}).strict(),text:z.string()}).strict()
+
+// The bounded, host-only projection is rebuilt from the Desktop session on
+// restore. The executor records the settled nested dispatch before the outer
+// result. Neither runtime stdout nor an unrelated call can supply the answer.
+const galleryProjection = {
+  key:'arenaGalleryAnswer', stateVersion:1,
+  stateSchema:z.object({callId:z.string(),settled:z.boolean(),proof:galleryProof.nullable()}).strict().nullable(),
+  init:()=>null,
+  apply(state,event) {
+    if (event.type === 'assistant/message') {
+      const message = event.data.message
+      if (message.source?.provider !== route || message.source.model !== model.id ||
+          !message.content.some(block=>block.type === 'image')) return null
+      const calls = message.content.filter(block=>block.type === 'tool-call')
+      return calls.length === 1 && calls[0].name === 'run_code' ? {callId:calls[0].id,settled:false,proof:null} : null
+    }
+    if (!state || event.type !== 'tool/ptc-dispatch') return state
+    const {parentCallId,rootCallId,name,arguments:args,content,isError} = event.data
+    if (parentCallId !== state.callId || rootCallId !== state.callId || name !== 'ask_user_question') return state
+    const parsed = !state.settled && isError === false && content?.length === 1 && content[0].type === 'text' &&
+      galleryProof.safeParse({arguments:args,text:content[0].text})
+    return {callId:state.callId,settled:true,proof:parsed?.success ? parsed.data : null}
+  },
+}
 
 async function storeGeneratedImages(ctx, images, signal) {
   if (!Array.isArray(images) || images.length < 1 || images.length > maxGeneratedImages)
@@ -100,7 +130,9 @@ function selectMessage(messages, sessionId) {
     if (message.toolCallId !== callPrefix || calls[0]?.id !== message.toolCallId) {
       throw mismatch()
     }
-    return { message, index, toolName:calls[0].name }
+    const toolName = calls[0].name
+    const gallery = assistant.content.some(block => block.type === 'image')
+    return { message, index, toolName, gallery }
   }
   return { message, index }
 }
@@ -112,6 +144,36 @@ export class ArenaAdapter extends LlmAdapter {
     this.companion = companion
     this.pollMs = pollMs
     this.shellResults = new Map()
+    this.toolSteps = new WeakMap()
+    this.galleryProjection = ctx.sessionProjections?.register?.(galleryProjection)
+    // The model request carries the turn signal and outer schemas. The loop
+    // supplies the step's live, revocable tool set when it assembles that request.
+    ctx.on?.('system-prompt/assemble', async (assembly, {scope,agent,signal,toolSet,modelSelection}, next) => {
+      // Harness restores a registered complete prompt after all listeners return.
+      const complete = assembly.sections.some(section=>section.complete === true)
+      const presentation = await next()
+      if (scope === agent && agent && signal && toolSet &&
+          modelSelection?.provider === route && modelSelection.model === model.id) {
+        // Only retain the two executor sections used to identify the program route.
+        const sections = complete ? [] : presentation.sections.filter(section=>section.name==='tools:sdk' || section.name==='tools:ptc-only')
+        this.toolSteps.set(signal,{agent,toolSet,sections})
+      }
+      return presentation
+    })
+  }
+
+  toolStep(options) {
+    const step = this.toolSteps.get(options.signal)
+    if (step && !options.signal.aborted && step.agent.session.id === options.sessionId) return step
+  }
+
+  questionAdmission(options) {
+    const step = this.toolStep(options)
+    if (step) return step.toolSet.view(step.agent).has('ask_user_question')
+  }
+
+  admitsGalleryProgram(options) {
+    return this.questionAdmission(options) === true && this.ctx.get?.('ptcRuntime')?.language === 'typescript'
   }
 
   recordShellResult(exec, result) {
@@ -138,7 +200,7 @@ export class ArenaAdapter extends LlmAdapter {
   async request(options) {
     if (options.purpose) throw Error('Arena does not accept auxiliary model requests')
     if (!options.sessionId) throw Error('Arena requires a Desktop session')
-    const { message, index, results, toolName } = selectMessage(options.messages, options.sessionId)
+    const { message, index, results, toolName, gallery } = selectMessage(options.messages, options.sessionId)
     const requestId = requestIdFor(options.sessionId, message.id)
     const tools = (options.tools ?? []).filter(tool => tool.name !== batchName)
     const catalog = tools.some(tool => tool.name === 'skill')
@@ -146,10 +208,14 @@ export class ArenaAdapter extends LlmAdapter {
       : undefined
     const skills = (catalog?.source.entries ?? []).map(({ name, description }) => ({ name, description }))
     const request = { requestId, sessionId: options.sessionId, text: '', tools, skills }
-    if (tools.some(tool => tool.name === 'run_code') && hasHelpHint(options.messages)) {
-      const runtime = this.ctx.get?.('ptcRuntime')
-      if (['python','typescript'].includes(runtime?.language)) {
-        request.toolHelpProgram = runtime.language
+    if (tools.some(tool => tool.name === 'arena_tool_help')) request.toolHelpDirect = hasHelpHint(options.messages)
+    if (tools.some(tool => tool.name === 'run_code') && this.admitsGalleryProgram(options)) request.galleryViaCode = true
+    const step = this.toolStep(options)
+    if (step && tools.some(tool => tool.name === 'run_code')) {
+      const program = programToolRoutes(this.ctx,step.agent,step.toolSet,tools,step.sections)
+      if (program) request.programToolRoutes = program
+      if (program?.names.includes('arena_tool_help') && hasHelpHint(options.messages)) {
+        request.toolHelpProgram = program.language
         request.toolHelpViaCode = true
       }
     }
@@ -168,21 +234,35 @@ export class ArenaAdapter extends LlmAdapter {
     const pngs = []
     let imageBytes = 0
     let imageCaption
-    if (message.content.filter(block => block.type === 'image').length > maxOutgoingImages) throw Error('Arena accepts up to 20 images per turn')
-    for (const block of message.content) {
-      if (block.type === 'text') parts.push(block.text)
+    const selected = selectedFileRefs(this.ctx,agent,message)
+    const imageCount = message.content.filter(block => block.type === 'image').length
+    if (imageCount && message.role !== 'tool')
+      throw Error('Desktop supplied a converted preview. Reattach the original file in the Arena composer.')
+    if (imageCount > maxOutgoingImages) throw Error('Arena accepts up to 20 tool images per turn')
+    for (const [i,block] of message.content.entries()) {
+      if (selected.has(i)) (request.files ??= []).push(fileMetadata(selected.get(i)))
+      else if (block.type === 'text') parts.push(block.text)
       else if (block.type === 'image') {
         const png = await outgoingPng(this.ctx, block, options.signal)
         imageBytes += png.length
         if (imageBytes > maxOutgoingBytes) throw Error('Arena images exceed the 32 MiB limit per turn')
         pngs.push(png.toString('base64'))
         if (toolName === 'read_image' && !message.isError) imageCaption = imageReadCaption(block.attachment,png)
-      } else throw Error('Arena supports text and static image attachments in a message')
+      } else throw Error('Unexpected Desktop content block. Reattach the original file in the Arena composer.')
     }
     if (pngs.length === 1) request.png = pngs[0]
     else if (pngs.length > 1) request.pngs = pngs
     if (message.role === 'tool') {
-      request.toolResult = JSON.stringify({ toolCallId: message.toolCallId, failed: message.isError === true, text: parts.join('\n') })
+      const galleryProgram = gallery && toolName === 'run_code'
+      if (gallery && (galleryProgram ? !request.galleryViaCode : !tools.some(tool=>tool.name === 'ask_user_question')))
+        throw Error('The Desktop gallery permission changed. If the panel is still open in the original Arena tab, choose an option there.')
+      if (galleryProgram && agent) {
+        const settled = (await this.galleryProjection)?.stateOf(agent.session)
+        if (settled?.callId === message.toolCallId && settled.proof)
+          request.galleryAnswer = {callId:settled.callId,...settled.proof}
+      }
+      const text = galleryProgram ? '' : parts.join('\n')
+      request.toolResult = JSON.stringify({ toolCallId: message.toolCallId, failed: message.isError === true, text })
       request.toolResultView = {}
       if (imageCaption && pngs.length === 1) request.toolResultView.image = imageCaption
       if (toolName === 'pwsh' && !message.isError) {
@@ -213,10 +293,24 @@ export class ArenaAdapter extends LlmAdapter {
     const setup = await this.companion.rpc('setup')
     if (setup?.supportsOnDemandContext !== true)
       throw Error('Update the Arena bridge companion to use on-demand tool documentation')
+    if (request.files && setup.supportsFiles !== true) throw Error('Update the Arena bridge companion to send original files.')
     if (request.pngs && setup.supportsPngBatch !== true) throw Error('Update the Arena bridge companion to send multiple images in one turn')
     if (setup.supportsResultView !== true) delete request.toolResultView
     signal?.throwIfAborted()
     try {
+      if (request.files) {
+        try {
+          await stageFiles(this.companion,this.ctx.get('attachments'),request,signal)
+          signal?.throwIfAborted()
+        } catch (error) {
+          if (!signal?.aborted) await this.companion.rpc('cancel',address).catch(()=>{})
+          throw error
+        }
+      }
+      if (this.questionAdmission(options) === false) {
+        delete request.galleryViaCode
+        request.tools = request.tools.filter(tool=>tool.name !== 'ask_user_question')
+      }
       const ack = await this.companion.rpc('start', request)
       if (ack.id !== address.id) throw Error('Arena bridge returned a different request ID')
       for (;;) {
@@ -247,21 +341,37 @@ export class ArenaAdapter extends LlmAdapter {
       if (text) blocks.push({ type:'text', text })
       calls.forEach((call, index) => blocks.push({ type:'tool-call', id:`arena_${address.id}_${index}`,
         name:call.name, arguments:JSON.stringify(call.arguments) }))
-    } else if ((reply?.kind === 'tool' || imageChoice) && reply.images === undefined && request.tools.some(tool => tool.name === reply.name) &&
+    } else if ((reply?.kind === 'tool' || imageChoice) && reply.images === undefined &&
+             (imageChoice || request.tools.some(tool => tool.name === reply.name)) &&
              reply.arguments && typeof reply.arguments === 'object' && !Array.isArray(reply.arguments) &&
              (reply.text === undefined || typeof reply.text === 'string')) {
+      let name = reply.name
+      let args = reply.arguments
       if (reply.text) blocks.push({ type:'text', text:reply.text })
       if (imageChoice) {
-        const options = reply.arguments.questions?.[0]?.options
+        const question = args.questions?.[0]
+        const choices = question?.options
         const labels = Array.isArray(reply.previews) ? reply.previews.map((_,index) => `Image ${index+1}`) : []
-        if (reply.arguments.questions?.length !== 1 || !Array.isArray(options) ||
-            !labels.every((label,index) => options[index]?.label === label) ||
-            (options.length !== labels.length && !(options.length === labels.length+1 && options.at(-1)?.label === 'Skip')))
+        if (!Array.isArray(args.questions) || args.questions.length !== 1 || typeof question?.id !== 'string' ||
+            typeof question.question !== 'string' || !Array.isArray(choices) ||
+            !labels.every((label,index) => choices[index]?.label === label) ||
+            (choices.length !== labels.length && !(choices.length === labels.length+1 && choices.at(-1)?.label === 'Skip')))
           throw Error('Arena image choices and previews do not match')
         const previews = await storeGeneratedImages(this.ctx, reply.previews, signal)
         previews.forEach((image,index) => blocks.push({type:'text',text:labels[index]}, image))
+        if (!request.tools.some(tool => tool.name === name) || this.questionAdmission(options) === false) {
+          if (request.galleryViaCode && this.admitsGalleryProgram(options)) {
+            const payload = {questions:[{id:question.id,question:question.question,options:choices.map(({label})=>({label}))}]}
+            name = 'run_code'
+            args = {description:'Choose an image from the Arena gallery',
+              code:`await tools.ask_user_question(${JSON.stringify(payload)})`}
+          } else {
+            name = undefined
+            blocks.push({type:'text',text:'If the panel is still open in the original Arena tab, choose an option there.'})
+          }
+        }
       }
-      blocks.push({ type:'tool-call', id:'arena_' + address.id, name:reply.name, arguments:JSON.stringify(reply.arguments) })
+      if (name) blocks.push({ type:'tool-call', id:'arena_' + address.id, name, arguments:JSON.stringify(args) })
     } else throw Error('Invalid reply or tool outside the active DSH profile')
     for (const [index, block] of blocks.entries()) {
       signal?.throwIfAborted()
@@ -270,6 +380,6 @@ export class ArenaAdapter extends LlmAdapter {
       if (block.type === 'tool-call') yield { type:'tool-call-delta', index, id:block.id, name:block.name, argumentsDelta:block.arguments }
       yield { type:'block-end', index, block }
     }
-    yield { type:'finish', reason:{ kind:reply.kind === 'text' ? 'stop' : 'tool-calls' } }
+    yield { type:'finish', reason:{ kind:blocks.some(block=>block.type === 'tool-call') ? 'tool-calls' : 'stop' } }
   }
 }

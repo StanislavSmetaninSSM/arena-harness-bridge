@@ -558,7 +558,7 @@
       const nativeQuestionClosed = Boolean(nativeQuestionId && s.question.closed);
       const ready = !s.question && state.ready && !s.settling && !s.log.waiting && !s.log.expected && !s.log.pendingRows;
       const { job, context, supportsNativeQuestions, supportsImageChoices, nativeQuestionClosed:closedId } = await rpc(s, 'poll', {
-        ready, supportsPngBatch:true, supportsNativeQuestions:true, nativeQuestionId, nativeQuestionClosed
+        ready, supportsPngBatch:true, supportsFiles:true, supportsNativeQuestions:true, nativeQuestionId, nativeQuestionClosed
       });
       if (session !== s || prepared) return;
       s.supportsNativeQuestions = supportsNativeQuestions === true;
@@ -596,7 +596,8 @@
         await page.submit({...job,...outgoing}, '', verifySource => guard(s,count,verifySource),
           () => {
             s.passiveFollowupIndex=null;s.log.expect(job.id, job.text, null, outgoing.receipt);
-          }, null, true, () => session===s && !prepared && !s.departed && s.chat===here() && s.problem?.transcriptChanged);
+          }, null, true, () => session===s && !prepared && !s.departed && s.chat===here() && s.problem?.transcriptChanged,
+          (index,offset) => rpc(s,'fileChunk',{job:job.id,index,offset}));
       } catch (error) {
         if (s.problem || error.kind || 'nativeAnswer' in job) suspend(s, s.problem || {kind:error.kind||'blocked',text:error.message},job.id);
         else if (s.log.expected) s.outbox.push(...s.log.fail(error.message));

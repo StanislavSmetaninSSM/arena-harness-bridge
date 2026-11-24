@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -17,6 +17,14 @@ const user = (id, text) => ({ id, role: 'user', source: {kind: 'user'}, content:
 const read = { name: 'read', description: 'Read a file', parameters: { type: 'object', properties: { file_path: {type:'string'} } } }
 const options = { sessionId: 'desktop-session', provider, model, tools: [read], messages: [user('user-1', 'Read the fixture')] }
 const collect = async iterable => Array.fromAsync(iterable)
+
+function toolImageMessages(content) {
+  const origin = user('picture','Inspect the screenshot')
+  const id = 'arena_'+createHash('sha256').update(JSON.stringify([options.sessionId,origin.id])).digest('hex')
+  return [origin,{id:'assistant',role:'assistant',source:{kind:'model',provider,model},
+    content:[{type:'tool-call',id,name:'read',arguments:'{}'}]},
+    {id:'image-result',role:'tool',toolCallId:id,content}]
+}
 
 class BrowserPeer {
   calls = []
@@ -195,27 +203,25 @@ test('transfers bytes of the current native PNG attachment and rejects unsupport
   const attachment = {type:'image', attachment:ref}
   const store = { async readImage(selected) { assert.deepEqual(selected, ref); return {data:bytes,ref} } }
   const adapter = new ArenaAdapter({ get:key => key === 'attachments' ? store : undefined }, new BrowserPeer())
-  const imageRequest = (...content) => adapter.request({...options,messages:[
-    {...user('older',''), content:[{type:'file', attachment:{id:'private-old-file'}}]},
-    {...user('picture',''), content},
-  ]})
+  const imageRequest = (...content) => adapter.request({...options,messages:toolImageMessages(content)})
   const request = await imageRequest(textBlock('Describe it'), attachment)
   assert.equal(request.png, bytes.toString('base64'))
-  assert.equal(request.text, 'Describe it')
+  assert.equal(JSON.parse(request.toolResult).text, 'Describe it')
   assert.doesNotMatch(JSON.stringify(request), /local-image-object|private-old-file/)
   await assert.rejects(imageRequest({...attachment,offloaded:true}), /PNG/)
   await assert.rejects(imageRequest({...attachment,attachment:{...ref,mediaType:'image/webp'}}), /PNG/)
   const uncached = new ArenaAdapter({get(){throw Error('Unexpected store access')}},new BrowserPeer())
-  const rejected = content => uncached.request({...options,messages:[{...user('guarded',''),content}]})
+  const rejected = content => uncached.request({...options,messages:toolImageMessages(content)})
+  await assert.rejects(uncached.request({...options,messages:[{...user('legacy',''),content:[attachment]}]}),/reattach the original/i)
   await assert.rejects(rejected(Array(21).fill(attachment)), /20/)
   await assert.rejects(rejected([{...attachment,attachment:{...ref,bytes:51*1024**2}}]), /50 MiB/)
   const mislabeled = new ArenaAdapter({get:() => ({readImage:async () => ({data:bytes})})},new BrowserPeer())
-  await assert.rejects(mislabeled.request({...options,messages:[{...user('wrong',''),content:[
+  await assert.rejects(mislabeled.request({...options,messages:toolImageMessages([
     {...attachment,attachment:{...ref,mediaType:'image/jpeg'}}
-  ]}]}), /match|format/i)
+  ])}), /match|format/i)
 })
 
-test('one native user turn or tool result sends each selected image in order in one request', async () => {
+test('one native tool result sends all screenshots in order in one request', async () => {
   const { ArenaAdapter } = await import('../provider.mjs')
   const sharp = createRequire(import.meta.url)('sharp')
   const red = await sharp({create:{width:12,height:4,channels:3,background:'#de262d'}}).png().toBuffer()
@@ -227,7 +233,7 @@ test('one native user turn or tool result sends each selected image in order in 
   const peer = new BrowserPeer()
   const adapter = new ArenaAdapter({ get:() => ({readImage:async ref => ({data:files[ref.id]})}) },peer,1)
   const content = [textBlock('First line'),blocks[1],textBlock('Second line'),blocks[0]]
-  const current = {...user('two-images',''),content}
+  const current = user('two-images','Read the images')
   const previous = {...user('previous',''),content:[{type:'file',attachment:{id:'private'}}]}
   peer.reply = {kind:'tool',name:'read',arguments:{file_path:'two.png'}}
   const events = await collect(adapter.stream({...options,messages:[previous,current]}))
@@ -238,9 +244,10 @@ test('one native user turn or tool result sends each selected image in order in 
   await collect(adapter.stream({...options,messages:[previous,current,assistant,result]}))
   const requests = peer.calls.filter(call => call.method === 'start').map(call => call.params)
   assert.equal(requests.length,2)
-  assert.equal(requests[0].text,'First line\nSecond line')
+  assert.equal(requests[0].text,'Read the images')
   assert.deepEqual(JSON.parse(requests[1].toolResult),{toolCallId:tool.id,failed:false,text:'First line\nSecond line'})
-  for (const request of requests) {
+  {
+    const request = requests[1]
     assert.equal(request.png,undefined)
     assert.equal(request.pngs.length,2)
     assert.equal(request.pngs[1],red.toString('base64'))
@@ -265,11 +272,11 @@ test('a failed, offloaded, cancelled or over-budget member prevents any part of 
     if (ref.id === 'aborted') controller.abort()
     return {data:png}
   }})},peer,1)
-  const send = (content,signal) => collect(adapter.stream({...options,signal,messages:[{...user('batch',''),content}]}))
+  const send = (content,signal) => collect(adapter.stream({...options,signal,messages:toolImageMessages(content)}))
   for (const [later,error] of [
     [{...image,offloaded:true},/accessible/i],
     [{...image,attachment:{...image.attachment,mediaType:'image/webp'}},/PNG|JPEG/],
-    [{type:'file',attachment:{id:'unrelated'}},/text|image/i],
+    [{type:'file',attachment:{id:'unrelated'}},/unexpected desktop content/i],
     [{...image,attachment:{...image.attachment,id:'missing'}},/fixture read failed/],
   ]) await assert.rejects(send([image,later]),error)
   await assert.rejects(send(Array(9).fill(image)),/32 MiB/)
@@ -284,11 +291,11 @@ test('a previous companion cannot acknowledge a multi-image request as text only
   const calls = []
   const peer = {async rpc(method) { calls.push(method); return {chat:'example'} }}
   const adapter = new ArenaAdapter({get:()=>({readImage:async()=>({data})})},peer)
-  await assert.rejects(collect(adapter.stream({...options,messages:[{...user('batch',''),content:[image,image]}]})),/update.*companion/i)
+  await assert.rejects(collect(adapter.stream({...options,messages:toolImageMessages([image,image])})),/update.*companion/i)
   assert.deepEqual(calls,['setup'])
 })
 
-test('real DSH normalized JPEG tool results and large PNG user attachments reach the wire as bounded, decodable PNGs', async t => {
+test('DSH tool JPEGs reach the wire as bounded PNGs and named user previews require original file intake', async t => {
   const { ArenaAdapter } = await import('../provider.mjs')
   const { Context } = await import('@deepseek-ai/cordis')
   const { default: LocalAttachments } = await import('@deepseek-ai/dsh-attachment-local')
@@ -325,7 +332,13 @@ test('real DSH normalized JPEG tool results and large PNG user attachments reach
         const tool = first.find(event => event.type === 'block-end').block
         messages = [...options.messages, {id:'assistant',role:'assistant',source:{kind:'model',provider,model},content:[tool]},
           {id:'image-result',role:'tool',toolCallId:tool.id,content}]
-      } else messages = [{...user('image-user',''),content}]
+      } else {
+        messages = [{...user('image-user',''),content}]
+        await assert.rejects(collect(adapter.stream({...options,messages})),/reattach the original file/i)
+        assert.equal(peer.calls.length,0)
+        await ctx.fiber.dispose()
+        return
+      }
       peer.reply = {kind:'text',text:'colors received'}
       await collect(adapter.stream({...options,messages}))
       const request = peer.calls.findLast(call => call.method === 'start').params
@@ -337,7 +350,7 @@ test('real DSH normalized JPEG tool results and large PNG user attachments reach
       const colorAt = (x,y) => Array.from(data.subarray(3*(y*info.width+x),3*(y*info.width+x)+3))
       const top = colorAt(5,5), bottom = colorAt(info.width-6,info.height-6)
       assert.ok(top[0]>210 && top[2]<60 && bottom[2]>210 && bottom[0]<60)
-      assert.equal(role === 'tool' ? JSON.parse(request.toolResult).text : request.text,'Inspect the colors')
+      assert.equal(JSON.parse(request.toolResult).text,'Inspect the colors')
       assert.equal((await store.readImage(ref)).data.byteLength,ref.bytes)
       await ctx.fiber.dispose()
     })
@@ -478,19 +491,47 @@ const system = (sections, texts, flags = {}) => ({role:'system', source:{kind:'s
 const activeSection = (name, contentIndex) => ({name, state:'active', order:20, contentIndex})
 const runCode = {name:'run_code', description:'Run a program', parameters:{type:'object'}}
 
-test('the first program-mode help example follows the active executor syntax', async () => {
+test('a same-name direct tool is advertised as bridge help only with its scoped help marker', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const adapter = new ArenaAdapter({},new BrowserPeer())
+  const named = {...options,tools:[{name:'arena_tool_help',parameters:{type:'object'}}]}
+  const messages = [system([activeSection('arena:tool-help',0)],['Arena tool reference is available for this step through arena_tool_help.']),...options.messages]
+  assert.equal((await adapter.request(named)).toolHelpDirect,false)
+  assert.equal((await adapter.request({...named,messages})).toolHelpDirect,true)
+})
+
+test('program routes come from the same live step and the help example follows its runtime', async () => {
   const { ArenaAdapter } = await import('../provider.mjs')
   const marker = 'Arena tool reference is available for this step through arena_tool_help.'
   const messages = [system([activeSection('arena:tool-help',0)], [marker]), ...options.messages]
+  const agent = {session:{id:options.sessionId}}
+  const signal = new AbortController().signal
+  const sections = ['tools:sdk','tools:ptc-only'].map(name=>({name,text:'native program block'}))
   for (const [language, programFormat, expected] of [
     ['typescript','function-body','typescript'], ['typescript','scoped-repl','typescript'],
     ['typescript','repl','typescript'], ['typescript','script','typescript'], ['python','script','python'],
   ]) {
-    const adapter = new ArenaAdapter({get:key=>key==='ptcRuntime'?{language,programFormat}:undefined},new BrowserPeer())
-    const request = await adapter.request({...options,tools:[runCode],messages})
+    let capture
+    const adapter = new ArenaAdapter({on:(_event,listener)=>{capture=listener},
+      get:key=>key==='ptcRuntime'?{language,programFormat}:undefined},new BrowserPeer())
+    const current = new Map(['read','arena_tool_help','new_tool'].map(name=>[name,{name}]))
+    const toolSet = {view:scope=>scope===agent ? new Map(current) : new Map()}
+    const args = {...options,tools:[runCode],messages,signal}
+    assert.equal((await adapter.request(args)).programToolRoutes,undefined)
+    await capture({sections},{scope:agent,agent,signal,toolSet,modelSelection:{provider,model}},async()=>({sections}))
+    const request = await adapter.request(args)
     assert.equal(request.toolHelpViaCode,true)
     assert.equal(request.toolHelpProgram,expected)
+    assert.deepEqual(request.programToolRoutes,{language,names:['arena_tool_help','new_tool','read']})
+    current.delete('read')
+    assert.ok(!(await adapter.request(args)).programToolRoutes.names.includes('read'))
+    assert.equal((await adapter.request({...args,sessionId:'different'})).programToolRoutes,undefined)
+    assert.equal((await adapter.request({...args,signal:new AbortController().signal})).programToolRoutes,undefined)
+    assert.equal((await adapter.request({...args,tools:[read]})).programToolRoutes,undefined)
     assert.equal((await adapter.request({...options,tools:[runCode]})).toolHelpProgram,undefined)
+    const exclusive = {sections:[...sections,{name:'exclusive',text:'Custom prompt',complete:true}]}
+    await capture(exclusive,{scope:agent,agent,signal,toolSet,modelSelection:{provider,model}},async()=>({sections}))
+    assert.equal((await adapter.request(args)).programToolRoutes,undefined)
   }
 })
 

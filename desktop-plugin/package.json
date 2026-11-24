@@ -1,13 +1,13 @@
 {
   "name": "dsh-arena-desktop",
-  "version": "0.1.17",
+  "version": "0.1.20",
   "description": "Arena Agent Mode in the DeepSeek Harness Desktop model selector",
   "private": true,
   "type": "module",
   "main": "./index.mjs",
-  "exports": { ".": "./index.mjs", "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json" },
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
-  "files": ["*.mjs", "arena_terminal", "pairing.ps1", "cordis.patch.yml", "README.md"],
+  "exports": { ".": "./index.mjs", "./client": "./original-files.client.js", "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json" },
+  "dsh": { "client": { "platform":"web", "inject":["@deepseek-ai/dsh-client-ui-conversation","@deepseek-ai/dsh-client-ui-model-selection","@deepseek-ai/dsh-client-ui-renderer"] }, "bundle": { "patch": "./cordis.patch.yml" } },
+  "files": ["*.mjs", "original-files.client.js", "arena_terminal", "pairing.ps1", "cordis.patch.yml", "README.md"],
   "scripts": { "test": "node --test test/*.test.mjs" },
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": "0.2.2-rc.5 || 0.2.3-alpha.2",
@@ -15,5 +15,5 @@
     "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.5 || 0.2.3-alpha.2",
     "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-rc.5 || 0.2.3-alpha.2"
   },
-  "dependencies": { "sharp": "0.35.5" }
+  "dependencies": { "sharp": "0.35.5", "mime-types": "3.0.2", "zod": "4.6.6" }
 }

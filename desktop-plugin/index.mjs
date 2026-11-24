@@ -9,7 +9,7 @@ import { registerToolHelp } from './tool-help.mjs'
 export const name = 'arena-desktop'
 export const inject = ['llm', 'commands', 'agents', 'sessionProjections', 'tools', 'systemPrompt']
 
-export function apply(ctx, config = {}) {
+export async function apply(ctx, config = {}) {
   const packageRoot = dirname(fileURLToPath(import.meta.url))
   const bundledCompanion = existsSync(resolve(packageRoot, 'arena_terminal', 'desktop_provider.py'))
   const root = config.bridgeRoot || process.env.ARENA_BRIDGE_ROOT || (bundledCompanion ? packageRoot : resolve(packageRoot, '..'))
@@ -20,6 +20,7 @@ export function apply(ctx, config = {}) {
   const companion = new Companion({ cwd: root, command, args: ['-u','-m','arena_terminal.desktop_provider'], env: {...env, PYTHONUTF8:'1'} })
   ctx.effect(() => () => companion.close())
   const adapter = new ArenaAdapter(ctx, companion)
+  await adapter.galleryProjection
   registerToolHelp(ctx)
   ctx.on('tools/result', (exec, result) => { adapter.recordShellResult(exec, result) })
   ctx.llm.registerAdapter([route], adapter)

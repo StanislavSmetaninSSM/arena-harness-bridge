@@ -45,7 +45,8 @@ class WindowsReleaseTests(unittest.TestCase):
                     self.assertEqual({name for name in installed if "/arena_terminal/" in name}, python_files)
                     self.assertEqual(installed, python_files | {
                         "package/package.json", "package/index.mjs", "package/provider.mjs", "package/tool-help.mjs",
-                        "package/outgoing-image.mjs", "package/pairing.mjs", "package/pairing.ps1",
+                        "package/outgoing-image.mjs", "package/original-files.mjs", "package/original-files.client.js",
+                        "package/pairing.mjs", "package/pairing.ps1",
                         "package/companion.mjs", "package/cordis.patch.yml", "package/README.md", "package/LICENSE",
                     })
 

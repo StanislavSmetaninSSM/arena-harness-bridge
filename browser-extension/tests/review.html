@@ -176,6 +176,12 @@
   check(!page.continueWork() && !continued.length, 'a user attachment hidden by the panel also blocks continuation');
 
   reset();
+  composer.insertAdjacentHTML('beforeend','<button type="button" aria-label="Remove personal.txt">×</button>');
+  composer.hidden=true;
+  panel();
+  check(!page.continueWork() && !continued.length, 'a hidden composer with a file chip and a cleared picker blocks continuation');
+
+  reset();
   const first = panel();
   const second = panel();
   check(!page.continueWork() && !continued.length, 'two visible review panels are ambiguous');

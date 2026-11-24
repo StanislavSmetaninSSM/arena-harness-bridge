@@ -2,6 +2,7 @@
 import hmac
 import json
 import re
+import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .journal import Problem
@@ -68,6 +69,8 @@ class ExtensionHandler(BaseHTTPRequestHandler):
                           "supportsImageChoices":getattr(db, "supports_image_choices", False)}
                 if closure is not None:
                     result["nativeQuestionClosed"] = closure
+            elif self.path == "/v1/file-chunk" and db.supports_files:
+                result = db.file_chunk(body)
             elif self.path == "/v1/event":
                 result = {"ok":True, **(db.event(body) or {})}
             elif self.path == "/v1/skill":
@@ -80,6 +83,8 @@ class ExtensionHandler(BaseHTTPRequestHandler):
                 return self.reply(404, {"error":"Unknown endpoint"})
         except (ValueError, TypeError, KeyError, RecursionError) as error:
             return self.reply(400, {"error":str(error)})
+        except sqlite3.Error as error:
+            return self.reply(503, {"error":f"Local journal: {error}"})
         except OSError:
             return self.reply(503, {"error":"Local adapter unavailable"})
         self.reply(200, result)

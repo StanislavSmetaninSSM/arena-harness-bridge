@@ -330,6 +330,154 @@ class DesktopProviderTests(unittest.TestCase):
         self.assertNotIn("Local.txt", status["error"])
         self.assertIsNone(self.db.poll(self.addr, True))
 
+    def test_known_program_tool_can_be_corrected_once_without_replaying_its_arguments(self):
+        request = dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=True,
+                       programToolRoutes={"language":"typescript", "names":["read", "arena_tool_help"]})
+        self.db.start(request)
+        # Replaying an accepted request keeps its original admitted catalog, even across a restart.
+        self.db.start(dict(request, programToolRoutes={"language":"python", "names":["different_tool"]}))
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        first = self.db.poll(self.addr, True)
+        self.assertIn("Only run_code", first["text"])
+        self.assertIn("TypeScript", first["text"])
+        self.assertNotIn('"read"', first["text"])
+        source = tool_call(first["id"], "read", {"file_path":"private-project-path"}).split("\n")[1]
+        self.send_raw(first["id"], source)
+        self.assertEqual(self.db.status("first", "desktop-session"), {"state":"queued"})
+        self.assertIsNone(self.db.lookup("first","desktop-session")["reply"])
+        retry = self.db.poll(self.addr, True)
+        self.assertNotEqual(retry["id"], first["id"])
+        for phrase in ('"read"', "run_code", "TypeScript", "fresh ID"):
+            self.assertIn(phrase, retry["text"])
+        self.assertNotIn("private-project-path", retry["text"])
+        self.db.event(self.raw_reply(first["id"], source, event_id="late-original"))
+        arguments = {"description":"Read the local file", "code":'await tools.read({file_path:"corrected-path"})'}
+        self.send_raw(retry["id"], tool_call(retry["id"], "run_code", arguments).split("\n")[1], event_id="corrected")
+        self.assertEqual(self.db.status("first","desktop-session")["reply"],
+                         {"kind":"tool", "text":"Пояснение.", "name":"run_code", "arguments":arguments})
+        self.assertIsNone(self.db.poll(self.addr, True))
+
+    def test_misrouting_an_unfamiliar_tool_uses_current_dialect_and_shared_retry_budget(self):
+        request = dict(self.request, tools=[{"name":"arena_tool_help"},{"name":"run_code"}],
+                       programToolRoutes={"language":"python", "names":["new-capability"]})
+        self.db.start(request)
+        first = self.db.poll(self.addr, True)
+        self.assertIn("Python", first["text"])
+        self.assertNotIn("Only run_code", first["text"])
+        self.assertNotIn("new-capability", first["text"])
+        self.send_raw(first["id"], tool_call(first["id"], "new-capability", {}).split("\n")[1])
+        second = self.db.poll(self.addr, True)
+        self.assertIn("Python", second["text"])
+        self.assertIn('"new-capability"', second["text"])
+        self.send_raw(second["id"], self.malformed_source(second["id"], "run_code"), event_id="second-invalid")
+        self.assertEqual(self.db.status("first","desktop-session")["state"], "failed")
+        self.assertIsNone(self.db.poll(self.addr, True))
+
+    def test_route_hints_expire_with_each_step_and_an_upgrade_announces_only_the_changed_contract(self):
+        self.db.acknowledge_context("desktop-intro-v3/typescript")
+        request = dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=True,
+                       programToolRoutes={"language":"typescript", "names":["read", "arena_tool_help"]})
+        self.db.start(request)
+        first = self.db.poll(self.addr, True)
+        self.assertIn("Only run_code", first["text"])
+        self.assertNotIn("ordinary JSON", first["text"])
+        self.db.event(dict(self.addr, id="sent-1", kind="sent", job=first["id"]))
+        self.db.event(dict(self.addr, id="finished", kind="assistant", replyTo=first["id"], text="OK"))
+        self.db.start(dict(request, requestId="new-step", programToolRoutes={
+            "language":"typescript", "names":["other", "arena_tool_help"]}))
+        next_job = self.db.poll(self.addr, True)
+        self.assertEqual(next_job["text"], self.request["text"])
+        self.send_raw(next_job["id"], tool_call(next_job["id"], "read").split("\n")[1])
+        self.assertEqual(self.db.status("new-step","desktop-session")["state"], "failed")
+        self.assertIsNone(self.db.poll(self.addr, True))
+
+    def test_repeated_wrong_route_stops_and_a_direct_tool_can_still_be_called_in_a_mixed_catalog(self):
+        request = dict(self.request, tools=[{"name":"run_code"}, {"name":"read"}],
+                       programToolRoutes={"language":"typescript", "names":["read", "custom"]})
+        self.db.start(request)
+        first = self.db.poll(self.addr, True)["id"]
+        self.send_raw(first, tool_call(first, "custom").split("\n")[1])
+        retry = self.db.poll(self.addr, True)["id"]
+        self.send_raw(retry, tool_call(retry, "custom").split("\n")[1], event_id="wrong-again")
+        self.assertEqual(self.db.status("first", "desktop-session")["state"], "failed")
+        self.assertIsNone(self.db.poll(self.addr, True))
+        self.db.start(dict(request, requestId="mixed"))
+        job = self.db.poll(self.addr, True)["id"]
+        self.send_raw(job, tool_call(job, "read", {"file_path":"fixture.txt"}).split("\n")[1], event_id="direct")
+        self.assertEqual(self.db.status("mixed","desktop-session")["reply"]["name"], "read")
+
+    def test_confirmed_bindings_determine_the_program_help_dialect_and_availability(self):
+        request = dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=True,
+                       programToolRoutes={"language":"python", "names":["arena_tool_help"]})
+        self.db.start(request)
+        first = self.db.poll(self.addr, True)
+        self.assertIn("print(await tools.arena_tool_help({}))", first["text"])
+        self.db.event(dict(self.addr, id="old-sent", kind="sent", job=first["id"]))
+        self.db.event(dict(self.addr, id="old-done", kind="assistant", replyTo=first["id"], text="OK"))
+        for index, names in enumerate((["read"], [])):
+            self.db.start(dict(request, requestId=f"changed-{index}", programToolRoutes={"language":"python", "names":names}))
+            job = self.db.poll(self.addr, True)
+            self.assertNotIn("tools.arena_tool_help", job["text"])
+            self.db.event(dict(self.addr, id=f"change-sent-{index}", kind="sent", job=job["id"]))
+            self.db.event(dict(self.addr, id=f"change-done-{index}", kind="assistant", replyTo=job["id"], text="OK"))
+
+    def test_shadowed_help_names_do_not_advertise_a_bridge_help_route(self):
+        for rid, direct, program, expected in (("both-shadowed", False, False, None),
+                                               ("direct-shadowed", False, True, "run_code"),
+                                               ("program-shadowed", True, False, "arena_tool_help")):
+            with self.subTest(rid=rid):
+                self.db.acknowledge_context("desktop-intro-v3/test")
+                request = dict(self.request, requestId=rid, tools=[{"name":"arena_tool_help"},{"name":"run_code"}],
+                               toolHelpDirect=direct, toolHelpViaCode=program,
+                               programToolRoutes={"language":"python", "names":["arena_tool_help"]})
+                self.db.start(request)
+                self.db.start(dict(request, toolHelpDirect=not direct, toolHelpViaCode=not program))
+                job = self.db.poll(self.addr, True)
+                if expected:
+                    example = json.loads(job["text"].split("```text\n")[1].split("\n```")[0])
+                    self.assertEqual(example["name"], expected)
+                else:
+                    self.assertNotIn("arena_tool_help", job["text"])
+                    self.assertIn("help is unavailable", job["text"])
+                self.db.event(dict(self.addr, id=rid+"-sent", kind="sent", job=job["id"]))
+                self.db.event(dict(self.addr, id=rid+"-done", kind="assistant", replyTo=job["id"], text="OK"))
+
+    def test_program_tool_name_alone_is_not_a_help_capability(self):
+        self.db.start(dict(self.request, tools=[{"name":"run_code"}],
+                           programToolRoutes={"language":"typescript", "names":["arena_tool_help"]}))
+        job = self.db.poll(self.addr, True)
+        self.assertNotIn("tools.arena_tool_help", job["text"])
+        self.assertIn("help is unavailable", job["text"])
+
+    def test_program_route_recovery_requires_an_intact_current_source_and_admitted_name(self):
+        request = dict(self.request, tools=[{"name":"run_code"}],
+                       programToolRoutes={"language":"typescript", "names":["read"]})
+        for scenario in ("unknown", "stale", "invalid-json", "text-reference", "extra-block", "missing-source", "no-run-code"):
+            with self.subTest(scenario=scenario):
+                params = dict(request, requestId=scenario)
+                if scenario == "no-run-code":
+                    params["tools"] = [{"name":"direct-tool"}]
+                self.db.start(params)
+                job = self.db.poll(self.addr, True)["id"]
+                turn = "f"*32 if scenario == "stale" else job
+                name = "unavailable" if scenario == "unknown" else "read"
+                arguments = {"value":{"$text":"sample"}} if scenario == "text-reference" else {}
+                source = tool_call(turn, name, arguments).split("\n")[1]
+                if scenario == "invalid-json":
+                    source = self.malformed_source(job, "read")
+                if scenario == "extra-block":
+                    source = "\x1e" + source + "\x1esample\nextra"
+                if scenario == "missing-source":
+                    self.db.event(dict(self.addr, id="sent-"+job, kind="sent", job=job))
+                    self.db.event(dict(self.addr, id="plain-"+job, kind="assistant", replyTo=job,
+                                       toolFrame=True, text=tool_call(job, name, arguments)))
+                    self.assertEqual(self.db.status(scenario,"desktop-session")["reply"]["kind"], "text")
+                else:
+                    self.send_raw(job, source, event_id=scenario)
+                    self.assertEqual(self.db.status(scenario,"desktop-session")["state"], "failed")
+                self.assertIsNone(self.db.poll(self.addr, True))
+
     def test_unproven_or_ambiguous_raw_commands_never_retry(self):
         for index, variant in enumerate(("stale", "duplicate", "extra-root-field", "unknown", "second-object")):
             with self.subTest(variant=variant):
@@ -715,6 +863,24 @@ class DesktopProviderTests(unittest.TestCase):
         self.db.start(dict(request, requestId="next", text="Follow-up"))
         self.assertEqual(self.browser_delivery()[0], "Follow-up")
 
+    def test_v2_chat_learns_automatic_image_delivery_once(self):
+        self.db.acknowledge_context("desktop-intro-v2/typescript")
+        request = dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=True, text="Hello")
+        self.db.start(request)
+        body, turn = self.browser_delivery()
+        intro, separator, prompt = body.partition("\n\n")
+        self.assertEqual((separator, prompt), ("\n\n", "Hello"))
+        self.assertIn("automatically delivers each generated image that Arena displays in your reply", intro)
+        self.assertIn("Once Arena shows the finished images in your reply, finish your answer normally", intro)
+        for topic in ("bridge:images", "read_image", "computer_use", "base64"):
+            self.assertNotIn(topic, intro)
+        self.db.event(dict(self.addr, id="image-role-sent", kind="sent", job=turn))
+        self.db.event(dict(self.addr, id="image-role-answer", kind="assistant", replyTo=turn, text="OK"))
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        self.db.start(dict(request, requestId="next", text="Next"))
+        self.assertEqual(self.browser_delivery()[0], "Next")
+
     def test_change_of_help_route_only_announces_the_new_entry_point(self):
         request = dict(self.request, tools=[{"name":"arena_tool_help"}])
         self.db.start(request)
@@ -965,12 +1131,50 @@ class DesktopProviderTests(unittest.TestCase):
         answer = {"answers":[{"id":card["id"],"selected":["Image 2"]}]}
         request = dict(self.request,requestId="choice",text="",toolResult=json.dumps(
             {"toolCallId":"arena_first","failed":False,"text":json.dumps(answer)}))
+        with self.assertRaisesRegex(Problem, "permission changed"):
+            self.db.start(request)
+        request["tools"] = [{"name":"ask_user_question"}]
         self.db.start(request)
         poller = dict(self.addr,supportsNativeQuestions=True,nativeQuestionId=card["id"])
         self.assertIsNone(self.db.poll(dict(poller,nativeQuestionId="different"),False))
         job = self.db.poll(poller,False)
         self.assertEqual(job["nativeAnswer"],dict(card,answer="Image 2"))
         self.assertIsNone(self.db.poll(poller,False))
+
+    def program_gallery_exchange(self):
+        start = dict(self.request, tools=[{"name":"run_code"}], galleryViaCode=True)
+        self.db.start(start)
+        origin = self.db.poll(self.addr,True)["id"]
+        self.db.event(dict(self.addr,id="sent",kind="sent",job=origin))
+        card = {"id":"gallery","question":"Choose an image","options":["Image 1","Image 2"]}
+        previews = [{"mediaType":"image/png","data":data} for data in (RED,BLUE)]
+        self.db.event(dict(self.addr,id="card",kind="assistant",replyTo=origin,supportsNativeQuestions=True,
+                           nativeQuestion=card,choicePreviews=previews))
+        def answer(label):
+            return json.dumps({"answers":[{"id":card["id"],"selected":[label]}]})
+        program = dict(start,requestId="result",text="",toolResult=json.dumps({
+            "toolCallId":"arena_first","failed":False,"text":answer("Image 1")}))
+        arguments = self.db.status("first","desktop-session")["reply"]["arguments"]
+        native = dict(callId="arena_first",arguments=arguments,text=answer("Image 2"))
+        return card, program, native
+
+    def test_program_gallery_uses_the_settled_native_answer_and_requires_current_admission(self):
+        card, program, native = self.program_gallery_exchange()
+        with self.assertRaisesRegex(Problem,"no admitted native answer"):
+            self.db.start(program)
+        program["galleryAnswer"] = native
+        with self.assertRaisesRegex(Problem,"no admitted native answer"):
+            self.db.start(dict(program,galleryViaCode=False))
+        self.db.start(program)
+        job = self.db.poll(dict(self.addr,supportsNativeQuestions=True,nativeQuestionId=card["id"]),False)
+        self.assertEqual(job["nativeAnswer"],dict(card,answer="Image 2"))
+
+    def test_program_gallery_rejects_a_selection_from_a_different_prompt_with_the_same_id(self):
+        _, program, native = self.program_gallery_exchange()
+        question = native["arguments"]["questions"][0]
+        for wrong in (dict(native,callId="arena_other"),dict(native,arguments={"questions":[dict(question,question="Other question")]})):
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(Problem,"no admitted native answer"):
+                self.db.start(dict(program,galleryAnswer=wrong))
 
     def test_site_card_admits_only_the_bound_question_and_matching_native_selection(self):
         event = self.site_question()

@@ -1,6 +1,6 @@
 {
   "name": "dsh-arena-desktop",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Arena Agent Mode in the DeepSeek Harness Desktop model selector",
   "private": true,
   "type": "module",
@@ -9,6 +9,11 @@
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "files": ["*.mjs", "arena_terminal", "pairing.ps1", "cordis.patch.yml", "README.md"],
   "scripts": { "test": "node --test test/*.test.mjs" },
-  "peerDependencies": { "@deepseek-ai/dsh-llm": "0.2.2-rc.5 || 0.2.3-alpha.2" },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.5 || 0.2.3-alpha.2",
+    "@deepseek-ai/dsh-scope": "0.2.2-rc.5 || 0.2.3-alpha.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.5 || 0.2.3-alpha.2",
+    "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-rc.5 || 0.2.3-alpha.2"
+  },
   "dependencies": { "sharp": "0.35.5" }
 }

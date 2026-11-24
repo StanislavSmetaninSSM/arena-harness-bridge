@@ -3,6 +3,7 @@ import { win32 } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { outgoingPng } from './outgoing-image.mjs'
+import { committedSection, hasHelpHint } from './tool-help.mjs'
 
 export const route = 'arena'
 const model = { provider: route, id: 'agent-mode', name: 'Arena Agent Mode', inputModalities: ['text', 'image'] }
@@ -38,26 +39,8 @@ async function legacyCuaGuidance(ctx, agent, options, message) {
 }
 
 async function computerUseGuidance(ctx, agent, options) {
-  for (let i = options.messages.length - 1; i >= 0; i--) {
-    const row = options.messages[i]
-    if (row.role !== 'system') continue
-    if (row.source?.kind !== 'system-prompt') return ''
-    const sections = row.source.sections
-    if (sections === undefined) return legacyCuaGuidance(ctx,agent,options,row)
-    if (!Array.isArray(sections)) return ''
-    const matching = sections.filter(section => section?.name === cuaSectionName)
-    if (matching.length) {
-      const section = matching[0]
-      const index = section.contentIndex
-      if (matching.length !== 1 || section.state !== 'active' || !Number.isInteger(index) || index < 0 ||
-          sections.some(other => other !== section && other?.contentIndex === index ||
-            Array.isArray(other?.noticeIndex) && other.noticeIndex.includes(index))) return ''
-      const block = row.content?.[index]
-      return block?.type === 'text' && typeof block.text === 'string' && block.text.trim() ? block.text : ''
-    }
-    if (row.source.reset || row.source.complete) return ''
-  }
-  return ''
+  const section = committedSection(options.messages, cuaSectionName)
+  return section?.legacy ? legacyCuaGuidance(ctx,agent,options,section.legacy) : section?.text ?? ''
 }
 
 async function storeGeneratedImages(ctx, images, signal) {
@@ -190,6 +173,7 @@ export class ArenaAdapter extends LlmAdapter {
       : undefined
     const skills = (catalog?.source.entries ?? []).map(({ name, description }) => ({ name, description }))
     const request = { requestId, sessionId: options.sessionId, text: '', tools, skills }
+    if (tools.some(tool => tool.name === 'run_code') && hasHelpHint(options.messages)) request.toolHelpViaCode = true
     if (tools.some(tool => batchTools.has(tool.name))) request.supportsReadBatch = true
     // The Desktop preset owns Plan Mode. Read the same committed session projection
     // as Desktop, so a pending selection takes effect at the next step boundary.
@@ -251,6 +235,8 @@ export class ArenaAdapter extends LlmAdapter {
     const needsGuidanceSupport = request.tools.some(tool => cuaToolNames.has(tool.name))
     if (request.pngs || request.toolResultView || needsGuidanceSupport) {
       const setup = await this.companion.rpc('setup')
+      if (request.toolHelpViaCode && setup?.supportsToolHelp !== true)
+        throw Error('Update the Arena bridge companion to deliver the Harness tool reference')
       if (needsGuidanceSupport && setup?.supportsComputerUseGuidance !== true)
         throw Error('Update the Arena bridge companion to deliver native Computer Use instructions')
       if (request.pngs && setup?.supportsPngBatch !== true) throw Error('Update the Arena bridge companion to send multiple images in one turn')

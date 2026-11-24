@@ -621,6 +621,15 @@ class DesktopProviderTests(unittest.TestCase):
         self.db.start(dict(request,requestId="next",computerUseGuidance="",text="Follow up"))
         self.assertNotIn("Computer Use guidance", self.db.poll(self.addr,True)["text"])
 
+    def test_nested_help_is_discoverable_and_does_not_become_a_direct_tool(self):
+        request = dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=True)
+        self.db.start(request)
+        self.db.start(dict(request, toolHelpViaCode=False))
+        first = self.db.poll(self.addr, True)
+        self.assertIn("inspect(await tools.arena_tool_help({}))", first["text"])
+        names = json.loads(self.db.one("SELECT names FROM requests WHERE id='first'")["names"])
+        self.assertEqual(names, ["run_code"])
+
     def test_changed_guidance_must_fit_before_a_continuation_is_queued(self):
         self.db.start(dict(self.request, computerUseGuidance="small section"))
         self.complete()

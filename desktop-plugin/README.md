@@ -2,9 +2,17 @@
 
 Плагин добавляет модель **Arena Agent Mode** и команду **Connect Arena / Подключить Arena** (`/arena-pair`). Установите его с Python-компаньоном и расширением Chrome по [инструкции Windows](../INSTALL.md).
 
-Пакет 0.1.14 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
+Пакет 0.1.15 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
 
-**English** — Plugin 0.1.14 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+**English** — Plugin 0.1.15 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+
+Перед работой с незнакомым инструментом Arena может запросить справку через `arena_tool_help`. Пустой запрос перечисляет доступные инструменты. Запрос `{"name":"read"}` возвращает описание, схему аргументов и результата, а также отдельную штатную инструкцию `tool:read`, если она опубликована. В программном режиме справка вызывается внутри `run_code`. Запрос `{"sdk":true}` открывает штатный SDK. Если пришёл `nextCursor`, его передают как `cursor` с теми же аргументами. Новые зарегистрированные инструменты появляются при следующем ходе, в котором Harness разрешил их использовать.
+
+**English** — Arena can look up unfamiliar tools with `arena_tool_help`. Call it with `{}` to list the current step's tools, or with `{"name":"read"}` to get the description, input and available output schema, and the published `tool:read` instructions when present. In program mode call the helper inside `run_code`. Use `{"sdk":true}` for the native SDK. Pass a returned `nextCursor` as `cursor` with the same query to continue. Newly registered tools appear on the next step that admits them.
+
+Пустой запрос также показывает общие инструкции. Например, `{"guide":"tool:schedule"}` возвращает опубликованные правила планировщика. Для одного программного вызова запрос `{"name":"read_image","sdk":true}` показывает тип результата, который получает программа.
+
+**English** — The index also lists shared guides. For example, `{"guide":"tool:schedule"}` returns the scheduler's published rules. Use `{"name":"read_image","sdk":true}` for a single program binding and its actual return type.
 
 Если в профиле включён Computer Use, плагин передаёт его штатное руководство Arena вместе с каталогом инструментов. В нём могут быть примеры кода и локальный путь к библиотеке Computer Use. При смене или отключении руководства мост обновляет инструкции в чате. Доступ к приложениям подтверждается в Harness.
 

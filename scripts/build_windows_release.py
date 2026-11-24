@@ -13,7 +13,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_FILES = (
     "companion.mjs", "cordis.patch.yml", "index.mjs", "outgoing-image.mjs",
-    "package.json", "pairing.mjs", "pairing.ps1", "provider.mjs", "README.md",
+    "package.json", "pairing.mjs", "pairing.ps1", "provider.mjs", "tool-help.mjs", "README.md",
 )
 EXTENSION_FILES = (
     "adapter.js", "content.js", "core.js", "generated-images.js", "manifest.json",

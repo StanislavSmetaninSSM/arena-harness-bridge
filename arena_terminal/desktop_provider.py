@@ -345,6 +345,11 @@ class DesktopJournal(Journal):
                    "questions to the Desktop user when available. Native tool catalog: " + schema
                    + "\nAvailable skills: " + json.dumps(skill_list,ensure_ascii=False))
         guidance = request.get("computerUseGuidance")
+        if request.get("toolHelpViaCode") is True and any(t["name"] == "run_code" for t in tools):
+            context += ("\nBefore using an unfamiliar Desktop tool, request its current Harness documentation. "
+                        "Inside run_code use inspect(await tools.arena_tool_help({})) to list available names, "
+                        "{name:'read'} for one tool, {guide:'tool:...'} for a listed shared instruction or "
+                        "{sdk:true} for the program SDK. Use nextCursor as cursor for the next page.")
         if "computerUseGuidance" in request:
             if not isinstance(guidance, str):
                 raise Problem("Expected Desktop Computer Use guidance as text")
@@ -359,7 +364,7 @@ class DesktopJournal(Journal):
         # Capability negotiation affects the initial catalog only. Replaying a
         # previously admitted request must retain its original catalog and ID.
         presentation = request.get("toolResultView")
-        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView", "computerUseGuidance"))
+        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView", "computerUseGuidance", "toolHelpViaCode"))
         with self.lock, self.sql:
             owner = self.one("SELECT id FROM desktop_session")
             if not owner or owner["id"] != session:
@@ -372,7 +377,7 @@ class DesktopJournal(Journal):
             if old:
                 # Older companions may have included a presentation or capability hint in the digest.
                 if old["session"] != session or (old["fingerprint"] != fingerprint and not any(
-                    old["fingerprint"] == request_fingerprint(request, (*omitted, "computerUseGuidance"))
+                    old["fingerprint"] == request_fingerprint(request, (*omitted, "computerUseGuidance", "toolHelpViaCode"))
                     for omitted in ((), ("supportsReadBatch",), ("toolResultView",))
                 )):
                     raise Problem("Desktop request ID reused with different content")
@@ -800,7 +805,8 @@ def serve():
                         with db.lock:
                             bound = db.one("SELECT chat FROM binding")
                         result = {"chat":bound["chat"] if bound else None, "port":8766, "supportsPngBatch":True,
-                                  "supportsResultView":True, "supportsComputerUseGuidance":True, "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
+                                  "supportsResultView":True, "supportsComputerUseGuidance":True, "supportsToolHelp":True,
+                                  "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
                         if "sessionId" in params:
                             result["pairToken"] = pair
                     elif method == "start":

@@ -336,7 +336,7 @@
   }
 
   function collect(s,publishNativeFinal=false,outgoing=false,verifyEcho=false) {
-    if (s !== session || s.chat !== here() || s.departed || s.log.fault || s.publishingReply) return;
+    if (s !== session || !onOriginalRoute(s) || s.away || s.log.fault || s.publishingReply) return;
     const state = page.state();
     if (state.verification) {
       s.verificationSince ??= Date.now();
@@ -431,7 +431,7 @@
 
   function guard(s, count, outgoing=false) {
     collect(s,false,outgoing);
-    return session === s && !prepared && s.chat === here() && !s.departed && !s.log.fault && !s.publishingReply
+    return session === s && !prepared && s.chat === here() && !s.departed && !s.away && !s.log.fault && !s.publishingReply
       && s.verificationSince == null && s.log.historyChangedAt == null && !s.log.expected && !s.log.waiting && !s.log.pendingRows && s.log.seen.length === count;
   }
 
@@ -462,6 +462,30 @@
     status = 'Ready.';
   }
 
+  function onOriginalRoute(s) {
+    if (!s.departed && s.chat !== here()) {
+      const log=s.log;
+      const idle = !prepared && !skill && !s.activeJob && !s.sending && !s.manual && !s.problem && !s.question &&
+        !s.capture && !s.media && !s.publishingReply && !log.waiting && !log.expected && !log.fault &&
+        !log.pendingRows && !log.pendingNativeCommand && log.historyChangedAt == null && s.verificationSince == null &&
+        !s.awaitingToolResult && !s.outbox.some(event => event.kind !== 'busy');
+      if (idle && ArenaBridge.awayAgentRoute(s.chat,location.href)) s.away=true;
+      else s.departed=true;
+      return false;
+    }
+    return !s.departed;
+  }
+
+  function originalHistory(s) {
+    if (session!==s || s.chat!==here() || !s.away || s.departed || s.problem || s.log.fault || s.returnIssue) return null;
+    // The original URL can return before React replaces the other chat's DOM.
+    const ids=page.rowIds(), seen=s.log.seen;
+    if (!ids.length || ids.length!==seen.length || new Set(ids).size!==ids.length ||
+        !ids.every((id,index)=>id && id===seen[index].siteId)) return null;
+    const history=recoveryHistory(s);
+    return history?.ready ? history.rows : null;
+  }
+
   async function tick() {
     const s = session;
     if (prepared && prepared.expires < Date.now()) prepared = null;
@@ -469,10 +493,27 @@
     if (processing || !s || prepared || skill || s.manual) return;
     processing = true;
     try {
-      if (s.chat !== here() || s.departed) {
-        s.departed = true;
+      if (!onOriginalRoute(s)) {
+        if (!s.departed) { status='Waiting for the original Arena conversation.'; return; }
         status = 'Tab changed conversation. Reconnect from the original chat.';
         if (!s.reportedDeparture) { await rpc(s, 'depart'); s.reportedDeparture = true; }
+        return;
+      }
+      if (s.away) {
+        status = s.returnIssue || s.log.fault || 'Waiting for the original conversation history and an empty composer.';
+        if (originalHistory(s)) {
+          await rpc(s,'return');
+          // Chrome's document check crosses an async boundary. Verify the current
+          // transcript synchronously at the point where this document resumes.
+          const rows=originalHistory(s);
+          if (rows) {
+            const reason=s.log.returnProblem(rows,(row,origin)=>page.historyReplySource?.(row,origin));
+            if (reason) {
+              s.returnIssue=reason+' Bind this conversation again in the extension.';
+              status=s.returnIssue;
+            } else { s.away=false; status='Ready.'; }
+          }
+        }
         return;
       }
       // A native answer may still redraw while earlier events are in flight.
@@ -531,6 +572,8 @@
           s.publishingReply = false;
         }
         s.log.acknowledgeReply(next);
+        if (next.kind==='assistant') s.awaitingToolResult=next.toolFrame===true;
+        if (next.kind==='sent' || next.kind==='user') s.awaitingToolResult=false;
         if (s.question?.event===next) s.question.passive = !(receipt.nativeQuestionHandled==='interactive' &&
           receipt.nativeQuestionId===s.question.wire.id && receipt.replyTo===s.question.origin);
         s.outbox.shift();
@@ -614,6 +657,13 @@
       if (!session || message.pageKey !== pageKey) throw Error('Document reloaded. Reconnect from the extension.');
       return { status };
     }
+    if (message.type==='parkRoute') {
+      const s=session;
+      if (!s || s.chat!==message.chat || pageKey!==message.pageKey || s.binding!==message.binding ||
+          !ArenaBridge.awayAgentRoute(s.chat,location.href)) throw Error('This is not the bound Arena route.');
+      onOriginalRoute(s);
+      return {chat:s.chat,pageKey,binding:s.binding,parked:!!s.away && !s.departed};
+    }
     if (!here() || message.chat !== here()) throw Error('The tab is no longer showing the selected chat.');
     if (message.type === 'prepare') {
       if (skill || session?.sending || session?.manual || session?.publishingReply)
@@ -656,7 +706,9 @@
     }
     const s = session;
     if (!s || s.binding !== message.binding || s.departed || s.chat !== here()) throw Error('This document is not paired.');
-    if (message.type === 'verifyDocument') return {chat:s.chat, pageKey, binding:s.binding};
+    if (message.type === 'verifyDocument') return {chat:s.chat, pageKey, binding:s.binding,...(s.away?{parked:true}:{})};
+    if (message.type === 'verifyReturn') return {chat:s.chat, pageKey, binding:s.binding,returned:s.away===true && !s.returnIssue};
+    if (s.away) throw Error('Wait for the original Arena conversation to return.');
     if (message.type === 'releaseSkill') { skill = null; return {}; }
     if (message.type === 'holdSkill') {
       collect(s);
@@ -695,7 +747,7 @@
 
   function intercept(event) {
     const s = session;
-    if (!event.isTrusted || !s || s.chat !== here() || s.departed) return;
+    if (!event.isTrusted || !s || s.chat !== here() || s.departed || s.away) return;
     const state = page.state();
     if (event.type === 'keydown') {
       if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey || event.isComposing

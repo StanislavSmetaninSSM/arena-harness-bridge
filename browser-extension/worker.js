@@ -100,31 +100,43 @@ async function pauseLink(link, reason) {
 const navigationNotice = 'Bound tab navigated or reloaded. Inspect the chat and reconnect.';
 const awaitingDocument = 'Waiting for Chrome to confirm the bound conversation.';
 
-async function documentProof(link) {
+async function documentProof(link, type='verifyDocument') {
   let timer;
   try {
     return await Promise.race([
-      tabMessage(link.tab,{type:'verifyDocument',chat:link.chat,pageKey:link.pageKey,binding:link.binding}).catch(() => null),
+      tabMessage(link.tab,{type,chat:link.chat,pageKey:link.pageKey,binding:link.binding}).catch(() => null),
       new Promise(resolve => { timer = setTimeout(() => resolve(null),3000); })
     ]);
   } finally { clearTimeout(timer); }
 }
 
-async function verifyTab(link, lastStatus, requireProof = false) {
+async function verifyTab(link, lastStatus, requireProof = false, returning = false) {
   const readTab = () => chrome.tabs.get(link.tab).catch(() => null);
   let tab = await readTab();
   const currentChat = () => ArenaBridge.conversation(tab?.url);
   const stable = currentChat() === link.chat && tab.status === 'complete' && !tab.pendingUrl && !tab.discarded;
-  if (stable && !link.checkDocument && !requireProof) return true;
+  if (stable && !link.checkDocument && !requireProof && !link.away && !returning) return true;
   if (!stable && !link.checkDocument) { link.checkDocument = true; await save(link); }
   let proof;
   const initialStatus = tab?.status;
   if (!tab?.pendingUrl && currentChat() === link.chat && !tab.discarded) {
-    proof = await documentProof(link);
+    proof = await documentProof(link,returning?'verifyReturn':'verifyDocument');
     tab = await readTab();
   }
   const chat = currentChat();
   if (tab?.url && chat !== link.chat) {
+    if (!link.lease && !link.receipt && !link.notice && !tab.pendingUrl && !tab.discarded &&
+        ArenaBridge.awayAgentRoute(link.chat,tab.url)) {
+      const awayUrl=tab.url;
+      const content=await documentProof(link,'parkRoute');
+      tab=await readTab();
+      if (tab?.url!==awayUrl || tab.pendingUrl) return false;
+      if (!tab.discarded && content?.parked===true && content.chat===link.chat &&
+          content.binding===link.binding && content.pageKey===link.pageKey) {
+        if (!link.away) { link.away=true; await save(link); }
+        return false;
+      }
+    }
     await pauseLink(link, navigationNotice);
     return false;
   }
@@ -133,6 +145,7 @@ async function verifyTab(link, lastStatus, requireProof = false) {
   if (initialStatus !== tab?.status) return false;
   const complete = (tab?.status || lastStatus) === 'complete';
   if (chat === link.chat && !tab.discarded && proof?.pageKey === link.pageKey && proof.chat === link.chat && proof.binding === link.binding) {
+    if (returning && (!complete || proof.returned!==true) || !returning && (proof.parked || link.away)) return false;
     if (complete && link.checkDocument) { delete link.checkDocument; await save(link); }
     return true;
   }
@@ -214,7 +227,13 @@ async function dispatch(message, sender) {
   if (link.paused || message.chat !== link.chat || requireProof &&
       (!URL.canParse(sender.url) || new URL(sender.url).origin !== new URL(link.chat).origin))
     throw Error('Conversation changed. Reconnect from the original chat.');
-  if (!await verifyTab(link, undefined, requireProof)) throw Error(link.paused || awaitingDocument);
+  const returning=message.type==='return';
+  if (returning && (link.lease || link.receipt || link.notice)) throw Error('Inspect the original active Arena delivery.');
+  if (!await verifyTab(link, undefined, requireProof, returning)) throw Error(link.paused || awaitingDocument);
+  if (returning) {
+    if (link.away) { delete link.away; await save(link); }
+    return {};
+  }
   if (message.type === 'poll') {
     if (message.recoverTranscript !== undefined) {
       const result = await request(link.token,'poll',{

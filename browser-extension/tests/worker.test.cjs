@@ -198,6 +198,7 @@ function navigationFixture(transport) {
     tabs:{get:async()=>structuredClone(browser),query:async()=>[],
       sendMessage:async (id,msg,opts)=>{
         messages.push({id,type:msg.type,frame:opts.frameId});
+        if(state.content) return state.content(msg);
         if(state.hung) return new Promise(()=>{});
         if(!state.active) throw Error('No receiving document.');
         state.onProof?.();
@@ -230,6 +231,168 @@ function navigationFixture(transport) {
   return {browser,doc,sender,state,messages,requests,wire,send,
     update:async(change,id=7)=>{updated(id,change,structuredClone(browser));await settle();},
     close:async()=>{removed(7);await settle();}};
+}
+
+function routeFixture() {
+  const f=navigationFixture(), original=[{siteId:'u1',role:'user',text:'Old question'},
+    {siteId:'a1',role:'assistant',text:'Old answer',complete:true}];
+  const foreign='https://arena.ai/agent/two', root='https://arena.ai/agent';
+  let rows=structuredClone(original), tick, listen, mutation, first=true;
+  let rowsReadWhileAway=0, draft='', now=1000;
+  const submissions=[], handlers={}, field={};
+  const ctx=vm.createContext({location:{href:f.doc.chat},URL,Date:class extends Date{static now(){return now;}},
+    crypto:{randomUUID:()=>first?(first=false,f.doc.pageKey):crypto.randomUUID()},
+    document:{documentElement:{}},addEventListener:(name,fn)=>{handlers[name]=fn;},
+    MutationObserver:class{constructor(fn){mutation=fn;}observe(){}},setInterval:fn=>{tick=fn;},setTimeout,clearTimeout,
+    chrome:{runtime:{id:'ext',sendMessage:msg=>f.send(msg),onMessage:{addListener:fn=>{listen=fn;}}}},
+    ArenaPage:class{
+      rowIds(){return rows.map(row=>row.siteId);}
+      rows(){if(ctx.location.href!==f.doc.chat || rows.some(row=>row.siteId==='b')) rowsReadWhileAway++;return rows.map(row=>({...row}));}
+      captureReplySource(row){if(row.stream){row.sourceOrigin='stream';return row.stream;}}
+      historyReplySource(row,origin){return origin==='stream' ? row.stream ?? {status:'unobserved'} : row.copy;}
+      state(){return {field,idle:true,ready:!draft,value:draft};}
+      async submit(job,_draft,guard,beforeClick){assert.ok(guard());beforeClick();submissions.push(job.id);
+        rows.push({role:'user',siteId:'u-'+job.id,text:job.text,lastLine:job.text.split('\n').at(-1)});
+      }
+    }
+  });
+  for (const file of ['core.js','content.js']) vm.runInContext(fs.readFileSync(path.join(__dirname,'..',file),'utf8'),ctx);
+  f.state.content=msg=>new Promise(resolve=>listen(msg,{id:'ext'},resolve));
+  f.state.offer=null;
+  const start=async()=>{
+    assert.equal((await f.state.content({type:'prepare',chat:f.doc.chat})).ok,true);
+    assert.equal((await f.state.content({type:'attach',...f.doc})).ok,true);
+    await tick();
+  };
+  const travel=async(url,history,contentFirst=false)=>{
+    ctx.location.href=url; f.browser.url=url;rows=history;
+    if(contentFirst){mutation();await tick();}
+    await f.update({url});
+    mutation();await tick();
+  };
+  return {...f,root,foreign,original,start,tick,travel,submissions,getForeignReads:()=>rowsReadWhileAway,
+    rows:()=>structuredClone(rows),append:row=>rows.push(row),advance:ms=>{now+=ms;},
+    setDraft:value=>{draft=value;},setRows:value=>{rows=value;},handlers};
+}
+
+const imageBase='https://arena.ai/files/19a9a4ae-44cd-4310-a12c-ced3a25d9e95.png';
+test('a completed live turn survives loss of its stream cache across routes and its follow-up sends once',async()=>{
+  const f=routeFixture();await f.start();
+  const first='1'.repeat(32), second='2'.repeat(32);
+  f.state.offer={id:first,text:'Reply with the test code'};await f.tick();await f.tick();
+  f.append({siteId:'chat-message-response',role:'assistant',nativeMessage:true,complete:true,
+    text:'СВЯЗЬ-54',stream:'СВЯЗЬ-54',copy:'СВЯЗЬ-54'});
+  await f.tick();f.advance(1200);await f.tick();await f.tick();
+  assert.equal(f.requests.filter(r=>r.data.kind==='assistant' && r.data.replyTo===first).length,1);
+  const restored=f.rows();delete restored.at(-1).stream;
+  await f.travel(f.root,[]);await f.travel(f.foreign,[]);
+  f.state.offer={id:second,text:'Follow-up'};
+  await f.travel(f.doc.chat,restored);
+  await f.tick();f.advance(1000);await f.tick();await f.tick();
+  assert.deepEqual(f.submissions,[first,second]);
+  assert.equal(f.requests.filter(r=>r.data.kind==='sent' && r.data.job===second).length,1);
+});
+
+test('image changed after the return proof but before the handshake completes cannot release a queued message',async()=>{
+  const f=routeFixture(), original=structuredClone(f.original);
+  original[1].artifact={pending:false,sources:[imageBase]};
+  f.setRows(original);await f.start();await f.travel(f.foreign,[]);
+  f.state.offer={id:'held',text:'Do not send'};
+  const content=f.state.content;let changed=false;
+  f.state.content=async message=>{
+    const reply=await content(message);
+    if (message.type==='verifyReturn' && reply.returned) {
+      changed=true;
+      const replacement=structuredClone(original);
+      replacement[1].artifact.sources=['https://arena.ai/files/changed.png'];
+      f.setRows(replacement);
+    }
+    return reply;
+  };
+  await f.travel(f.doc.chat,original);await f.tick();await f.tick();
+  assert.equal(changed,true);
+  assert.deepEqual(f.submissions,[]);
+  assert.equal(f.state.offer.id,'held');
+  const popup=await content({type:'status',pageKey:f.doc.pageKey});
+  assert.match(popup.status,/Bind this conversation again/);
+});
+
+for(const [kind,allowed] of [['same graphic',true],['new signature on same S3 object',true],['different graphic',false],
+  ['different proxy image query',false],['changed native answer',false],['changed image selection',false]]){
+  test('return verifies visual or card identity: '+kind,async()=>{
+    const f=routeFixture(), history=structuredClone(f.original), row=history.at(-1);
+    if(kind==='changed native answer')
+      row.nativeQuestion={id:'a1',status:'answered',question:'Choose?',options:['A','B'],selected:'A'};
+    else if(kind==='changed image selection')
+      row.imageChoices=[{id:'a1/choice',status:'selected',sources:[imageBase]}];
+    else row.artifact={pending:false,sources:[kind==='different proxy image query'?'https://arena.ai/proxy?file=1':
+      kind==='new signature on same S3 object'?imageBase+'?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc':imageBase]};
+    f.setRows(history);await f.start();await f.travel(f.foreign,[]);
+    const restored=structuredClone(history), last=restored.at(-1);
+    if(kind==='different graphic') last.artifact.sources=['https://arena.ai/files/replacement.png'];
+    if(kind==='different proxy image query') last.artifact.sources=['https://arena.ai/proxy?file=2'];
+    if(kind==='new signature on same S3 object') last.artifact.sources=[imageBase+'?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=updated'];
+    if(kind==='changed native answer') last.nativeQuestion.selected='B';
+    if(kind==='changed image selection') last.imageChoices[0].sources=['https://arena.ai/files/other.png'];
+    f.state.offer={id:'next',text:'Next'};await f.travel(f.doc.chat,restored);await f.tick();await f.tick();
+    assert.deepEqual(f.submissions,allowed?['next']:[]);
+  });
+}
+
+test('an acknowledged fallback tool command prevents an idle return until its result arrives',async()=>{
+  const f=routeFixture();await f.start();
+  const id='a'.repeat(32);
+  f.state.offer={id,text:'one'};await f.tick();await f.tick();
+  f.append({role:'assistant',siteId:'fallback',text:'issued',complete:true,toolFrame:true});
+  await f.tick();await f.tick();
+  assert.ok(f.requests.some(r=>r.data.toolFrame===true));
+  const original=f.rows();
+  await f.travel(f.foreign,[]);await f.travel(f.doc.chat,original);
+  assert.ok(f.state.link.paused,'Desktop may still be executing the acknowledged command');
+});
+
+test('idle original document returns through Arena hub and another conversation, then accepts one queued Desktop input',async()=>{
+  const f=routeFixture();await f.start();
+  const foreignRows=[{siteId:'b',role:'assistant',text:'FOREIGN',complete:true}];
+  await f.travel(f.root,[]);
+  await f.travel(f.foreign,foreignRows,true);
+  f.state.offer={id:'q1',text:'First after returning'};
+  assert.equal(f.getForeignReads(),0);
+  await f.travel(f.doc.chat,foreignRows);
+  assert.equal(f.submissions.length,0,'wait for the original rows to mount');
+  f.setRows(structuredClone(f.original));f.setDraft('User draft');await f.tick();
+  assert.equal(f.submissions.length,0,'preserve an unsent browser draft');
+  f.setDraft('');await f.tick();await f.tick();await f.tick();
+  assert.deepEqual(f.submissions,['q1']);
+  assert.equal(f.requests.filter(r=>r.data.kind==='sent').length,1);
+  assert.equal(f.getForeignReads(),0,'even after the URL returns, never scrape the other chat');
+  assert.ok(f.requests.every(r=>!JSON.stringify(r.data).includes('FOREIGN')));
+});
+
+for(const obstacle of ['waiting for an answer','original history edited','document replaced','different tab']){
+  test('return cannot deliver a new Desktop input with '+obstacle,async()=>{
+    const f=routeFixture();await f.start();
+    if(obstacle==='waiting for an answer'){
+      f.state.offer={id:'active',text:'Original message'};await f.tick();await f.tick();
+      assert.equal(f.state.lease,null,'sent receipt reached Desktop, Arena still owes a reply');
+    }
+    await f.travel(f.foreign,[],true);
+    f.state.offer={id:'new',text:'Never deliver'};
+    const restored=structuredClone(f.original);
+    if(obstacle==='original history edited') restored[1].text='Different original';
+    if(obstacle==='document replaced'){
+      const content=f.state.content;f.state.content=msg=>msg.type==='status'?content(msg):{ok:true,...f.doc,pageKey:'other'};
+    }
+    if(obstacle==='different tab'){
+      const count=f.requests.length;
+      assert.equal((await f.send({type:'return'}, {...f.sender,tab:{id:8}})).ok,false);
+      assert.equal(f.requests.length,count);
+    }else{
+      await f.travel(f.doc.chat,restored);await f.tick();await f.tick();
+    }
+    assert.equal(f.submissions.includes('new'),false);
+    assert.equal(f.state.offer.id,'new','the offer stays on the companion');
+  });
 }
 
 test('malformed pairing codes cannot send requests or replace the saved binding', async () => {

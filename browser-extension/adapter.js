@@ -597,6 +597,12 @@ const ArenaPage = (() => {
     return all(root, `#${id},[data-message-id="${id}"],[data-message-id="${nativeId}"],[data-chat-message-id="${nativeId}"]`).length === 1;
   }
 
+  function messageSiteId(node) {
+    const wrapperId = node.closest('[id^="chat-message-"]')?.id;
+    const explicitId = node.getAttribute('data-message-id');
+    return explicitId && wrapperId !== 'chat-message-' + explicitId ? explicitId : wrapperId || null;
+  }
+
   class Page {
     constructor(doc) {
       this.doc = doc;
@@ -674,15 +680,21 @@ const ArenaPage = (() => {
       return readReply(node,'arena-harness-check-history')?.source;
     }
 
-    rows() {
+    messageNodes() {
       const root = this.doc.querySelector('main') || this.doc.body;
       const selector = users + ',' + assistants + ',[id^="chat-message-"]';
-      const priorImages = new Set();
       const nodes = all(root, selector)
         .filter(node => visible(node) && !node.parentElement.closest(selector + ',form,pre,code,[contenteditable="true"]'));
-      return nodes
-        .filter((node, index) => !emptyNativeReply(node, nodes[index + 1], root))
-        .map(node => {
+      return nodes.filter((node, index) => !emptyNativeReply(node, nodes[index + 1], root));
+    }
+
+    rowIds() {
+      return this.messageNodes().map(messageSiteId);
+    }
+
+    rows() {
+      const priorImages = new Set();
+      return this.messageNodes().map(node => {
           const isUser = node.matches(users) || node.querySelector('.group.items-end .bg-surface-raised .prose')
             || node.matches('.group.items-end') && node.querySelector('.bg-surface-raised .prose');
           const ended = all(node,'span[aria-label*="Response ended" i]').some(marker =>
@@ -705,9 +717,7 @@ const ArenaPage = (() => {
           const body = finalBodies.length === 1 ? finalBodies[0] : finalBodies.length || hasAnalysis || artifact || nativeQuestion || imageChoices.length ? null : node;
           const multipleFinalBodies = directBodies.length>1 &&
             directBodies.every(el => el.parentElement === directBodies[0].parentElement);
-          const wrapperId = node.closest('[id^="chat-message-"]')?.id;
-          const explicitId = node.getAttribute('data-message-id');
-          const siteId = explicitId && wrapperId !== 'chat-message-' + explicitId ? explicitId : wrapperId || null;
+          const siteId = messageSiteId(node);
           if (!this.nodeIds.has(node)) this.nodeIds.set(node,this.nextNodeId++);
           for (const img of node.querySelectorAll('img')) {
             const url=ArenaGeneratedImages.source(img);

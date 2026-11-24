@@ -7,6 +7,41 @@ const assistant = (text, complete = false) => ({ role: 'assistant', text, comple
 const history = [user('earlier question'), assistant('earlier answer', true)];
 const events = (turns) => turns.map(({ id, ...event }) => event);
 
+test('return verifies every previously captured source even when the earlier link label stays the same',()=>{
+  const rows=[1,2].map(i=>({...assistant('Guide',true),nativeMessage:true,siteId:'chat-message-'+i}));
+  const log=new Transcript(rows);
+  log.seen[0].sourceOrigin='copy';
+  log.seen[0].originalMarkdown='[Guide](https://example.test/original)';
+  const reads=[];
+  const read=(row,origin)=>{reads.push([row.siteId,origin]);return '[Guide](https://example.test/edited)';};
+  assert.ok(log.returnProblem(rows,read));
+  assert.deepEqual(reads,[['chat-message-1','copy']]);
+  assert.ok(log.returnProblem(rows,()=>undefined),'missing previously captured authority cannot confirm a return');
+  assert.equal(log.returnProblem(rows,()=>log.seen[0].originalMarkdown),'');
+});
+
+test('return verifies a completed Arena stream after changing chats clears its browser stream cache',()=>{
+  const row={...assistant('СВЯЗЬ-54',true),nativeMessage:true,siteId:'chat-message-a54'};
+  function check(stream,copy,display=row,original=row.text) {
+    const log=new Transcript([row]), reads=[];
+    Object.assign(log.seen[0],{sourceOrigin:'stream',originalMarkdown:original});
+    const reason=log.returnProblem([display],(_row,origin)=>{reads.push(origin);return origin==='stream'?stream:copy;});
+    return {reason,reads};
+  }
+  const gone={status:'unobserved'};
+  assert.deepEqual(check(gone,'СВЯЗЬ-54'),{reason:'',reads:['stream','copy']});
+  assert.equal(check(gone,'СВЯЗЬ-54\r\n').reason,'');
+  assert.ok(check(gone,undefined).reason,'a visible label cannot establish its original Markdown link destination');
+  assert.ok(check(gone,undefined,{...row,text:'Different'}).reason);
+  assert.ok(check(gone,'[Guide](https://example.test/new)',row,'[Guide](https://example.test/old)').reason);
+  assert.ok(check(gone,undefined,{...row,siteId:'other'}).reason);
+  for (const stream of ['Different bytes',{status:'conflict'},{status:'incomplete'}]){
+    const {reason,reads}=check(stream,'СВЯЗЬ-54');
+    assert.ok(reason);
+    assert.deepEqual(reads,['stream'],'available or conflicting stream authority is definitive');
+  }
+});
+
 test('only exact stable Agent Mode addresses can bind', () => {
   assert.equal(typeof conversation, 'function');
   assert.equal(conversation('https://arena.ai/agent/one-2/'), 'https://arena.ai/agent/one-2');

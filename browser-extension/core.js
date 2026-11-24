@@ -17,6 +17,14 @@ const ArenaBridge = (() => {
     return { id: crypto.randomUUID(), kind, ...fields };
   }
 
+  function awayAgentRoute(original, address) {
+    try {
+      const url = new URL(address);
+      if (url.origin !== new URL(original).origin || url.username || url.password || url.search || url.hash) return false;
+      return /^\/agent\/?$/.test(url.pathname) || Boolean(conversation(address) && conversation(address) !== original);
+    } catch { return false; }
+  }
+
   function validQuestion(value) {
     const label = (s,max) => typeof s === 'string' && s.length <= max && !!s.trim();
     return value && Object.keys(value).length === 3 && label(value.id,256) && label(value.question,16000)
@@ -115,8 +123,40 @@ const ArenaBridge = (() => {
     if (delivery && rows.filter(row=>row.role==='user' && row.lastLine===echo.lastLine).length===1) return delivery;
   }
 
-  function consumedRow({role, text, siteId, domKey, toolFrame, toolSource, nativeMessage, nativeSourceRejected}) {
+  function mediaResource(source) {
+    try {
+      const url = new URL(source);
+      if (!['https:','blob:'].includes(url.protocol) || url.username || url.password) return null;
+      // Only a named signing scheme on an explicitly identified object is renewable.
+      // Proxy selectors, version IDs and unfamiliar query parameters remain part of its identity.
+      if (url.protocol==='https:' && /(?:^|\/)[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}(?:[./]|$)/i.test(url.pathname)) {
+        for (const [prefix,algorithm] of [['X-Amz-','AWS4-HMAC-SHA256'],['X-Goog-','GOOG4-RSA-SHA256']]) {
+          if (url.searchParams.get(prefix+'Algorithm')===algorithm && url.searchParams.has(prefix+'Signature')) {
+            for (const key of ['Algorithm','Signature','Credential','Date','Expires','SignedHeaders','Security-Token'])
+              url.searchParams.delete(prefix+key);
+          }
+        }
+      }
+      return url.href;
+    } catch { return null; }
+  }
+
+  function returnMedia(row) {
+    const {artifact,nativeQuestion:card,imageChoices=[]}=row;
+    if (!artifact && !card && !imageChoices.length) return;
+    if (artifact && (artifact.pending || artifact.error || !artifact.sources?.length) ||
+        card && (!['answered','closed','dismissed','failed'].includes(card.status) || card.draft) ||
+        imageChoices.some(choice=>!['selected','skipped'].includes(choice.status) || !choice.sources?.length)) return null;
+    const resources=artifact?.sources.map(mediaResource) ?? [];
+    const choices=imageChoices.map(({id,status,question,options,sources})=>[id,status,question,options,sources.map(mediaResource)]);
+    if (resources.includes(null) || choices.some(choice=>choice[4].includes(null))) return null;
+    return JSON.stringify([resources,card && [card.id,card.status,card.question,card.options,card.selected,!!card.summary],choices]);
+  }
+
+  function consumedRow(row) {
+    const {role, text, siteId, domKey, toolFrame, toolSource, nativeMessage, nativeSourceRejected}=row;
     return {role, text, siteId, domKey, toolFrame:toolFrame === true, toolSource, nativeMessage:nativeMessage === true,
+      returnMedia:returnMedia(row),
       ...(nativeSourceRejected ? {passiveNativeHistory:true} : {})};
   }
 
@@ -181,6 +221,19 @@ const ArenaBridge = (() => {
     return null;
   }
 
+  function confirmedReturnSource(old,row,readSource) {
+    const source=readSource(row,old.sourceOrigin);
+    if (source===old.originalMarkdown) return true;
+    // Arena discards stream observations on route changes. Only this explicit
+    // cache miss may use the native Copy action for the same completed message.
+    if (old.sourceOrigin!=='stream' || source?.status!=='unobserved' ||
+        old.role!=='assistant' || row.role!=='assistant' || !row.nativeMessage || !row.complete) return false;
+    const copy=readSource(row,'copy');
+    if (typeof copy!=='string') return false;
+    const lineEndings=text=>text.replace(/\r\n/g,'\n').replace(/\n+$/,'');
+    return lineEndings(copy)===lineEndings(old.originalMarkdown);
+  }
+
   class Transcript {
     constructor(history) {
       this.seen = history.map(row => ({...consumedRow(row),
@@ -196,6 +249,22 @@ const ArenaBridge = (() => {
 
     expect(job, text, contextId, receipt, prompt=text) {
       this.expected = { job, text, contextId, receipt, prompt, issued: Date.now() };
+    }
+
+    returnProblem(rows, readSource) {
+      const sources=new Map();
+      for (const [i,old] of this.seen.entries()) {
+        const row=rows[i];
+        if (!row || row.siteId!==old.siteId) return 'The original Arena message IDs changed.';
+        if (old.returnMedia===null || returnMedia(row)!==old.returnMedia)
+          return 'The original Arena images or choices changed or could not be confirmed.';
+        if (old.originalMarkdown!==undefined) {
+          if (!confirmedReturnSource(old,row,readSource)) return 'The original Arena message source changed or could not be confirmed.';
+          sources.set(row,old.originalMarkdown);
+        }
+      }
+      this.scan(rows,{historyOnly:true,outgoing:true,verifyEcho:true,historySource:row=>sources.get(row)});
+      return this.fault || (this.historyChangedAt!=null ? 'The original Arena history could not be confirmed.' : '');
     }
 
     currentCommand(event,rows) {
@@ -467,7 +536,7 @@ const ArenaBridge = (() => {
       return output;
     }
   }
-  return { conversation, event, delivery, pairingSettlement, Transcript, validQuestion, sameQuestion, confirmedQuestion,
+  return { conversation, awayAgentRoute, event, delivery, pairingSettlement, Transcript, validQuestion, sameQuestion, confirmedQuestion,
     imageUnavailable, maxGeneratedImages };
 })();
 

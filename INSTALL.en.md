@@ -21,6 +21,8 @@ Click **Open Chrome extensions** in the wizard. If that button is unavailable, e
 
 When you return to this conversation, use the normal message field. Switching conversations preserves the selected model and its Arena pairing.
 
+If you open another Arena chat in the same Chrome tab between tasks, return to the paired chat. The bridge resumes when the original history has loaded and the message field is empty. If you leave during a send, check the original chat to see what was delivered.
+
 If the extension asks for a token after Chrome restarts, open the same Arena chat. Run `/arena-pair` in the original Desktop conversation, copy the code, and click **Bind conversation** in the extension.
 
 **Updating.** Quit Desktop completely and run the new installer for the same profile. Use the Chrome extension from the same release. If Chrome loads the extension from the wizard’s folder, click **Reload** on its extension card. If you originally installed from a ZIP, disable the old extension and add the new one as in step 2. Refresh the original Arena tab. Run `/arena-pair` in the **original Desktop conversation** and bind the same Arena chat as in step 3.

@@ -306,6 +306,12 @@ class Journal:
             self.sql.execute("DELETE FROM catalog")
             self.sql.execute("INSERT INTO catalog VALUES(?)", (digest,))
 
+    def acknowledge_delivery(self, job):
+        """Record the context that accompanied a confirmed outbound delivery."""
+        meta = self.one("SELECT digest FROM outgoing_context WHERE job=?", (job,))
+        if meta:
+            self.acknowledge_context(meta["digest"])
+
     def lease(self):
         with self.lock:
             row = self.one("SELECT id FROM jobs WHERE state='offered'")
@@ -513,9 +519,7 @@ class Journal:
                 if kind != "sent" and text:
                     self.sql.execute("INSERT OR REPLACE INTO delivery_issues VALUES(?,?)", (job, text[:900]))
                 if kind == "sent":
-                    meta = self.one("SELECT digest FROM outgoing_context WHERE job=?", (job,))
-                    if meta:
-                        self.acknowledge_context(meta["digest"])
+                    self.acknowledge_delivery(job)
             elif kind == "user":
                 meta = self.context()
                 if meta and data.get("contextId") == meta["id"]:

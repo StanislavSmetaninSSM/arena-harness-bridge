@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import {execFileSync} from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 if (!process.versions.electron) {
   const {register} = await import('../../harness-adapter/node_modules/tsx/dist/esm/api/index.mjs')
@@ -30,7 +31,7 @@ async function harness(t, ptc=false, parent) {
   ctx.systemPrompt.context({name:'cwd',order:4,text:secret})
   const runCode = {name:'run_code',description:'Runtime syntax',parameters:{type:'object'}}
   if (ptc) ctx.tools.setExecutor({describe:()=>({schemas:[runCode]}),sections:[
-    {name:'tools:sdk',order:5,text:defs=>'Native SDK\n'+defs.map(d=>d.name).join('\n')}]})
+    {name:'tools:sdk',order:5,text:typeof ptc === 'function' ? ptc : defs=>'Native SDK\n'+defs.map(d=>d.name).join('\n')}]})
   else await ctx.plugin(await import('@deepseek-ai/dsh-tool-executor-native'))
   const { Session } = await import('@deepseek-ai/dsh-session')
   const agent = {session:Session.create('help-fixture')}
@@ -101,10 +102,29 @@ test('published family guidance is discoverable, including families with unrelat
   ctx.systemPrompt.section({name:'tool:unusual-family',order:4,text:'Shared instructions from this profile.'})
   ctx.systemPrompt.section({name:'tool:hidden',order:4,text:'PRIVATE future_create'})
   const {call} = await prepare()
-  assert.match((await call({name:'future_create'})).text,/Ask the user/)
+  assert.doesNotMatch((await call({name:'future_create'})).text,/Ask the user/)
+  assert.match((await call({guide:'tool:future'})).text,/Ask the user/)
   assert.match((await call({})).text,/tool:unusual-family/)
   assert.match((await call({guide:'tool:unusual-family'})).text,/Shared instructions/)
   for (const guide of ['tool:hidden','persona','cwd','tools:sdk']) assert.doesNotMatch((await call({guide})).text,/PRIVATE|Shared instructions|Native SDK/)
+})
+
+test('named tool help omits incidental mentions from the terminal panel and other tool guides', async t=>{
+  const {ctx,prepare} = await harness(t)
+  ctx.tools.register(tool('read','Read a file'))
+  ctx.tools.register(tool('bash','Run a shell command'))
+  const removeCua = ctx.tools.register(tool('cua','Computer Use'))
+  const panel = 'Once the user types into one, you can only read it. Keep using bash for short commands whose output you need now.'
+  ctx.systemPrompt.section({name:'tool:pty-panel',order:4,text:panel})
+  ctx.systemPrompt.section({name:'tool:cua',order:4,text:'CUA instructions that mention read.'})
+  const {call} = await prepare()
+  for (const name of ['read','bash']) assert.doesNotMatch((await call({name})).text,/CUA instructions|you can only read it/)
+  assert.match((await call({})).text,/tool:pty-panel/)
+  assert.equal((await call({guide:'tool:pty-panel'})).text,panel)
+  assert.match((await call({name:'cua'})).text,/CUA instructions/)
+  removeCua()
+  assert.doesNotMatch((await call({name:'read'})).text,/CUA instructions/)
+  assert.doesNotMatch((await call({guide:'tool:cua'})).text,/CUA instructions/)
 })
 
 test('changing registrations during native assembly invalidates the complete SDK page', async t=>{
@@ -118,13 +138,131 @@ test('changing registrations during native assembly invalidates the complete SDK
 })
 
 test('per-tool SDK uses the native program output adaptation', async t=>{
-  const {ctx,prepare} = await harness(t,true)
+  const {renderToolsSdk} = await import('@deepseek-ai/dsh-tool-executor-ptc')
+  const {ctx,prepare} = await harness(t,defs=>renderToolsSdk(defs.map(d=>({...d,output:d.output.schema}))))
   ctx.tools.register(tool('read_image','Read test image'))
+  ctx.tools.register(tool('write_file','Unrelated binding'))
   const {call} = await prepare()
-  let page = await call({name:'read_image',sdk:true})
-  let doc = page.text
-  while(page.nextCursor) {page=await call({name:'read_image',sdk:true,cursor:page.nextCursor});doc+=page.text}
-  assert.match(doc,/read_image: Image;/)
+  const wholeSdk = await fullHelp(call,{sdk:true})
+  // The same fixture produces Image in alpha.2 and its canonical number in rc.5.
+  const binding = /read_image: (?:Image|number);/.exec(wholeSdk)
+  assert.ok(binding)
+  const doc = await fullHelp(call,{name:'read_image',sdk:true})
+  assert.ok(doc.includes(binding[0]))
+  assert.doesNotMatch(doc,/write_file|Unrelated binding/)
+})
+
+test('single binding SDK follows the active executor language', async t=>{
+  const {ctx,prepare} = await harness(t,defs=>defs.map(d=>`async def ${d.name}(args): ...`).join('\n'))
+  ctx.tools.register(tool('read','Read a file'))
+  ctx.tools.register(tool('other','Unrequested'))
+  const {call} = await prepare()
+  assert.equal(await fullHelp(call,{name:'read',sdk:true}),'async def read(args): ...')
+})
+
+async function fullHelp(call, query) {
+  let page = await call(query)
+  let document = page.text
+  while (page.nextCursor) {
+    page = await call({...query,cursor:page.nextCursor})
+    document += page.text
+  }
+  return document
+}
+
+const cuaTopic = 'computer-use:dsh-cua'
+for (const [ptc, cuaName] of [[false,'cua_run_code'],[true,'cua']]) {
+  test('only an explicit query reads the current Computer Use guide for '+cuaName, async t=>{
+    const {ctx,prepare} = await harness(t,ptc)
+    const removeTool = ctx.tools.register(tool(cuaName,'Control a desktop'))
+    ctx.tools.register(tool('read','Read a local file'))
+    let guidance = 'Desktop guide mentioning read and run_code\n'+'操作🚀'.repeat(1200)
+    const removeGuide = ctx.systemPrompt.section({name:cuaTopic,order:4,text:()=>guidance})
+    const {call} = await prepare()
+    assert.ok((await fullHelp(call,{})).includes(cuaTopic))
+    for (const query of [{},{name:'read'},{name:'run_code'},{sdk:true},{name:'read',sdk:true}])
+      assert.doesNotMatch(await fullHelp(call,query),/Desktop guide|操作|UNRELATED_PRIVATE_CONTENT/)
+    assert.equal(await fullHelp(call,{guide:cuaTopic}),guidance)
+    assert.ok((await fullHelp(call,{name:cuaName})).includes(guidance))
+    const first = await call({guide:cuaTopic})
+    guidance = 'Updated scope-specific reference'
+    await assert.rejects(call({guide:cuaTopic,cursor:first.nextCursor}),/changed/)
+    assert.equal(await fullHelp(call,{guide:cuaTopic}),guidance)
+    removeGuide()
+    assert.match(await fullHelp(call,{name:cuaName}),/Computer Use.*unavailable/i)
+    ctx.systemPrompt.section({name:cuaTopic,order:4,text:'Detached reference, never disclose'})
+    removeTool()
+    assert.doesNotMatch(await fullHelp(call,{}),/computer-use:dsh-cua/)
+    for (const query of [{guide:cuaTopic},{name:cuaName}]) {
+      const response = await fullHelp(call,query)
+      assert.match(response,/unavailable/i)
+      assert.doesNotMatch(response,/Detached reference/)
+    }
+  })
+}
+
+test('bridge call help describes only direct, admitted batch members and multiline shell calls',async t=>{
+  const {ctx,prepare} = await harness(t)
+  const removeGlob = ctx.tools.register(tool('glob','List paths'))
+  ctx.tools.register(tool('arena_read_batch','Reserved name collision'))
+  ctx.tools.register(tool('grep','Search text'),{when:()=>false})
+  ctx.tools.register(tool('pwsh','Run a command'))
+  const {call} = await prepare()
+  const list = await fullHelp(call,{})
+  assert.match(list,/arena_read_batch/)
+  assert.doesNotMatch(list,/harness-text|"calls"/)
+  const batch = await fullHelp(call,{name:'arena_read_batch'})
+  assert.match(batch,/calls/)
+  assert.match(batch,/\bglob\b/)
+  assert.doesNotMatch(batch,/\bgrep\b|Reserved name collision/)
+  assert.match(await fullHelp(call,{name:'pwsh'}),/\$text/)
+  assert.match(await fullHelp(call,{name:'pwsh'}),/```harness-text script/)
+  assert.doesNotMatch(await fullHelp(call,{name:'glob'}),/\$text|harness-text/)
+  removeGlob()
+  assert.doesNotMatch(await fullHelp(call,{}),/arena_read_batch/)
+  assert.match(await fullHelp(call,{name:'arena_read_batch'}),/unavailable/i)
+  const program = await harness(t,true)
+  program.ctx.tools.register(tool('glob','Program binding'))
+  program.ctx.tools.register(tool('pwsh','Program shell binding'))
+  const programCall = (await program.prepare()).call
+  assert.doesNotMatch(await fullHelp(programCall,{}),/arena_read_batch/)
+  assert.match(await fullHelp(programCall,{name:'arena_read_batch'}),/unavailable/i)
+  assert.doesNotMatch(await fullHelp(programCall,{name:'pwsh'}),/harness-text/)
+})
+
+test('image generation instructions are discoverable as their own bridge topic',async t=>{
+  const {ctx,prepare} = await harness(t)
+  ctx.tools.register(tool('read','Read a file'))
+  const {call} = await prepare()
+  assert.match(await fullHelp(call,{}),/bridge:images/)
+  assert.doesNotMatch(await fullHelp(call,{name:'read'}),/image generation/)
+  assert.match(await fullHelp(call,{guide:'bridge:images'}),/Arena.*image.*final answer/is)
+})
+
+test('only help for the admitted skill loader exposes the current skill catalog', async t=>{
+  const {createUserMessage} = await import('@deepseek-ai/dsh-llm')
+  const {ctx,agent,prepare} = await harness(t,true)
+  const removeSkill = ctx.tools.register(tool('skill','Load the named skill'))
+  const catalog = entries => agent.session.append('user/message',createUserMessage({
+    content:[{type:'text',text:secret}],source:{kind:'skill-catalog',form:'catalog',entries},
+  }),{surfaceOp:'append'})
+  agent.session.append('turn/start',{turn:1})
+  catalog([{name:'obsolete-skill',description:'Retired'}])
+  catalog([{name:'active-skill',description:'The latest catalog summary',extra:secret}])
+  const {call} = await prepare()
+  const tools = await fullHelp(call,{})
+  assert.match(tools,/\{name:"skill"\}/)
+  assert.doesNotMatch(tools,/active-skill|obsolete-skill|latest catalog summary|UNRELATED_PRIVATE_CONTENT/)
+  const details = await fullHelp(call,{name:'skill'})
+  assert.match(details,/active-skill/)
+  assert.match(details,/latest catalog summary/)
+  assert.doesNotMatch(details,/obsolete-skill|UNRELATED_PRIVATE_CONTENT/)
+  catalog([])
+  assert.doesNotMatch(await fullHelp(call,{name:'skill'}),/active-skill/)
+  catalog([{name:'still-journaled',description:'Hidden after restriction'}])
+  removeSkill()
+  assert.doesNotMatch(await fullHelp(call,{}),/\{name:"skill"\}|still-journaled/)
+  assert.doesNotMatch(await fullHelp(call,{name:'skill'}),/still-journaled/)
 })
 
 test('a child cannot reclassify a masked parent registration as a shared guide', async t=>{
@@ -169,21 +307,31 @@ for (const mode of ['native','ptc']) {
     ctx.tools.register(tool(target,'Dynamic reference entry'))
     const requests = []
     const peer = {async rpc(method,request) {
-      if (method==='setup') return {supportsComputerUseGuidance:true,supportsToolHelp:true,supportsResultView:true}
+      if (method==='setup') return {supportsOnDemandContext:true,supportsToolHelp:true,supportsResultView:true}
       if (method==='start') {requests.push(request);return {id:request.requestId}}
+      if (requests.length===1) {
+        const fixture = fileURLToPath(new URL('./first-help-command.py',import.meta.url))
+        const python = process.env.ARENA_PYTHON || (process.platform==='win32' ? 'python' : 'python3')
+        const example = execFileSync(python,[fixture],{input:JSON.stringify(requests[0]),encoding:'utf8',windowsHide:true})
+        return {state:'done',reply:JSON.parse(example)}
+      }
       const direct = {kind:'tool',name:'arena_tool_help',arguments:{name:target}}
       const nested = {kind:'tool',name:'run_code',arguments:{description:'Read current documentation',code:
-        'const page = await tools.arena_tool_help({name:"future_plugin_v2"}); inspect(page.text)'}}
-      return {state:'done',reply:requests.length===1 ? (mode==='native' ? direct : nested) : {kind:'text',text:'Done'}}
+        'const page = await tools.arena_tool_help({name:"future_plugin_v2"}); (typeof inspect === "function" ? inspect : console.log)(page.text)'}}
+      return {state:'done',reply:requests.length===2 ? (mode==='native' ? direct : nested) : {kind:'text',text:'Done'}}
     }}
     ctx.llm.registerAdapter(['arena'],new ArenaAdapter(ctx,peer,1))
     const {agent} = await ctx.agents.create({sessionId:'help-'+mode,meta:{cwd:root},agentOptions:selection})
     agent.followup(createUserMessage({source:{kind:'user'},content:[{type:'text',text:'Look up the new tool.'}]}))
     await agent.whenIdle()
-    assert.equal(requests.length,2)
+    assert.equal(requests.length,3)
     assert.equal(requests[0].toolHelpViaCode===true,mode==='ptc')
     assert.equal(requests[0].tools.some(s=>s.name==='arena_tool_help'),mode==='native')
-    const result=JSON.parse(requests[1].toolResult)
+    const index=JSON.parse(requests[1].toolResult)
+    assert.equal(index.failed,false,index.text)
+    assert.match(index.text,/future_plugin_v2/)
+    assert.doesNotMatch(index.text,/Dynamic reference entry/)
+    const result=JSON.parse(requests[2].toolResult)
     assert.equal(result.failed,false,result.text)
     assert.match(result.text,/Dynamic reference entry/)
     assert.match(result.text,/local file/)

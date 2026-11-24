@@ -2,9 +2,9 @@
 
 Плагин добавляет модель **Arena Agent Mode** и команду **Connect Arena / Подключить Arena** (`/arena-pair`). Установите его с Python-компаньоном и расширением Chrome по [инструкции Windows](../INSTALL.md).
 
-Пакет 0.1.15 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
+Пакет 0.1.17 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
 
-**English** — Plugin 0.1.15 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+**English** — Plugin 0.1.17 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
 
 Перед работой с незнакомым инструментом Arena может запросить справку через `arena_tool_help`. Пустой запрос перечисляет доступные инструменты. Запрос `{"name":"read"}` возвращает описание, схему аргументов и результата, а также отдельную штатную инструкцию `tool:read`, если она опубликована. В программном режиме справка вызывается внутри `run_code`. Запрос `{"sdk":true}` открывает штатный SDK. Если пришёл `nextCursor`, его передают как `cursor` с теми же аргументами. Новые зарегистрированные инструменты появляются при следующем ходе, в котором Harness разрешил их использовать.
 
@@ -14,9 +14,9 @@
 
 **English** — The index also lists shared guides. For example, `{"guide":"tool:schedule"}` returns the scheduler's published rules. Use `{"name":"read_image","sdk":true}` for a single program binding and its actual return type.
 
-Если в профиле включён Computer Use, плагин передаёт его штатное руководство Arena вместе с каталогом инструментов. В нём могут быть примеры кода и локальный путь к библиотеке Computer Use. При смене или отключении руководства мост обновляет инструкции в чате. Доступ к приложениям подтверждается в Harness.
+В начале диалога мост объясняет Arena, как общаться с Desktop, и показывает один пример запроса справки для текущего профиля. Для вызова инструмента Arena копирует в `turn_id` идентификатор из последней строки текущего сообщения `Bridge delivery <id>`, в том числе после возврата результата. Для обычного ответа достаточно текста. Руководство Computer Use доступно по запросу, когда инструмент разрешён. Доступ к приложениям подтверждается в Harness.
 
-When Computer Use is active in the profile, the plugin sends its native guidance to Arena with the tool catalog. These can include code examples and the local path to the Computer Use library. The bridge updates the instructions in the chat when they change or become unavailable. Harness handles application permissions.
+At the start of a conversation the bridge explains how to use Desktop and gives a help example for the current profile. For each tool call Arena copies the ID from the current message’s final `Bridge delivery <id>` line into `turn_id`, including after a tool result. Ordinary replies can be plain text. Arena can request the native Computer Use guide when the tool is available. Harness handles application permissions.
 
 Начиная с плагина 0.1.11, команда `/arena-reset` очищает очередь моста и освобождает подключение из любого диалога этого профиля Desktop. Используйте её, если прежний диалог удалён или нужно привязать другой. После сброса выполните `/arena-pair` в нужном диалоге. Если Chrome уже получил задачу для отправки, она может дойти в прежний чат.
 

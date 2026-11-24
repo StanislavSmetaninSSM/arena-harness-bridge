@@ -10,7 +10,7 @@ import threading
 
 from .__main__ import read_pairing
 from .journal import (
-    InvalidToolSource, Journal, Problem, TOOL_REPLY_GUIDANCE, decode_generated_images,
+    InvalidToolSource, Journal, Problem, decode_generated_images,
     new_id, source_tool_frame, tool_frame,
 )
 from .transport import Endpoint, ExtensionHandler
@@ -20,29 +20,43 @@ TOOL_RESULT_HEADER = "DeepSeek Harness tool result:"
 READ_BATCH = "arena_read_batch"
 READ_BATCH_TOOLS = {"read", "glob", "grep"}
 DESKTOP_CANCELLED = "Desktop cancelled this request"
-DESKTOP_TOOL_HANDOFF = (
-    "For local Windows work, put the tool request in your visible reply for Desktop. "
-    "Arena's shell runs in the cloud. "
-    + TOOL_REPLY_GUIDANCE
-    + " End the reply after issuing the request. Desktop executes it and returns the result in the next message."
+CONNECTION = "DeepSeek Harness Desktop is connected."
+INTRO = (
+    "You are the assistant for the user working in DeepSeek Harness Desktop. The user sends you their task "
+    "from Desktop and reads your answer there. You decide how to carry out the task and give the user the outcome.\n"
+    "Answer conversational questions in plain text or in the format the user asks for. When a task needs "
+    "the user's local project, files or programs, request the needed action yourself through this bridge. "
+    "The bridge reads your normal, visible reply in this Arena chat and passes the tool request to Desktop. "
+    "Arena’s own tools run in its cloud. You can request a Desktop tool through this bridge even when it "
+    "does not appear in Arena’s tool menu.\n"
+    'For a Desktop action, put one fenced json block in your visible reply. Use exactly four fields: '
+    '"$harness":"tool_call" first, then turn_id, name and an arguments object. Copy the 32 characters '
+    'after "Bridge delivery " on the last line of the current message into turn_id. Finish your reply and wait. '
+    "Desktop runs the requested tool subject to the user's permissions. "
+    'Look for "DeepSeek Harness tool result:" in Desktop’s reply to your pending request. '
+    "The arena_… value labels that particular call. Read the output or error to decide what to do next "
+    "or what to tell the user. Use the fresh delivery ID for the next call.\n"
+    "An ordinary answer, including ordinary JSON, needs no turn_id. To show the user a literal example "
+    "of a tool request, use a fenced text block."
 )
+HELP_PROGRAMS = {
+    "typescript": "(typeof inspect === 'function' ? inspect : console.log)(JSON.stringify(await tools.arena_tool_help({})))",
+    "python": "print(await tools.arena_tool_help({}))",
+}
+INTRO_VERSION = "desktop-intro-v2/"
+LEGACY_RESUBMIT = "Desktop updated the Arena message format. Resubmit this request in Desktop."
 TEXT_ARGUMENTS = {"pwsh": "command"}
-TEXT_ARGUMENT_GUIDANCE = (
-    'For a multiline pwsh script, use "command":{"$text":"script"} in the same JSON tool call. '
-    'In the same reply add one top-level fenced block opening with ```harness-text script and closing with ```. '
-    'Put the actual script between those lines with normal newlines, quotes, and backslashes. '
-    'Desktop inserts that text as the native command string. For a short one-line command, use a normal JSON command string.'
-)
 TEXT_BLOCK_NAME = r"[A-Za-z][A-Za-z0-9_-]{0,31}"
 PLAN_ACTIVE = (
     "DeepSeek Harness plan mode: ACTIVE. Use only read-only inspection. Do not modify files or settings, "
-    "commit, or implement the task. Ask the user only about decisions that inspection cannot resolve. "
+    "commit, or implement the task. Ask the user only about decisions that inspection cannot resolve."
+)
+PLAN_REVIEW = (
     "When the plan is ready, reply with one fenced json block to request local review. "
     'Use this object shape: {"$harness":"tool_call","turn_id":"CURRENT_DELIVERY_ID","name":"exit_plan_mode","arguments":{"plan":"# Plan"}}. '
     "Replace CURRENT_DELIVERY_ID with the ID on the final Bridge delivery line of this request. "
     "Replace # Plan with the complete Markdown plan, including its heading. The local bridge reads this "
-    "reply and Desktop opens its built-in plan review. Use this route for approval. Arena's question "
-    "cards are for clarification only. Keep planning if the Desktop review is declined. "
+    "reply and Desktop opens its built-in plan review. Keep planning if the Desktop review is declined. "
     "Implementation begins after approval in Desktop or when the user turns plan mode off."
 )
 PLAN_INACTIVE = (
@@ -51,10 +65,17 @@ PLAN_INACTIVE = (
 )
 
 
-def desktop_handoff(names):
-    if any(name in TEXT_ARGUMENTS for name in names):
-        return DESKTOP_TOOL_HANDOFF + "\n" + TEXT_ARGUMENT_GUIDANCE
-    return DESKTOP_TOOL_HANDOFF
+def help_entry_point(route):
+    if route == "unavailable":
+        return "Desktop tool help is unavailable for this profile."
+    name = "arena_tool_help" if route == "direct" else "run_code"
+    arguments = {} if route == "direct" else {
+        "description":"List Desktop tools and help topics", "code":HELP_PROGRAMS[route],
+    }
+    example = {"$harness":"tool_call", "turn_id":"CURRENT_DELIVERY_ID", "name":name, "arguments":arguments}
+    return ("If you need to discover a Desktop tool, the example below requests the current list. "
+            "Replace CURRENT_DELIVERY_ID with the current ID and send the example in a json fence.\n```text\n"
+            + json.dumps(example, separators=(",", ":")) + "\n```")
 
 
 def bind_argument_text(frame, block):
@@ -85,27 +106,12 @@ def bind_argument_text(frame, block):
     arguments[field] = body
 
 
-def desktop_tools(tools, supports_read_batch):
-    # This entry describes a bridge operation, never a native Harness tool.
-    tools = [tool for tool in tools if tool["name"] != READ_BATCH]
-    names = sorted(READ_BATCH_TOOLS.intersection(tool["name"] for tool in tools))
-    if supports_read_batch is not True or not names:
-        return tools
-    return [*tools, {
-        "name": READ_BATCH,
-        "description": (
-            "Send two or more independent text inspection calls together using this name in one tool_call "
-            "with the current turn_id. Use each tool's native arguments. Use single requests when one "
-            "call needs a previous result. Desktop returns all results in one message in call order "
-            "with a distinct tool call ID, status and output for each call."
-        ),
-        "parameters": {"type":"object", "required":["calls"], "additionalProperties":False, "properties":{
-            "calls":{"type":"array", "minItems":2, "items":{
-                "type":"object", "required":["name", "arguments"], "additionalProperties":False,
-                "properties":{"name":{"enum":names}, "arguments":{"type":"object"}},
-            }},
-        }},
-    }]
+def desktop_tool_names(tools, supports_read_batch):
+    # Only a companion-negotiated synthetic batch may enter the executable list.
+    names = [tool["name"] for tool in tools if tool["name"] != READ_BATCH]
+    if supports_read_batch is True and READ_BATCH_TOOLS.intersection(names):
+        names.append(READ_BATCH)
+    return names
 
 
 def read_batch_reply(frame, names):
@@ -265,12 +271,82 @@ class DesktopJournal(Journal):
             request TEXT PRIMARY KEY, rejected_job TEXT UNIQUE NOT NULL);
           CREATE TABLE IF NOT EXISTS desktop_transcript_faults(
             binding TEXT PRIMARY KEY, event TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS desktop_prompts(job TEXT PRIMARY KEY, plan_mode INTEGER, sent INTEGER DEFAULT 0);
+          CREATE TABLE IF NOT EXISTS desktop_mode_sync(id INTEGER PRIMARY KEY CHECK(id=1));
           -- Even an older companion performing a retry must keep this answer out of its ordinary text queue.
           CREATE TRIGGER IF NOT EXISTS requeue_site_answer AFTER UPDATE OF state ON jobs
             WHEN NEW.state='queued' AND EXISTS(SELECT 1 FROM site_questions WHERE answer_job=NEW.id)
             BEGIN UPDATE jobs SET state='question_queued' WHERE id=NEW.id; END;
           UPDATE jobs SET state='question_queued' WHERE state='queued' AND id IN (SELECT answer_job FROM site_questions);
         """)
+
+        # Old queued jobs combine user text with generated instructions. Their original
+        # boundary is unknown, so resubmit them instead of editing their contents.
+        with self.sql:
+            prior = self.one("SELECT digest FROM catalog")
+            if prior:
+                self.note_legacy_context(prior["digest"])
+            old = self.sql.execute("""SELECT r.id,r.job FROM requests r JOIN jobs j ON r.job=j.id
+                WHERE j.state IN ('queued','held') AND r.reply IS NULL AND r.error IS NULL
+                AND NOT EXISTS(SELECT 1 FROM desktop_prompts p WHERE p.job=j.id)
+                AND NOT EXISTS(SELECT 1 FROM site_questions q WHERE q.answer_job=j.id)""").fetchall()
+            for request in old:
+                self.sql.execute("UPDATE requests SET error=? WHERE id=?", (LEGACY_RESUBMIT, request["id"]))
+                self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (request["job"],))
+
+    def note_legacy_context(self, digest):
+        # The old companion acknowledged a catalog by its SHA-256 digest. Its
+        # mode was mixed with user/tool text, so sync it from Desktop once.
+        if digest and re.fullmatch(r"[0-9a-f]{64}", digest):
+            self.sql.execute("INSERT OR IGNORE INTO desktop_mode_sync VALUES(1)")
+
+    def acknowledge_context(self, digest):
+        super().acknowledge_context(digest)
+        self.note_legacy_context(digest)
+
+    def acknowledge_delivery(self, job):
+        super().acknowledge_delivery(job)
+        self.sql.execute("UPDATE desktop_prompts SET sent=1 WHERE job=?", (job,))
+        self.sql.execute("""DELETE FROM desktop_mode_sync WHERE EXISTS
+            (SELECT 1 FROM desktop_prompts WHERE job=? AND plan_mode IS NOT NULL)""", (job,))
+
+    def pending_intro(self, route):
+        # The extension treats the context ID as opaque and acknowledges it only on
+        # a confirmed send. The ID depends only on the advertised help entry point.
+        context_id = INTRO_VERSION + route
+        ack = self.one("SELECT digest FROM catalog")
+        if ack and ack["digest"] == context_id:
+            return None
+        text = CONNECTION
+        if not ack or not ack["digest"].startswith(INTRO_VERSION):
+            text += " " + INTRO
+        return {"id": context_id, "text": text + " " + help_entry_point(route)}
+
+    def context(self):
+        with self.lock:
+            # A browser-originated send may acknowledge the same outstanding intro.
+            # Serve only the current binding's admitted, undelivered snapshot.
+            meta = self.one("""SELECT o.digest AS id,o.text FROM outgoing_context o
+                JOIN desktop_prompts p ON p.job=o.job JOIN requests r ON r.job=o.job
+                JOIN request_context c ON c.id=r.id JOIN binding b ON b.id=c.binding
+                JOIN jobs j ON j.id=o.job WHERE r.error IS NULL AND r.reply IS NULL
+                AND j.state IN ('queued','offered','uncertain')
+                AND o.digest NOT IN (SELECT digest FROM catalog)""")
+            return dict(meta) if meta else None
+
+    def resolve(self, id, action):
+        with self.lock, self.sql:
+            legacy = self.one("""SELECT 1 FROM requests r WHERE r.job=?
+                AND NOT EXISTS(SELECT 1 FROM desktop_prompts p WHERE p.job=r.job)
+                AND NOT EXISTS(SELECT 1 FROM site_questions q WHERE q.answer_job=r.job)""", (id,))
+            if legacy and action in ("send", "retry"):
+                raise Problem("Inspect and skip the original Arena delivery. " + LEGACY_RESUBMIT)
+            if action == "sent":
+                self.acknowledge_delivery(id)
+            if legacy and action == "skip":
+                self.sql.execute("UPDATE requests SET error=? WHERE job=? AND reply IS NULL AND error IS NULL",
+                                 (LEGACY_RESUBMIT, id))
+            super().resolve(id, action)
 
     def pair_owner(self, session):
         if not isinstance(session,str) or not 0 < len(session) <= 256:
@@ -295,13 +371,15 @@ class DesktopJournal(Journal):
             if settled_delivery:
                 # The old answer was inspected during explicit pairing. Retire the delivery,
                 # preserving its prior outcome and never accepting the old reply as new work.
-                self.sql.execute("""UPDATE jobs SET state='done' WHERE id=? AND state IN ('offered','waiting','uncertain')
+                settled = self.sql.execute("""UPDATE jobs SET state='done' WHERE id=? AND state IN ('offered','waiting','uncertain')
                                   AND id IN (SELECT r.job FROM requests r JOIN request_context c ON c.id=r.id
                                     JOIN desktop_session s ON s.id=r.session
                                     WHERE c.binding=? AND r.reply IS NULL
                                     AND NOT EXISTS (SELECT 1 FROM site_questions q WHERE q.answer_job=r.job OR q.job=r.job)
                                     AND NOT EXISTS (SELECT 1 FROM calls WHERE job=r.job))""",
                                  (settled_delivery, existing["id"]))
+                if settled.rowcount:
+                    self.acknowledge_delivery(settled_delivery)
             # A manually reconnected document baselines its visible history. A
             # turn while disconnected may have no journal event, even at the
             # same URL and Chrome tab ID. Invalidate work from that interval.
@@ -331,40 +409,24 @@ class DesktopJournal(Journal):
         tools = request.get("tools", [])
         if not isinstance(tools, list) or not all(isinstance(t,dict) and isinstance(t.get("name"),str) for t in tools):
             raise Problem("Invalid active Desktop tool catalog")
-        tools = desktop_tools(tools, request.get("supportsReadBatch"))
-        handoff = desktop_handoff(tool["name"] for tool in tools)
-        schema = json.dumps(tools, separators=(",",":"), sort_keys=True, ensure_ascii=False)
+        names = desktop_tool_names(tools, request.get("supportsReadBatch"))
+        help_route = "unavailable"
+        if "arena_tool_help" in names:
+            help_route = "direct"
+        elif "run_code" in names and request.get("toolHelpViaCode") is True:
+            help_route = request.get("toolHelpProgram", "typescript")
+            if not isinstance(help_route, str) or help_route not in HELP_PROGRAMS:
+                raise Problem("Unknown Desktop tool help program format")
         skills = request.get("skills", [])
         if not isinstance(skills,list) or not all(isinstance(s,dict) and isinstance(s.get("name"),str)
                                                   and isinstance(s.get("description"),str) for s in skills):
             raise Problem("Invalid native skill catalogue")
-        skill_list = [{"name":s["name"],"description":s["description"]} for s in skills]
-        context = ("DeepSeek Harness Desktop is connected. For image generation, use Arena's own image tool "
-                   "and include the image in your final answer. Arena's cloud helpers run in Arena. "
-                   "Use Desktop tools for local project or computer operations, and ask_user_question for "
-                   "questions to the Desktop user when available. Native tool catalog: " + schema
-                   + "\nAvailable skills: " + json.dumps(skill_list,ensure_ascii=False))
-        guidance = request.get("computerUseGuidance")
-        if request.get("toolHelpViaCode") is True and any(t["name"] == "run_code" for t in tools):
-            context += ("\nBefore using an unfamiliar Desktop tool, request its current Harness documentation. "
-                        "Inside run_code use inspect(await tools.arena_tool_help({})) to list available names, "
-                        "{name:'read'} for one tool, {guide:'tool:...'} for a listed shared instruction or "
-                        "{sdk:true} for the program SDK. Use nextCursor as cursor for the next page.")
-        if "computerUseGuidance" in request:
-            if not isinstance(guidance, str):
-                raise Problem("Expected Desktop Computer Use guidance as text")
-            # Keep the catalog a single paragraph: the browser uses its blank line to locate the user prompt.
-            if guidance:
-                context += ("\nCurrent Desktop Computer Use instructions (replace earlier instructions for this tool): "
-                            + json.dumps(guidance, ensure_ascii=False))
-            else:
-                context += ("\nComputer Use guidance is unavailable in this Desktop session. "
-                            "Disregard earlier Computer Use instructions. If a task needs GUI control, "
-                            "report that the instructions are unavailable and leave the desktop untouched.")
+        if "computerUseGuidance" in request and not isinstance(request["computerUseGuidance"], str):
+            raise Problem("Expected Desktop Computer Use guidance as text")
         # Capability negotiation affects the initial catalog only. Replaying a
         # previously admitted request must retain its original catalog and ID.
         presentation = request.get("toolResultView")
-        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView", "computerUseGuidance", "toolHelpViaCode"))
+        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView", "computerUseGuidance", "toolHelpViaCode", "toolHelpProgram"))
         with self.lock, self.sql:
             owner = self.one("SELECT id FROM desktop_session")
             if not owner or owner["id"] != session:
@@ -377,7 +439,7 @@ class DesktopJournal(Journal):
             if old:
                 # Older companions may have included a presentation or capability hint in the digest.
                 if old["session"] != session or (old["fingerprint"] != fingerprint and not any(
-                    old["fingerprint"] == request_fingerprint(request, (*omitted, "computerUseGuidance", "toolHelpViaCode"))
+                    old["fingerprint"] == request_fingerprint(request, (*omitted, "computerUseGuidance", "toolHelpViaCode", "toolHelpProgram"))
                     for omitted in ((), ("supportsReadBatch",), ("toolResultView",))
                 )):
                     raise Problem("Desktop request ID reused with different content")
@@ -411,7 +473,7 @@ class DesktopJournal(Journal):
                     rendered_result = readable_result(tool_data, presentation)
                 else:
                     rendered_result = result
-                text = TOOL_RESULT_HEADER + " " + handoff + "\n" + rendered_result + ("\n\n" + text if text else "")
+                text = TOOL_RESULT_HEADER + "\n" + rendered_result + ("\n\n" + text if text else "")
                 if self.one("SELECT id FROM request_context WHERE origin=?", (origin,)):
                     raise Problem("This native tool result already has a delivery")
                 prior_job = prior["job"]
@@ -427,18 +489,27 @@ class DesktopJournal(Journal):
                     text = "Review the attached image." if len(images) == 1 else "Review the attached images."
                 if not text.strip():
                     raise Problem("Expected a message of at most 180000 characters")
-                if tools:
-                    text += "\n\n" + handoff
-            meta = self.pending_catalog(context) if selection is None and (not prior_job or guidance is not None) else None
-            if selection is None and plan_mode is not None:
-                text += "\n\n" + (PLAN_ACTIVE if plan_mode else PLAN_INACTIVE)
+            meta = self.pending_intro(help_route) if selection is None else None
+            if selection is None and plan_mode is True:
+                text += "\n\n" + PLAN_ACTIVE
+                if "exit_plan_mode" in names:
+                    text += " " + PLAN_REVIEW
+                else:
+                    text += (" Submit the completed plan for review in Desktop when available. Wait for approval "
+                             "or for the user to turn plan mode off before implementation.")
+            elif selection is None and plan_mode is False:
+                last = self.one("""SELECT plan_mode FROM desktop_prompts
+                    WHERE sent=1 AND plan_mode IS NOT NULL ORDER BY rowid DESC LIMIT 1""")
+                if last and last["plan_mode"]:
+                    text += "\n\n" + PLAN_INACTIVE
+                elif self.one("SELECT 1 FROM desktop_mode_sync"):
+                    text += "\n\nDeepSeek Harness plan mode: INACTIVE."
             if len(text) + (len(meta["text"]) + 2 if meta else 0) > 180000:
                 raise Problem("Message and native tool instructions exceed the bridge text limit")
             if self.paused():
                 raise Problem(self.paused())
             if self.one("SELECT id FROM jobs WHERE state NOT IN ('done','superseded')"):
                 raise Problem("A previous turn is still active. Inspect Arena and the connection status first.")
-            self.use_catalog(context)
             job = self._insert_job(text,request.get("png"),prior_job,"question_queued" if selection is not None else "queued")
             if selection is not None:
                 self.sql.execute("UPDATE site_questions SET answer_job=?,answer=? WHERE job=?", (job,selection,prior_job))
@@ -446,10 +517,11 @@ class DesktopJournal(Journal):
                 self.sql.executemany("INSERT INTO outgoing_pngs(job,position,bytes) VALUES(?,?,?)",
                                      ((job, index, raw) for index, raw in enumerate(images)))
             if meta:
-                # A queued turn can outlive the companion that constructed its native catalog.
+                # Keep the admitted intro available if the companion restarts before the send.
                 self.sql.execute("INSERT INTO outgoing_context VALUES(?,?,?)", (job,meta["id"],meta["text"]))
-            names = json.dumps([t["name"] for t in tools])
-            self.sql.execute("INSERT INTO requests VALUES(?,?,?,?,?,NULL,NULL)", (rid,session,fingerprint,job,names))
+            self.sql.execute("INSERT INTO desktop_prompts(job,plan_mode) VALUES(?,?)",
+                             (job, plan_mode if selection is None else None))
+            self.sql.execute("INSERT INTO requests VALUES(?,?,?,?,?,NULL,NULL)", (rid,session,fingerprint,job,json.dumps(names)))
             self.sql.execute("INSERT INTO request_context VALUES(?,?,?,?)",(rid,binding["id"],browser_turn,origin))
             return {"id":rid}
 
@@ -463,6 +535,7 @@ class DesktopJournal(Journal):
                                  OR id IN (SELECT job FROM browser_inputs))""", (binding,))
         self._stop_pending_requests(binding, data["text"])
         self.sql.execute("UPDATE request_context SET binding=NULL WHERE binding=?", (binding,))
+        self.sql.execute("DELETE FROM catalog")
         self.sql.execute("DELETE FROM desktop_cancelled_deliveries")
         self.sql.execute("INSERT OR REPLACE INTO desktop_transcript_faults VALUES(?,?)", (binding, data["id"]))
         return True
@@ -674,7 +747,7 @@ class DesktopJournal(Journal):
 
     def retry_tool_reply(self, job, diagnostic):
         # The event transaction already owns the lock. Keep the rejection and new delivery atomic.
-        request = self.one("""SELECT r.id,r.names,j.parent FROM requests r JOIN jobs j ON j.id=r.job
+        request = self.one("""SELECT r.id,j.parent FROM requests r JOIN jobs j ON j.id=r.job
                               JOIN request_context c ON c.id=r.id JOIN binding b ON b.id=c.binding
                               JOIN desktop_session s ON s.id=r.session
                               WHERE j.id=? AND j.state='waiting' AND r.reply IS NULL AND r.error IS NULL
@@ -686,8 +759,9 @@ class DesktopJournal(Journal):
             return False
         prompt = (diagnostic + " Reissue the single intended tool call as valid JSON. "
                   "Use the fresh ID on the final Bridge delivery line. Keep the current task and plan mode. "
-                  "Return one command and wait for its result.\n\n" + desktop_handoff(json.loads(request["names"])))
+                  "Return one command and wait for its result.")
         retry = self._insert_job(prompt, None, request["parent"], "queued")
+        self.sql.execute("INSERT INTO desktop_prompts(job) VALUES(?)", (retry,))
         self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (job,))
         self.sql.execute("UPDATE requests SET job=? WHERE id=?", (retry, request["id"]))
         return True
@@ -772,7 +846,8 @@ class DesktopJournal(Journal):
             self.sql.execute("DELETE FROM released")
             self.sql.execute("DELETE FROM pause")
             self.sql.execute("DELETE FROM catalog")
-            self.catalog = None
+            self.sql.execute("DELETE FROM desktop_prompts")
+            self.sql.execute("DELETE FROM desktop_mode_sync")
             return {"ok":True}
 
     def skill(self, name):
@@ -805,7 +880,7 @@ def serve():
                         with db.lock:
                             bound = db.one("SELECT chat FROM binding")
                         result = {"chat":bound["chat"] if bound else None, "port":8766, "supportsPngBatch":True,
-                                  "supportsResultView":True, "supportsComputerUseGuidance":True, "supportsToolHelp":True,
+                                  "supportsResultView":True, "supportsOnDemandContext":True, "supportsToolHelp":True,
                                   "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
                         if "sessionId" in params:
                             result["pairToken"] = pair

@@ -84,7 +84,7 @@ test('a bound Arena question reaches the native answerer once and only its ownin
   const starts = []
   const statuses = new Map()
   const peer = {async rpc(method,params) {
-    if (method === 'setup') return {supportsResultView:true}
+    if (method === 'setup') return {supportsResultView:true,supportsOnDemandContext:true}
     if (method === 'status') return statuses.get(params.id)
     assert.equal(method,'start')
     starts.push(params)

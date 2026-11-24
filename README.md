@@ -2,14 +2,14 @@
 
 Мост подключает один веб-чат Arena Agent Mode к одному разговору в штатном DeepSeek Harness Desktop. Задания вводятся в обычном поле Desktop, ответы Arena приходят в тот же разговор. Штатные инструменты Harness выполняют локальные действия с разрешениями выбранного профиля.
 
-Arena Harness Bridge connects an Arena Agent Mode browser chat to the standard DeepSeek Harness Desktop app. Type in Desktop and get Arena’s replies there. Arena can look up the active tools’ documentation and receives the native guide when Computer Use is enabled.
+Arena Harness Bridge connects an Arena Agent Mode browser chat to the standard DeepSeek Harness Desktop app. Type in Desktop and get Arena’s replies there. Arena can request documentation for tools available in the current profile, including Computer Use.
 
 **Проверено на Windows с Chrome и DeepSeek Harness Desktop 0.2.2-rc.5 и 0.2.3-alpha.2.** [Последний релиз и ZIP для Windows](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest) · [Инструкция на русском](INSTALL.md) · [English installation guide](INSTALL.en.md)
 
 ## Возможности
 
 - Обычные сообщения, ответы и локальные вызовы инструментов с подтверждениями Desktop.
-- Справка по запросу для инструментов текущего хода, в том числе внутри `run_code`. Для Computer Use мост передаёт штатное руководство до первого действия.
+- Справка по запросу для инструментов текущего хода, включая Computer Use и инструменты внутри `run_code`.
 - Штатные цели, режим плана, карточки вопросов, вложения и скиллы текущего профиля.
 - Передача PNG из Desktop в Arena и возврат сгенерированных изображений в Desktop.
 - Команда `/arena-reset` освобождает привязку к Arena из любого диалога Desktop в том же профиле, даже если исходный диалог удалён.
@@ -19,7 +19,7 @@ Arena Harness Bridge connects an Arena Agent Mode browser chat to the standard D
 
 ## Данные и разрешения
 
-Мост слушает `127.0.0.1:8766` и привязывает вкладку по локальному токену. В чат Arena передаются отправленные сообщения, выбранные вложения, результаты инструментов этой сессии и описания доступных инструментов и скиллов. При использовании справки Arena получает запрошенные инструкции. Штатное руководство Computer Use может включать локальный путь к его библиотеке. Для локальной работы выберите нужную рабочую папку и профиль разрешений в Desktop.
+Мост слушает `127.0.0.1:8766` и привязывает вкладку по локальному токену. В начале диалога Arena узнаёт, как запросить справку и выполнить действие через Desktop. В чат передаются сообщения пользователя, выбранные вложения и результаты вызовов. Описания инструментов и руководство Computer Use поступают по запросу. Для локальной работы выберите нужную рабочую папку и профиль разрешений в Desktop.
 
 ## Дополнительный CLI
 
@@ -43,7 +43,7 @@ python -m arena_terminal --root 'C:\путь\к\проекту'
 Для сборки нужны Python и npm. Архив появится в `dist/`.
 
 ```powershell
-python scripts/build_windows_release.py --version 0.1.7
+python scripts/build_windows_release.py --version 0.1.8
 python -m unittest test_arena_desktop test_arena_terminal test_windows_release
 node --test browser-extension/tests/*.test.cjs
 ```

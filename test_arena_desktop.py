@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+import subprocess
 import struct
 import tempfile
 import threading
@@ -10,11 +11,14 @@ import zlib
 from contextlib import contextmanager
 from http.client import HTTPConnection
 from pathlib import Path
+from unittest.mock import patch
 
 from arena_terminal.desktop_provider import DesktopJournal
 from arena_terminal.journal import Problem
 from arena_terminal.transport import Endpoint, ExtensionHandler
 
+
+JS_HELP = "(typeof inspect === 'function' ? inspect : console.log)(JSON.stringify(await tools.arena_tool_help({})))"
 
 RED = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 BLUE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC"
@@ -34,10 +38,10 @@ class DesktopProviderTests(unittest.TestCase):
         reply = self.db.status("first", "desktop-session")["reply"]
         self.assertEqual(reply, {"kind":"tool", "name":"pwsh", "arguments":{"description":"Fixture", "command":script},
                                  "text":"Before.\n\nAfter."})
-        self.assertIn('harness-text script', first["text"])
+        self.assertNotIn('harness-text script', first["text"])
         self.db.start(dict(self.request, tools=[{"name":"pwsh"}], requestId="next", text="", toolResult=json.dumps(
             {"toolCallId":"arena_first", "failed":False, "text":"output"})))
-        self.assertIn('harness-text script', self.db.poll(self.addr, True)["text"])
+        self.assertNotIn('harness-text script', self.db.poll(self.addr, True)["text"])
 
     def test_text_argument_rejects_missing_ambiguous_nested_and_unproven_sources(self):
         valid = "\x1escript\nWrite-Output benign"
@@ -90,7 +94,7 @@ class DesktopProviderTests(unittest.TestCase):
     def test_read_batch_returns_one_ordered_continuation_and_rejects_replay(self):
         self.db.start(dict(self.request, supportsReadBatch=True))
         job = self.db.poll(self.addr, True)
-        self.assertIn('arena_read_batch', job['text'])
+        self.assertNotIn('arena_read_batch', job['text'])
         calls = [{"name":"read", "arguments":{"file_path":f"file-{i}.txt"}} for i in range(5)]
         self.send_raw(job['id'], tool_call(job['id'], "arena_read_batch", {"calls":calls}).split("\n")[1])
         self.assertEqual(self.db.status("first", "desktop-session")["reply"],
@@ -184,14 +188,17 @@ class DesktopProviderTests(unittest.TestCase):
                     db.close()
 
     def test_enabling_read_batch_preserves_the_recorded_catalog_of_an_existing_request(self):
-        # Leave room for the legacy catalog, with less than another catalog entry available.
-        legacy = dict(self.request, text="a" * 178798)
-        old_request = self.db.start(legacy)
+        # Replay a previously admitted delivery that filled the old combined budget.
+        previous = {"id":"desktop-intro-v1/unavailable", "text":"DeepSeek Harness Desktop is connected."}
+        legacy = dict(self.request, text="a" * (180000 - len(previous["text"]) - 2))
+        with patch.object(self.db, "pending_intro", return_value=previous):
+            old_request = self.db.start(legacy)
         upgraded = dict(legacy, supportsReadBatch=True)
         self.assertEqual(self.db.start(upgraded), old_request)
         with self.assertRaisesRegex(Problem, "reused with different content"):
             self.db.start(dict(upgraded, text="Different request"))
         delivery = self.db.poll(self.addr, True)
+        self.assertEqual(delivery["text"], previous["text"] + "\n\n" + legacy["text"])
         self.assertNotIn("arena_read_batch", delivery["text"])
         self.send_raw(delivery["id"], tool_call(delivery["id"]).split("\n")[1])
         self.assertEqual(self.db.status("first", "desktop-session")["reply"]["kind"], "tool")
@@ -245,6 +252,7 @@ class DesktopProviderTests(unittest.TestCase):
             new = post("poll", dict(resumed, ready=True))[1]["job"]
             self.assertNotEqual(new["id"], old_delivery)
             self.assertIn("A new human message", new["text"])
+            self.assertIn("ordinary JSON", new["text"], "the replaced history may have lost its introduction")
             self.assertNotIn("old tool output", new["text"])
             self.assertEqual(post("event", dict(resumed, id="new-sent", kind="sent", job=new["id"]))[0], 200)
             self.assertEqual(post("event", self.raw_reply(old_delivery, tool_call(old_delivery).split("\n")[1],
@@ -561,99 +569,162 @@ class DesktopProviderTests(unittest.TestCase):
         self.assertEqual(result["reply"], {"kind":"text","text":"Пример команды.\n\n" + block})
         self.assertEqual(self.db.pending_calls(), [])
 
-    def test_tool_continuation_delivers_reply_format_guidance_outside_the_original_result(self):
-        self.db.start(self.request)
-        first = self.db.poll(self.addr,True)
-        _, catalog = first["text"].split("Native tool catalog: ",1)
-        schema, end = json.JSONDecoder().raw_decode(catalog)
-        self.assertEqual(schema,self.request["tools"])
-        prefix, instructions = catalog[end:].rsplit("\n\n", 1)
-        self.assertEqual(prefix, "\nAvailable skills: []\n\nread file")
-        self.db.event(dict(self.addr,id="first-sent",kind="sent",job=first["id"]))
-        frame = tool_call(first["id"])
-        self.db.event(dict(self.addr,id="call",kind="assistant",text=frame,toolFrame=True,replyTo=first["id"]))
-        raw = json.dumps({"toolCallId":"arena_first","failed":False,"text":"A result with \n, {braces}, and «quotes»."},
-                         ensure_ascii=False)
-        self.db.start(dict(self.request,requestId="result",text="",toolResult=raw))
-        sent = self.db.poll(self.addr,True)["text"]
-        header, body = sent.split("\n",1)
-        self.assertTrue(header.startswith("DeepSeek Harness tool result:"))
-        self.assertEqual(body,raw)
-        for guidance in (header,instructions):
-            self.assertIn('"$harness":"tool_call"',guidance)
-            self.assertIn("first",guidance)
-            self.assertIn("Bridge delivery",guidance)
-            self.assertIn("turn_id",guidance)
-            self.assertIn("fenced text",guidance)
-            self.assertNotIn("arena.harness.v1",guidance)
-            self.assertNotIn("Arena-Harness-Call",guidance)
-            self.assertNotIn("WordPad",guidance)
+    def browser_delivery(self):
+        job = self.db.poll(self.addr, True)
+        # Stamp the actual journal offer with the same formatter the extension submits.
+        script = ("const job = JSON.parse(require('node:fs').readFileSync(0, 'utf8')); "
+                  "process.stdout.write(require('./browser-extension/core.js').delivery(job.text, job.id).text)")
+        out = subprocess.run(["node", "-e", script], cwd=Path(__file__).parent, check=True,
+                             input=json.dumps(job).encode(), capture_output=True).stdout.decode()
+        body, receipt = out.rsplit("\n\n", 1)
+        self.assertRegex(receipt, r"^Bridge delivery [a-f0-9]{32}$")
+        turn = receipt.removeprefix("Bridge delivery ")
+        self.assertEqual(turn, job["id"])
+        return body, turn
 
-    def test_computer_use_guidance_follows_the_acknowledged_catalog_and_tool_continuations(self):
-        guide = "First line.\n\ninspect(await cua.getCapabilities())"
-        request = dict(self.request, computerUseGuidance=guide)
+    def test_direct_help_example_executes_and_each_result_supplies_a_fresh_id(self):
+        request = dict(self.request, text="Are you there?", planMode=False,
+                       computerUseGuidance="old eager CUA guide", supportsReadBatch=True,
+                       skills=[{"name":"hidden-skill", "description":"eager skill content"}],
+                       tools=[{"name":"arena_tool_help"},{"name":"pwsh","description":"eager shell schema"},
+                              {"name":"cua_run_code"},{"name":"read_image"},{"name":"ask_user_question"}])
         self.db.start(request)
-        first = self.db.poll(self.addr, True)
-        self.assertIn(json.dumps(guide, ensure_ascii=False), first["text"])
-        self.assertEqual(first["text"].split("\n\n", 1)[1].split("\n", 1)[0], "read file")
-        self.send_raw(first["id"], tool_call(first["id"]).split("\n")[1])
-        continuation = dict(request, requestId="continued", text="", toolResult=json.dumps(
-            {"toolCallId":"arena_first", "failed":False, "text":"read result"}))
-        updated = guide + "\nUpdated rule."
-        self.db.start(dict(continuation, computerUseGuidance=updated))
-        self.db.start(dict(continuation, computerUseGuidance="another revision after admission"))
-        # Drop all in-memory context, as on a companion restart.
-        self.db.use_catalog(None)
-        child = self.db.poll(self.addr, True)
-        self.assertTrue(child["text"].startswith("DeepSeek Harness tool result:"))
-        self.assertIn(json.dumps(updated, ensure_ascii=False), child["text"])
-        self.assertNotIn("another revision", child["text"])
-        self.assertNotIn(json.dumps(guide, ensure_ascii=False), child["text"])
-        self.send_raw(child["id"], tool_call(child["id"]).split("\n")[1], event_id="second-answer")
-        next_result = dict(continuation, requestId="retired", computerUseGuidance="", toolResult=json.dumps(
-            {"toolCallId":"arena_continued", "failed":False, "text":"another read result"}))
-        self.db.start(next_result)
-        retired = self.db.poll(self.addr, True)
-        self.assertIn("Computer Use guidance is unavailable", retired["text"])
-        self.assertNotIn("Updated rule", retired["text"])
-        self.db.event(dict(self.addr, id="retired-sent",kind="sent",job=retired["id"]))
-        self.db.event(dict(self.addr, id="completed",kind="assistant",text="Ready"))
-        self.db.start(dict(request,requestId="next",computerUseGuidance="",text="Follow up"))
-        self.assertNotIn("Computer Use guidance", self.db.poll(self.addr,True)["text"])
+        body, first = self.browser_delivery()
+        intro, user = body.split("\n\n", 1)
+        self.assertTrue(intro.startswith("DeepSeek Harness Desktop is connected."))
+        self.assertEqual(user, "Are you there?")
+        for phrase in ("cloud", "ordinary JSON", "32", "Bridge delivery", "first", "fenced json", "fenced text"):
+            self.assertIn(phrase, intro)
+        for unrelated in ("old eager CUA guide", "hidden-skill", "eager shell schema", "ask_user_question",
+                          "read_image", "harness-text", "cua_run_code", "image generation", "run_code", "plan mode"):
+            self.assertNotIn(unrelated, body)
+        example = json.loads(intro.split("```text\n")[1].split("\n```")[0])
+        self.assertEqual(list(example), ["$harness", "turn_id", "name", "arguments"])
+        self.assertEqual(example, {"$harness":"tool_call", "turn_id":"CURRENT_DELIVERY_ID",
+                                   "name":"arena_tool_help", "arguments":{}})
+        self.send_raw(first, json.dumps(dict(example, turn_id=first)), text="")
+        self.assertEqual(self.db.status("first", "desktop-session")["reply"],
+                         {"kind":"tool","name":"arena_tool_help","arguments":{}})
+        docs = "Requested tool names: read_image, pwsh"
+        result = {"toolCallId":"arena_first","failed":False,"text":docs}
+        self.db.start(dict(request, requestId="lookup", text="", toolResult=json.dumps(result), toolResultView={}))
+        body, second = self.browser_delivery()
+        self.assertEqual(body, "DeepSeek Harness tool result:\nTool arena_first (ok)\n" + docs)
+        self.assertNotEqual(first, second)
+        self.send_raw(second, json.dumps(dict(example, turn_id=second, arguments={"name":"pwsh"})),
+                      event_id="lookup-answer", text="")
+        self.assertEqual(self.db.status("lookup", "desktop-session")["reply"],
+                         {"kind":"tool","name":"arena_tool_help","arguments":{"name":"pwsh"}})
+        self.db.start(dict(request, requestId="last", text="", toolResult=json.dumps(
+            {"toolCallId":"arena_lookup","failed":False,"text":"Specific docs"}), toolResultView={}))
+        body, third = self.browser_delivery()
+        self.assertEqual(body, "DeepSeek Harness tool result:\nTool arena_lookup (ok)\nSpecific docs")
+        self.db.event(dict(self.addr, id="last-sent", kind="sent", job=third))
+        self.db.event(dict(self.addr, id="final", kind="assistant", replyTo=third, text='{"finished":true}'))
+        self.assertEqual(self.db.status("last", "desktop-session")["reply"], {"kind":"text","text":'{"finished":true}'})
+        self.db.start(dict(request, requestId="human", text="My copy:\n" + docs,
+                           computerUseGuidance="changed eager guide"))
+        self.assertEqual(self.browser_delivery()[0], "My copy:\n" + docs)
 
-    def test_nested_help_is_discoverable_and_does_not_become_a_direct_tool(self):
+    def test_nested_help_example_uses_only_the_admitted_program_tool(self):
         request = dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=True)
         self.db.start(request)
         self.db.start(dict(request, toolHelpViaCode=False))
-        first = self.db.poll(self.addr, True)
-        self.assertIn("inspect(await tools.arena_tool_help({}))", first["text"])
-        names = json.loads(self.db.one("SELECT names FROM requests WHERE id='first'")["names"])
-        self.assertEqual(names, ["run_code"])
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        body, first = self.browser_delivery()
+        intro, prompt = body.split("\n\n", 1)
+        self.assertEqual(prompt, self.request["text"])
+        example = json.loads(intro.split("```text\n")[1].split("\n```")[0])
+        self.assertEqual(example["arguments"]["code"], JS_HELP)
+        self.assertTrue(example["arguments"]["description"].strip())
+        self.assertEqual(example["name"], "run_code")
+        self.send_raw(first, json.dumps(dict(example, turn_id=first)), text="")
+        self.assertEqual(self.db.status("first", "desktop-session")["reply"],
+                         {"kind":"tool","name":"run_code","arguments":example["arguments"]})
+        self.assertEqual(json.loads(self.db.lookup("first","desktop-session")["names"]), ["run_code"])
 
-    def test_changed_guidance_must_fit_before_a_continuation_is_queued(self):
-        self.db.start(dict(self.request, computerUseGuidance="small section"))
+    def test_program_examples_change_with_the_current_runtime_and_replay_keeps_the_admitted_one(self):
+        for dialect, code in (
+                ("typescript", JS_HELP), ("python", "print(await tools.arena_tool_help({}))")):
+            with self.subTest(dialect=dialect):
+                request = dict(self.request, requestId=dialect, tools=[{"name":"run_code"}],
+                               toolHelpViaCode=True, toolHelpProgram=dialect)
+                self.db.start(request)
+                self.db.start(dict(request, toolHelpProgram="python"))
+                body, turn = self.browser_delivery()
+                example = json.loads(body.split("```text\n")[1].split("\n```")[0])
+                self.assertEqual(example["arguments"]["code"], code)
+                self.assertEqual("ordinary JSON" in body, dialect == "typescript")
+                self.db.event(dict(self.addr, id=dialect+"-sent", kind="sent", job=turn))
+                self.db.event(dict(self.addr, id=dialect+"-answer", kind="assistant", text="Ready"))
+
+    def test_unrequested_guides_and_catalog_revisions_do_not_consume_the_browser_budget(self):
+        request = dict(self.request, computerUseGuidance="old guide", tools=[{"name":"read", "description":"x"*180000}])
+        self.db.start(request)
         self.complete()
-        request = dict(self.request, requestId="continued",text="",computerUseGuidance="x"*180000,
-                       toolResult=json.dumps({"toolCallId":"arena_first","failed":False,"text":"read result"}))
-        with self.assertRaisesRegex(Problem,"limit"):
-            self.db.start(request)
-        self.assertIsNone(self.db.poll(self.addr,True))
+        result = json.dumps({"toolCallId":"arena_first","failed":False,"text":"My copy of old guide"})
+        self.db.start(dict(self.request, requestId="continued", text="", computerUseGuidance="y"*180000, toolResult=result))
+        self.assertEqual(self.db.poll(self.addr,True)["text"], "DeepSeek Harness tool result:\n" + result)
 
-    def test_local_tool_handoff_is_available_after_the_catalog_is_acknowledged(self):
-        self.db.start(self.request)
-        first = self.db.poll(self.addr, True)
-        self.db.event(dict(self.addr, id="first-sent", kind="sent", job=first["id"]))
-        self.db.event(dict(self.addr, id="first-done", kind="assistant", text="Ready"))
+    def test_pending_context_can_be_acknowledged_after_a_companion_restart(self):
+        self.db.start(dict(self.request, tools=[{"name":"arena_tool_help"}]))
+        pending = self.db.context()
+        self.assertIn('"name":"arena_tool_help"', pending["text"])
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        self.assertEqual(self.db.context(), pending)
+        self.db.event(dict(self.addr, id="manual", kind="user", text="Earlier browser turn", contextId=pending["id"]))
+        self.assertIsNone(self.db.context())
+        self.db.event(dict(self.addr, id="manual-answer", kind="assistant", text="Ready"))
+        self.assertEqual(self.browser_delivery()[0], self.request["text"])
 
-        self.db.start(dict(self.request, requestId="local-follow-up", text="Read the local project file"))
-        text = self.db.poll(self.addr, True)["text"]
-        self.assertNotIn("Native tool catalog:", text)
-        self.assertTrue(text.startswith("Read the local project file\n\n"))
-        self.assertIn('"$harness":"tool_call"', text)
-        self.assertIn("Bridge delivery", text)
-        self.assertIn("visible reply", text)
-        self.assertIn("End the reply", text)
-        self.assertIn("next message", text)
+    def test_only_an_acknowledged_intro_survives_restart_and_repair_of_the_same_chat(self):
+        request = dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=False)
+        self.db.start(request)
+        self.db.cancel("first","desktop-session")
+        self.db.start(dict(request, requestId="offered"))
+        body, turn = self.browser_delivery()
+        self.assertIn("DeepSeek Harness Desktop is connected.", body)
+        self.assertNotIn("arena_tool_help", body)
+        self.assertNotIn("run_code", body)
+        self.db.event(dict(self.addr, id="sent", kind="sent", job=turn))
+        self.db.event(dict(self.addr, id="done", kind="assistant", text="Ready"))
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        self.addr["binding"] = self.db.bind(self.addr["chat"],self.addr["tab"])
+        self.db.start(dict(request, requestId="reconnected", text="Next"))
+        self.assertEqual(self.browser_delivery()[0], "Next")
+
+    def test_previous_intro_receipt_delivers_the_visible_reply_contract_once(self):
+        self.db.acknowledge_context("desktop-intro-v1/typescript")
+        request = dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=True,
+                       text="!image Draw a sign")
+        self.db.start(request)
+        body, turn = self.browser_delivery()
+        intro, separator, prompt = body.partition("\n\n")
+        self.assertEqual((separator, prompt), ("\n\n", request["text"]))
+        for phrase in ("You decide how to carry out the task", "your normal, visible reply",
+                       "even when it does not appear", "subject to the user's permissions",
+                       "Read the output or error", JS_HELP):
+            self.assertIn(phrase, intro)
+        self.db.event(dict(self.addr, id="role-sent", kind="sent", job=turn))
+        self.db.event(dict(self.addr, id="role-answer", kind="assistant", replyTo=turn, text="OK"))
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        self.db.start(dict(request, requestId="next", text="Follow-up"))
+        self.assertEqual(self.browser_delivery()[0], "Follow-up")
+
+    def test_change_of_help_route_only_announces_the_new_entry_point(self):
+        request = dict(self.request, tools=[{"name":"arena_tool_help"}])
+        self.db.start(request)
+        self.complete(name="arena_tool_help")
+        self.db.start(dict(request, requestId="changed", tools=[{"name":"run_code"}], toolHelpViaCode=True,
+                           text="",toolResult=json.dumps({"toolCallId":"arena_first","failed":False,"text":"names"})))
+        body, _ = self.browser_delivery()
+        self.assertIn(JS_HELP, body)
+        self.assertNotIn("ordinary JSON", body)
+        self.assertNotIn('"name":"arena_tool_help"', body)
 
     def test_tool_result_at_previous_combined_budget_is_delivered_intact(self):
         self.db.start(self.request)
@@ -670,7 +741,7 @@ class DesktopProviderTests(unittest.TestCase):
         self.assertEqual(delivered.split("\n",1)[1],raw)
 
     def test_plan_mode_reaches_the_browser_with_the_original_submission(self):
-        self.db.start(dict(self.request, text="!image Draw a lighthouse", planMode=True))
+        self.db.start(dict(self.request, text="!image Draw a lighthouse", planMode=True, tools=[{"name":"exit_plan_mode"}]))
         delivered = self.db.poll(self.addr, True)["text"]
         _, prompt = delivered.split("\n\n", 1)
         self.assertTrue(prompt.startswith("!image Draw a lighthouse\n\n"))
@@ -687,7 +758,15 @@ class DesktopProviderTests(unittest.TestCase):
         })
         self.assertIn("one fenced json block", instruction)
         self.assertIn("Desktop opens its built-in plan review", instruction)
-        self.assertIn("Native tool catalog:", delivered)
+        self.assertNotIn("Native tool catalog:", delivered)
+
+    def test_program_only_plan_profile_uses_desktop_review_without_advertising_a_direct_exit_tool(self):
+        self.db.start(dict(self.request, tools=[{"name":"run_code"}], toolHelpViaCode=True, planMode=True))
+        body, _ = self.browser_delivery()
+        mode = body.split("plan mode: ACTIVE.",1)[1]
+        for term in ("read-only", "Desktop", "review", "approval"):
+            self.assertIn(term, mode)
+        self.assertNotIn("exit_plan_mode", body)
 
     def test_plan_instruction_follows_ordinary_tool_results_and_can_end(self):
         self.db.start(dict(self.request, planMode=True))
@@ -697,10 +776,10 @@ class DesktopProviderTests(unittest.TestCase):
         continued = self.db.poll(self.addr, True)
         header, result_and_mode = continued["text"].split("\n", 1)
         result, _, mode = result_and_mode.partition("\n\n")
-        self.assertIn('"$harness":"tool_call"', header)
+        self.assertEqual(header, "DeepSeek Harness tool result:")
         self.assertEqual(result, raw)
         self.assertIn("plan mode: ACTIVE", mode)
-        self.assertIn('"name":"exit_plan_mode","arguments":{"plan":', mode)
+        self.assertNotIn("exit_plan_mode", mode)
         self.db.event(dict(self.addr, id="followup-sent", kind="sent", job=continued["id"]))
         self.db.event(dict(self.addr, id="followup-done", kind="assistant", text="Inspected"))
         self.db.start(dict(self.request, requestId="manual-off", text="Carry out the task", planMode=False))
@@ -709,18 +788,144 @@ class DesktopProviderTests(unittest.TestCase):
         self.assertIn("plan mode: INACTIVE", reset)
         self.assertNotIn("plan mode: ACTIVE", reset)
 
+    def test_plan_exit_requires_a_previously_delivered_active_mode_and_is_sent_only_once(self):
+        self.db.start(dict(self.request, planMode=True))
+        self.db.cancel("first", "desktop-session")
+        self.db.start(dict(self.request, requestId="normal", planMode=False))
+        body, turn = self.browser_delivery()
+        self.assertNotIn("plan mode", body)
+        self.db.event(dict(self.addr, id="normal-sent", kind="sent", job=turn))
+        self.db.event(dict(self.addr, id="normal-answer", kind="assistant", text="Ready"))
+        self.db.start(dict(self.request, requestId="active", planMode=True))
+        body, turn = self.browser_delivery()
+        self.assertIn("plan mode: ACTIVE", body)
+        self.db.event(dict(self.addr, id="active-sent", kind="sent", job=turn))
+        self.db.event(dict(self.addr, id="active-answer", kind="assistant", text="Ready"))
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        self.db.start(dict(self.request, requestId="off", planMode=False))
+        body, turn = self.browser_delivery()
+        self.assertIn("plan mode: INACTIVE", body)
+        self.db.event(dict(self.addr, id="off-sent", kind="sent", job=turn))
+        self.db.event(dict(self.addr, id="off-answer", kind="assistant", text="Ready"))
+        self.db.start(dict(self.request, requestId="next", planMode=False))
+        self.assertEqual(self.browser_delivery()[0], self.request["text"])
+
+    def reopen_with_acknowledged_legacy_context(self):
+        # The released companion recorded one SHA-256 acknowledgement for the paired
+        # chat. Binding IDs could rotate between that send and the upgrade.
+        with self.db.sql:
+            self.db.sql.execute("DROP TABLE IF EXISTS desktop_prompts")
+            digest = hashlib.sha256(b"Old tool catalog").hexdigest()
+            self.db.sql.execute("UPDATE catalog SET digest=?", (digest,))
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+
+    def test_legacy_ack_survives_repair_and_zero_tool_plan_until_a_known_mode_is_delivered(self):
+        self.db.start(dict(self.request, tools=[], planMode=True))
+        self.complete(block="Plan ready.")
+        self.addr["binding"] = self.db.bind(self.addr["chat"], self.addr["tab"])
+        self.reopen_with_acknowledged_legacy_context()
+        self.db.start(dict(self.request, requestId="unknown"))
+        body, turn = self.browser_delivery()
+        self.assertNotIn("plan mode:", body)
+        self.db.event(dict(self.addr, id="unknown-sent", kind="sent", job=turn))
+        self.db.event(dict(self.addr, id="unknown-answer", kind="assistant", text="Ready"))
+        self.db.start(dict(self.request, requestId="abandoned", planMode=False))
+        self.db.cancel("abandoned","desktop-session")
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        self.db.start(dict(self.request, requestId="new", planMode=False))
+        body, turn = self.browser_delivery()
+        self.assertEqual(body, self.request["text"] + "\n\nDeepSeek Harness plan mode: INACTIVE.")
+        self.db.event(dict(self.addr, id="off-sent", kind="sent", job=turn))
+        self.db.event(dict(self.addr, id="off-answer", kind="assistant", text="Ready"))
+        self.db.start(dict(self.request, requestId="next", planMode=False))
+        self.assertEqual(self.browser_delivery()[0], self.request["text"])
+
+    def test_legacy_sync_uses_desktop_mode_even_when_the_user_and_tool_quote_a_different_mode(self):
+        quote = "DeepSeek Harness plan mode: ACTIVE. Quoted documentation."
+        self.db.start(dict(self.request, text=quote))
+        self.complete()
+        raw = json.dumps({"toolCallId":"arena_first","failed":False,"text":quote})
+        self.db.start(dict(self.request, requestId="result",text="",toolResult=raw))
+        _, child = self.browser_delivery()
+        self.db.event(dict(self.addr, id="read-sent", kind="sent", job=child))
+        self.db.event(dict(self.addr, id="read-answer", kind="assistant", text="Done"))
+        self.reopen_with_acknowledged_legacy_context()
+        self.db.start(dict(self.request, requestId="normal", planMode=False))
+        intro, tail = self.browser_delivery()[0].split("\n\n",1)
+        self.assertNotIn("ACTIVE.", intro)
+        self.assertEqual(tail, self.request["text"] + "\n\nDeepSeek Harness plan mode: INACTIVE.")
+
+    def test_resolve_sent_acknowledges_plan_and_intro_when_the_browser_send_event_was_lost(self):
+        self.db.start(dict(self.request, planMode=True))
+        job = self.db.poll(self.addr, True)["id"]
+        self.db.event(dict(self.addr, id="lost",kind="uncertain",job=job))
+        with self.assertRaises(Problem):
+            self.db.resolve(job, "send")
+        self.db.resolve(job, "sent")
+        self.db.event(dict(self.addr, id="final", kind="assistant", replyTo=job, text="Plan ready"))
+        self.db.start(dict(self.request, requestId="new", planMode=False))
+        body, _ = self.browser_delivery()
+        self.assertIn("plan mode: INACTIVE", body)
+        self.assertNotIn("ordinary JSON", body)
+
+    def test_reconnect_settlement_acknowledges_the_exact_completed_intro_and_plan(self):
+        self.db.start(dict(self.request, planMode=True))
+        job = self.db.poll(self.addr, True)["id"]
+        self.db.event(dict(self.addr, id="lost",kind="uncertain",job=job))
+        self.addr["binding"] = self.db.bind(self.addr["chat"], self.addr["tab"], job)
+        self.db.start(dict(self.request, requestId="new", planMode=False))
+        body, _ = self.browser_delivery()
+        self.assertIn("plan mode: INACTIVE", body)
+        self.assertNotIn("ordinary JSON", body)
+
+    def test_pending_legacy_prompt_is_retired_on_upgrade_without_rewriting_user_text(self):
+        self.db.start(self.request)
+        with self.db.sql:
+            # An old journal has no on-demand prompt records. Its persisted offer includes
+            # generated instructions and arbitrary user text without a trustworthy boundary.
+            self.db.sql.execute("DROP TABLE IF EXISTS desktop_prompts")
+            self.db.sql.execute("UPDATE outgoing_context SET text='Old private catalog'")
+            self.db.sql.execute("UPDATE jobs SET text='user text plus legacy handoff'")
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        self.assertIsNone(self.db.poll(self.addr,True))
+        self.assertIn("resubmit", self.db.status("first","desktop-session")["error"].lower())
+        self.db.start(dict(self.request, requestId="new", text="New user text", planMode=False))
+        body, _ = self.browser_delivery()
+        self.assertNotIn("Old private catalog", body)
+        self.assertEqual(body.split("\n\n",1)[1], "New user text")
+
+    def test_uncertain_legacy_prompt_keeps_its_receipt_fence_until_explicit_resolution(self):
+        self.db.start(self.request)
+        job = self.db.poll(self.addr, True)
+        with self.db.sql:
+            self.db.sql.execute("DROP TABLE IF EXISTS desktop_prompts")
+        self.db.close()
+        self.db = DesktopJournal(self.root / "state.db", self.root)
+        self.assertEqual(self.db.status("first", "desktop-session")["state"], "uncertain")
+        self.assertIsNone(self.db.poll(self.addr, True))
+        with self.assertRaisesRegex(Problem, "skip"):
+            self.db.resolve(job["id"], "retry")
+        self.db.resolve(job["id"], "skip")
+        self.assertEqual(self.db.status("first", "desktop-session")["state"], "failed")
+        self.db.start(dict(self.request, requestId="resubmitted"))
+        self.assertIn("ordinary JSON", self.db.poll(self.addr,True)["text"])
+
     def test_plan_mode_is_optional_and_requires_an_actual_boolean(self):
         for invalid in (None, "true", 0, 1, [], {}):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(Problem, "plan mode"):
                 self.db.start(dict(self.request, planMode=invalid))
         self.db.start(self.request)
         legacy = self.db.poll(self.addr, True)["text"]
-        self.assertIn("\n\nread file\n\n", legacy)
+        self.assertTrue(legacy.endswith("\n\nread file"))
         self.assertNotIn("plan mode", legacy)
 
     def test_plan_mode_preserves_image_only_and_checks_the_full_prompt_budget(self):
         with self.assertRaisesRegex(Problem, "text limit"):
-            self.db.start(dict(self.request, text="x" * 179000, planMode=True))
+            self.db.start(dict(self.request, text="x" * 179900, planMode=True))
         self.assertIsNone(self.db.poll(self.addr, True))
         self.db.start(dict(self.request, text="", png=BLUE, planMode=True))
         delivered = self.db.poll(self.addr, True)
@@ -869,7 +1074,7 @@ class DesktopProviderTests(unittest.TestCase):
                 self.assertIsNone(response["job"])
             status,response = post("poll",dict(self.addr,ready=True))
             self.assertEqual(status,200)
-            self.assertIn("\n\nFollow up\n\n", response["job"]["text"])
+            self.assertEqual("Follow up", response["job"]["text"])
             job = response["job"]["id"]
             self.db.event(dict(self.addr,id="sent-normal",kind="sent",job=job))
             self.db.event(dict(self.addr,id="done-normal",kind="assistant",text="Ok"))
@@ -960,7 +1165,7 @@ class DesktopProviderTests(unittest.TestCase):
         job = self.db.poll(addr,True)
         self.assertEqual(job["pngs"],[RED,BLUE])
         self.assertIn("attached images",job["text"])
-        self.assertIn("Native tool catalog:",job["text"])
+        self.assertIn("DeepSeek Harness Desktop is connected.",job["text"])
         self.assertTrue(self.db.inspect(job["id"])["has_image"])
         restart()
         self.assertEqual(self.db.status("first","desktop-session")["state"],"uncertain")

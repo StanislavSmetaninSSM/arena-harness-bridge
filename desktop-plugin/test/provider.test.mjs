@@ -22,12 +22,12 @@ class BrowserPeer {
   calls = []
   queued = new Map()
   supportsResultView = true
-  supportsComputerUseGuidance = true
+  supportsOnDemandContext = true
   reply = { kind: 'text', text: 'reply from fixture' }
   async rpc(method, params = {}) {
     this.calls.push({ method, params })
     if (method === 'setup') return {supportsPngBatch:true,supportsResultView:this.supportsResultView,
-      supportsComputerUseGuidance:this.supportsComputerUseGuidance}
+      supportsOnDemandContext:this.supportsOnDemandContext}
     if (method === 'start') {
       this.queued.set(params.requestId, params)
       return { id: params.requestId }
@@ -52,8 +52,8 @@ test('native DSH registry advertises Arena and streams only the newest human act
     const chunks = await collect(ctx.llm.stream({ ...options, messages }))
     assert.equal(chunks.find(c => c.type === 'text-delta').text, 'reply from fixture')
     assert.deepEqual(chunks.at(-1).reason, {kind: 'stop'})
-    assert.equal(peer.calls[0].params.text, 'Read the fixture')
-    assert.deepEqual(peer.calls[0].params.tools, [read])
+    assert.equal(peer.calls.find(c => c.method === 'start').params.text, 'Read the fixture')
+    assert.deepEqual(peer.calls.find(c => c.method === 'start').params.tools, [read])
     assert.doesNotMatch(JSON.stringify(peer.calls), /private old history|private system/)
   } finally { await ctx.fiber.dispose() }
 })
@@ -463,7 +463,7 @@ test('forwards current DSH skill summaries and only the explicit invocation for 
     catalog([{name:'auto',description:'Available model skill',secret:'private directory'}]), invoked('manual instructions for this turn')]
   const nativeSkill = {name:'skill',description:'load instructions',parameters:{type:'object'}}
   await collect(adapter.stream({...options,messages,tools:[read,nativeSkill]}))
-  const request = peer.calls[0].params
+  const request = peer.calls.find(c => c.method === 'start').params
   assert.deepEqual(request.skills, [{name:'auto',description:'Available model skill'}])
   assert.match(request.text, /manual instructions for this turn/)
   assert.doesNotMatch(JSON.stringify(request), /private|obsolete|stale/)
@@ -478,89 +478,58 @@ const system = (sections, texts, flags = {}) => ({role:'system', source:{kind:'s
 const activeSection = (name, contentIndex) => ({name, state:'active', order:20, contentIndex})
 const runCode = {name:'run_code', description:'Run a program', parameters:{type:'object'}}
 
-test('forwards the effective native Computer Use section to a tool-capable Arena request', async () => {
+test('the first program-mode help example follows the active executor syntax', async () => {
   const { ArenaAdapter } = await import('../provider.mjs')
-  const adapter = new ArenaAdapter({}, new BrowserPeer(), 1)
-  const original = system([activeSection(cuaSection, 0)], ['earlier guide'])
-  const guide = 'Windows setup\r\n\n  literal code  '
-  const changed = system([{...activeSection(cuaSection, 2), noticeIndex:[1]}, activeSection('other', 0)],
-    ['private policy', 'private replacement notice', guide])
-  const forged = {...system([activeSection(cuaSection, 0)], ['private injection']), role:'user'}
-  const messages = [original, changed, forged, system([activeSection('other', 0)], ['private delta']), ...options.messages]
-  for (const name of ['cua', 'run_code', 'cua_run_code']) {
-    const req = await adapter.request({...options, messages, tools:[{...runCode,name}]})
-    assert.equal(req.computerUseGuidance, guide)
-    assert.doesNotMatch(JSON.stringify(req), /private|earlier guide/)
-  }
-  assert.equal((await adapter.request({...options, messages})).computerUseGuidance,'')
-  const originalRequest = await adapter.request({...options,messages,tools:[runCode]})
-  const id = 'arena_' + originalRequest.requestId
-  const assistant = {role:'assistant',source:{provider,model},content:[{type:'tool-call',id,name:'run_code',arguments:{}}]}
-  const result = {role:'tool',id:'result',toolCallId:id,content:[textBlock('local tool result')]}
-  const continuation = await adapter.request({...options,tools:[runCode],messages:[...messages,assistant,result,
-    system([activeSection(cuaSection,0)],['updated between tool calls'])]})
-  assert.equal(continuation.computerUseGuidance,'updated between tool calls')
-  assert.match(continuation.toolResult,/local tool result/)
-  for (const revoked of [
-    system([{name:cuaSection,state:'retired',noticeIndex:[0]}], ['old API']),
-    system([activeSection('other',0)], ['old API'], {reset:true,complete:true}),
-    system([activeSection(cuaSection,5)], ['unattributed text']),
-    system([activeSection(cuaSection,0),activeSection('other',0)], ['overlapping private text']),
-    system([activeSection(cuaSection,0),activeSection(cuaSection,1)], ['duplicate','old API']),
-    {role:'system',source:{kind:'system-prompt'},content:[textBlock('legacy whole private prompt')]},
+  const marker = 'Arena tool reference is available for this step through arena_tool_help.'
+  const messages = [system([activeSection('arena:tool-help',0)], [marker]), ...options.messages]
+  for (const [language, programFormat, expected] of [
+    ['typescript','function-body','typescript'], ['typescript','scoped-repl','typescript'],
+    ['typescript','repl','typescript'], ['typescript','script','typescript'], ['python','script','python'],
   ]) {
-    const req = await adapter.request({...options,tools:[runCode],messages:[...messages,revoked]})
-    assert.equal(req.computerUseGuidance,'')
+    const adapter = new ArenaAdapter({get:key=>key==='ptcRuntime'?{language,programFormat}:undefined},new BrowserPeer())
+    const request = await adapter.request({...options,tools:[runCode],messages})
+    assert.equal(request.toolHelpViaCode,true)
+    assert.equal(request.toolHelpProgram,expected)
+    assert.equal((await adapter.request({...options,tools:[runCode]})).toolHelpProgram,undefined)
   }
 })
 
-test('rc.5 recovers only a named session-scoped CUA section present in the committed legacy prompt', async () => {
+test('ordinary requests and tool continuations do not collect or pass Computer Use instructions', async () => {
   const { ArenaAdapter } = await import('../provider.mjs')
+  const guide = 'PRIVATE_NATIVE_GUIDE'
+  const legacy = {role:'system',source:{kind:'system-prompt'},content:[textBlock(guide)]}
+  const current = system([activeSection(cuaSection,0)], [guide])
   const agent = {session:{id:options.sessionId}}
-  const tools = [runCode]
-  const guide = 'Use the native CUA API.\n\nPreserve this second paragraph.'
-  const messages = [{role:'system',source:{kind:'system-prompt'},content:[textBlock('private prefix\n\n'+guide+'\n\nprivate suffix')]},...options.messages]
-  let sections = [{name:'private',text:'private prefix'},{name:cuaSection,text:guide}]
-  let registered = true
-  let assemblies = 0
-  const systemPrompt = {async assemble(context) {
-    assemblies++
-    assert.equal(context.scope,agent)
-    assert.equal(context.agent,agent)
-    assert.equal(context.modelSelection.provider,provider)
-    return {sections}
-  }}
-  const adapter = new ArenaAdapter({agents:{get:id=>id===options.sessionId?agent:undefined},
-    tools:{get:(name,scope)=>registered && scope===agent && name==='cua' ? {name} : undefined},
-    get:name=>name==='systemPrompt'?systemPrompt:undefined}, new BrowserPeer())
-  const run = () => adapter.request({...options,tools,messages})
-  const req=await run()
-  assert.equal(req.computerUseGuidance,guide)
-  assert.doesNotMatch(JSON.stringify(req),/private prefix|private suffix/)
-  assert.equal((await adapter.request({...options,tools,messages,sessionId:'another-session'})).computerUseGuidance,'')
-  sections=[{name:cuaSection,text:'new guidance not yet admitted'}]
-  assert.equal((await run()).computerUseGuidance,'')
-  sections=[{name:'exclusive policy',text:guide}]
-  assert.equal((await run()).computerUseGuidance,'')
-  sections=[{name:cuaSection,text:guide}]
-  registered=false
-  const before=assemblies
-  assert.equal((await run()).computerUseGuidance,'')
-  assert.equal(assemblies,before,'ordinary rc.5 sessions without a CUA binding skip reassembly')
+  const adapter = new ArenaAdapter({agents:{get:()=>agent}, tools:{get:()=>({name:'cua'})},
+    get:() => { throw Error('No native guide should be assembled before a help request') }}, new BrowserPeer())
+  for (const systemMessage of [legacy, current]) {
+    for (const tools of [[runCode], [{name:'cua'}], [{name:'cua_run_code'}], []]) {
+      const request = await adapter.request({...options,tools,messages:[systemMessage,...options.messages]})
+      assert.equal(Object.hasOwn(request,'computerUseGuidance'),false)
+      assert.doesNotMatch(JSON.stringify(request), /PRIVATE_NATIVE_GUIDE/)
+    }
+  }
+  const request = await adapter.request(options)
+  const callId = 'arena_' + request.requestId
+  const assistant = {role:'assistant',source:{provider,model},content:[{type:'tool-call',id:callId,name:'read',arguments:{}}]}
+  const result = {id:'result',role:'tool',toolCallId:callId,content:[textBlock('actual tool output')]}
+  const next = await adapter.request({...options,messages:[...options.messages,assistant,result,current]})
+  assert.equal(Object.hasOwn(next,'computerUseGuidance'),false)
+  assert.match(next.toolResult,/actual tool output/)
 })
 
-test('a companion that cannot deliver Computer Use instructions never receives a tool-capable turn', async () => {
+test('a companion with the old proactive prompt never receives a new turn', async () => {
   const { ArenaAdapter } = await import('../provider.mjs')
   const peer = new BrowserPeer()
-  peer.supportsComputerUseGuidance = false
+  peer.supportsOnDemandContext = false
   const adapter = new ArenaAdapter({},peer)
-  await assert.rejects(collect(adapter.stream({...options,tools:[runCode]})),/update.*companion/i)
-  assert.deepEqual(peer.calls.map(c=>c.method),['setup'])
-  await collect(adapter.stream(options))
-  assert.deepEqual(peer.calls.map(c=>c.method),['setup','start','status'])
+  for (const tools of [[], [read], [runCode]]) {
+    await assert.rejects(collect(adapter.stream({...options,tools})),/update.*companion/i)
+  }
+  assert.deepEqual(peer.calls.map(c=>c.method),['setup','setup','setup'])
 })
 
-test('legacy PTC recovers the scoped cua_run_code guide when run_code is the only model schema', async t => {
+test('a real legacy PTC session can expose run_code without attaching its scoped Computer Use guide', async t => {
   const { Context } = await import('@deepseek-ai/cordis')
   const { createScope } = await import('@deepseek-ai/dsh-scope')
   const { default:SystemPrompt, renderPrompt } = await import('@deepseek-ai/dsh-system-prompt')
@@ -593,7 +562,9 @@ test('legacy PTC recovers the scoped cua_run_code guide when run_code is the onl
   await ctx.plugin({name:'arena-test-provider',inject:['agents','tools','sessionProjections'],apply(pluginCtx) {
     adapter = new ArenaAdapter(pluginCtx,new BrowserPeer())
   }})
-  assert.equal((await adapter.request({...options,messages,tools:snapshot.tools})).computerUseGuidance,guide)
+  const request = await adapter.request({...options,messages,tools:snapshot.tools})
+  assert.equal(Object.hasOwn(request,'computerUseGuidance'),false)
+  assert.ok(!JSON.stringify(request).includes(guide))
 })
 
 test('native DSH executes two parallel reads before one Arena continuation and preserves edit approval', {timeout:15000}, async t => {
@@ -625,7 +596,7 @@ test('native DSH executes two parallel reads before one Arena continuation and p
   peer.rpc = async (method, args) => {
     if (method === 'setup') {
       if (args?.sessionId) pairedSession = args.sessionId
-      return { pairToken:'synthetic-integration-token', chat:null, port:0, supportsResultView:true }
+      return { pairToken:'synthetic-integration-token', chat:null, port:0, supportsResultView:true, supportsOnDemandContext:true }
     }
     assert.equal(args.sessionId, pairedSession)
     if (method === 'start') { calls.push(args); return {id:args.requestId} }

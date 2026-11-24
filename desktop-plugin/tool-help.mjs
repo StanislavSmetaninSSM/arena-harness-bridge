@@ -1,13 +1,22 @@
 import { createHash } from 'node:crypto'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
-import { renderToolsSdk } from '@deepseek-ai/dsh-tool-executor-ptc'
 import { scopeChainOf } from '@deepseek-ai/dsh-scope'
 
 const name = 'arena_tool_help'
 const sectionName = 'arena:tool-help'
 const marker = 'Arena tool reference is available for this step through arena_tool_help.'
 const selection = {provider:'arena', model:'agent-mode'}
-const usage = 'Before using an unfamiliar Harness tool, look it up here. Omit arguments to list available names; use name for its documentation, guide for a listed shared instruction, or sdk:true for the native run_code guide. Repeat the same query with nextCursor as cursor for more.'
+export const batchName = 'arena_read_batch'
+export const batchTools = new Set(['read','glob','grep'])
+const cuaTopic = 'computer-use:dsh-cua'
+const cuaNames = ['cua','cua_run_code']
+const imageTopic = 'bridge:images'
+const literalScriptHelp = [
+  'For a multiline Desktop call, set "command":{"$text":"script"} in its JSON arguments.',
+  'In the same reply, put the literal command in one top-level fenced block opened by ```harness-text script and closed by ```.',
+  'For a one-line command, use its normal JSON string.',
+].join(' ')
+const usage = 'List the current tools and guide topics with {}. Use name for tool documentation, guide for a listed topic, or sdk:true for the native run_code SDK. Repeat the same query with nextCursor as cursor for more.'
 const parameters = {type:'object', additionalProperties:false, properties:{
   name:{type:'string',description:'Exact tool name from the current list.'},
   guide:{type:'string',description:'Published tool instruction ID from the current list.'},
@@ -20,7 +29,7 @@ const outputSchema = {type:'object', additionalProperties:false, required:['text
 
 // alpha.2 journals named section updates. rc.5 commits one flat system
 // message; callers must verify their own expected section in that message.
-export function committedSection(messages, sectionName) {
+function committedSection(messages, sectionName) {
   for (let index = messages.length - 1; index >= 0; index--) {
     const row = messages[index]
     if (row.role !== 'system') continue
@@ -68,22 +77,51 @@ function page(document, topic, cursor) {
   return {text:chars.slice(start,end).join(''), nextCursor:end<chars.length ? signature+':'+end : null}
 }
 
-// Harness publishes both per-tool and shared tool:* instructions. It has no
-// family membership field. Keep every published shared topic discoverable by
-// its own ID. Name matching only selects convenient inline suggestions.
-function reference(ctx, assembly, visible, agent, args) {
+function currentSkills(agent) {
+  const catalog = agent.session.deriveMessages().findLast(row => row.role === 'user' &&
+    row.source?.kind === 'skill-catalog' && row.source.form === 'catalog')
+  const entries = catalog?.source.entries
+  return Array.isArray(entries) ? entries.filter(entry => typeof entry?.name === 'string' &&
+    typeof entry.description === 'string') : []
+}
+
+function batchReference(members) {
+  const member = {
+    type:'object', additionalProperties:false, required:['name','arguments'],
+    properties:{name:{enum:members},arguments:{type:'object'}},
+  }
+  return JSON.stringify({
+    name:batchName,
+    description:'Send two or more independent text inspections in one Desktop call. Use the native arguments for each tool. Results arrive in call order with individual IDs, status and output.',
+    parameters:{type:'object', additionalProperties:false, required:['calls'],
+      properties:{calls:{type:'array',minItems:2,items:member}}},
+  },null,2)
+}
+
+// Harness publishes per-tool and shared tool:* instructions without a family
+// membership field. Shared topics are discoverable by their own section IDs.
+function reference(ctx, assembly, visible, agent, args, bindingSdk) {
   const runCode = assembly.tools.find(tool => tool.name === 'run_code')
   const active = assembly.sections.filter(section => !section.retire && !section.complete && section.text?.trim())
   const render = section => renderPrompt({...assembly, sections:[section]})
+  const hasCua = cuaNames.some(toolName => visible.has(toolName))
+  // The bridge's batch and literal script forms operate on direct wire calls.
+  const direct = new Set(assembly.tools.map(tool => tool.name))
+  const batchMembers = [...batchTools].filter(toolName => direct.has(toolName) && visible.has(toolName)).sort()
+  const cua = hasCua && active.find(section => section.name === cuaTopic)
+  const cuaHelp = () => cua ? render(cua) : 'Computer Use guidance is unavailable in this step. Wait for current guidance before using Computer Use.'
   // A scope mask also hides a registration from get(name, agent). Check its
   // declaring ancestors before treating the same ID as an independent guide.
   const scopes = [...scopeChainOf(agent), undefined]
   const guides = active.filter(section => {
     if (!section.name.startsWith('tool:')) return false
     const owner = section.name.slice(5)
+    if (cuaNames.includes(owner)) return visible.has(owner)
     return visible.has(owner) || !scopes.some(scope => ctx.tools.get(owner, scope))
   })
   if (args.guide !== undefined) {
+    if (args.guide === cuaTopic) return cuaHelp()
+    if (args.guide === imageTopic) return "For image generation, use Arena's own image tool and include the image in your final answer for Desktop."
     const guide = guides.find(section => section.name === args.guide)
     return guide ? render(guide) : 'Tool guide unavailable. Request {} for published topics.'
   }
@@ -95,36 +133,59 @@ function reference(ctx, assembly, visible, agent, args) {
   }
   if (args.name === undefined) {
     const names = new Set(visible.keys())
+    if (!runCode) names.delete(batchName)
+    if (batchMembers.length) names.add(batchName)
     if (runCode) names.add(runCode.name)
-    const intro = runCode ? 'Inside run_code use await tools[name](args). The direct transport is run_code.'
+    const intro = runCode ? 'Inside run_code use await tools[name](args). Request {sdk:true} for the program SDK.'
       : 'Use the listed Harness tools directly.'
-    const topics = guides.map(section => section.name).sort()
-    return [intro, ...[...names].sort(), '', 'Published instructions (request with guide):', ...topics].join('\n')
+    const topics = [imageTopic,...guides.map(section => section.name)]
+    if (cua) topics.push(cuaTopic)
+    const lines = [intro, 'Tools (request with name):', ...[...names].sort(), '',
+      'Published instructions (request with guide):', ...topics.sort()]
+    if (visible.has('skill')) lines.push('', 'For available skills, request {name:"skill"}.')
+    return lines.join('\n')
+  }
+  if (args.name === batchName && !runCode) {
+    if (!batchMembers.length) return 'Tool unavailable in this step. Request the current list with {}.'
+    return args.sdk ? 'The read batch is a direct Desktop call.' : batchReference(batchMembers)
   }
   const tool = definition ?? (args.name === runCode?.name ? runCode : undefined)
   if (!tool) return 'Tool unavailable in this step. Request the current list with {}.'
   const entry = {name:tool.name, description:tool.description, parameters:tool.parameters}
   const parts = []
-  if (definition && sdk) {
-    const native = renderToolsSdk([{...entry, output:definition.output.schema}], ctx.get('ptcRuntime')?.programFormat)
+  if (definition && sdk && bindingSdk) {
     // A presentation shortcut only. When the native renderer changes its
     // layout, the lossless per-binding SDK remains available in full.
-    const outputMap = /^interface ToolOutputMap \{[\s\S]*?^\}/m.exec(native)?.[0]
-    if (args.sdk) return outputMap ? outputMap+'\n\n'+native : native
+    const outputMap = /^interface ToolOutputMap \{[\s\S]*?^\}/m.exec(bindingSdk)?.[0]
+    if (args.sdk) return outputMap ? outputMap+'\n\n'+bindingSdk : bindingSdk
     if (outputMap) parts.push('Return value inside run_code:\n'+outputMap)
     else parts.push('Request {name, sdk:true} for this binding\'s native program types.')
   } else if (args.sdk) {
     return 'No program executor SDK is available in this step.'
   }
   if (definition) entry.canonicalOutput = definition.output.schema
-  const words = new Set(args.name.toLowerCase().split(/[_-]/))
-  for (const section of guides) {
-    const group = section.name.slice(5).toLowerCase()
-    const mentioned = section.text.match(/[\p{L}\p{N}_-]+/gu)?.includes(args.name)
-    if (group === args.name || words.has(group) || mentioned) parts.push(section.name+'\n'+render(section))
+  if (cuaNames.includes(args.name)) parts.push(cuaHelp())
+  if (args.name === 'pwsh' && direct.has('pwsh')) parts.push(literalScriptHelp)
+  if (args.name === 'skill') {
+    const skills = currentSkills(agent)
+    parts.push(skills.length ? ['Available skills:',...skills.map(entry => entry.name+' — '+entry.description)].join('\n') : 'No skills are listed in the current catalog.')
   }
+  const guide = guides.find(section => section.name === 'tool:'+args.name)
+  if (guide) parts.push(guide.name+'\n'+render(guide))
   parts.push(JSON.stringify(entry,null,2))
   return parts.join('\n\n')
+}
+
+// Let the scoped executor render the binding using its actual language, program
+// format and return-value adaptation. Only narrow the real step's live view.
+async function singleBindingSdk(ctx, context, toolName) {
+  const toolSet = {...context.toolSet, view(scope) {
+    const tool = context.toolSet.view(scope).get(toolName)
+    return new Map(tool ? [[toolName,tool]] : [])
+  }}
+  const assembly = await ctx.systemPrompt.assemble({...context,toolSet})
+  const section = assembly.sections.find(item => item.name === 'tools:sdk' && !item.retire && !item.complete && item.text?.trim())
+  return section && renderPrompt({...assembly,sections:[section]})
 }
 
 export function registerToolHelp(ctx) {
@@ -143,13 +204,17 @@ export function registerToolHelp(ctx) {
         (args.guide!==undefined && (typeof args.guide!=='string' || args.name!==undefined || args.sdk===true)))
       throw Error('Use {}, {name}, {guide}, or {sdk:true}, optionally with a name for the SDK and a page cursor.')
     signal.throwIfAborted()
-    const assembly = await ctx.systemPrompt.assemble({agent,scope:agent,session:agent.session,toolSet,signal,modelSelection:selection})
+    const context = {agent,scope:agent,session:agent.session,toolSet,signal,modelSelection:selection}
+    const assembly = await ctx.systemPrompt.assemble(context)
+    signal.throwIfAborted()
+    const bindingSdk = admitted.has(args.name) && assembly.tools.some(tool => tool.name === 'run_code')
+      ? await singleBindingSdk(ctx,context,args.name) : undefined
     signal.throwIfAborted()
     const visible = toolSet.view(agent)
     if (visible.get(name)!==help) throw Error('Tool help is no longer available in this step.')
     if (visible.size !== admitted.size || [...admitted].some(([key, definition]) => visible.get(key) !== definition))
       throw Error('The set of admitted tools changed while preparing help. Request the current page again.')
-    return page(reference(ctx,assembly,visible,agent,args), [args.name??null,args.guide??null,args.sdk===true], args.cursor)
+    return page(reference(ctx,assembly,visible,agent,args,bindingSdk), [args.name??null,args.guide??null,args.sdk===true], args.cursor)
   }}
   ctx.tools.register(help,{when:({modelSelection})=>modelSelection.provider===selection.provider && modelSelection.model===selection.model})
   ctx.systemPrompt.section({name:sectionName,order:ctx.systemPrompt.getSectionOrder('TOOLS_SDK'),interpolate:false,

@@ -27,7 +27,7 @@ async function desktop(t, mount) {
   let answer = () => ({ kind: 'text', text: 'End of test step.' })
   const companion = {
     async rpc(method, args) {
-      if (method === 'setup') return {supportsResultView:true}
+      if (method === 'setup') return {supportsResultView:true,supportsOnDemandContext:true}
       if (method === 'start') {
         calls.push(args)
         replies.set(args.requestId, answer(args, calls.length))

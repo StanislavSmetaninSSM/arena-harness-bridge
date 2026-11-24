@@ -1,6 +1,7 @@
 """Loopback-only extension interface. Operator approval has no HTTP endpoint."""
 import hmac
 import json
+import os
 import re
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,9 @@ from .journal import Problem
 
 class Endpoint(ThreadingHTTPServer):
     daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second process bind a port that is already
+    # being served: it starts without an error and never receives a request.
+    allow_reuse_address = os.name != "nt"
 
 
 class ExtensionHandler(BaseHTTPRequestHandler):

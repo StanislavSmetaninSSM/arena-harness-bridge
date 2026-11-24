@@ -1318,6 +1318,12 @@ class DesktopProviderTests(unittest.TestCase):
             self.db.poll(dict(self.addr,supportsNativeQuestions=True,nativeQuestionId="site-card"),False)
         self.assertIsNone(self.db.lease())
 
+    def test_a_second_endpoint_on_the_same_port_is_refused(self):
+        # Windows grants this bind when SO_REUSEADDR is set. The second companion then runs and receives nothing.
+        with Endpoint(("127.0.0.1",0),ExtensionHandler) as first:
+            with self.assertRaises(OSError):
+                Endpoint(("127.0.0.1",first.server_port),ExtensionHandler).server_close()
+
     @contextmanager
     def extension_client(self):
         with Endpoint(("127.0.0.1",0),ExtensionHandler) as server:

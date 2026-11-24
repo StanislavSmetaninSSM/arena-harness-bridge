@@ -21,9 +21,13 @@ export class Companion {
     const fail = () => {
       if (this.child !== child) return
       this.child = null
-      const occupied = /10048|EADDRINUSE|address already in use|port 8766/i.test(diagnostic)
-      const error = Error(occupied ? 'Port 8766 is busy. Stop the standalone Arena terminal, then open Connect Arena again.'
-        : 'Arena bridge companion disconnected. Check Python, the bridge installation path, and Connect Arena.')
+      let message = 'Arena bridge companion disconnected. Check Python, the bridge installation path, and Connect Arena.'
+      if (/\bWinError\s+10013\b/i.test(diagnostic)) {
+        message = 'Windows denied access to port 8766 (WinError 10013). Check whether another service has reserved the port or Windows restricts its use, then open Connect Arena again.'
+      } else if (/\b10048\b|EADDRINUSE|address already in use|port 8766/i.test(diagnostic)) {
+        message = 'Port 8766 is busy. Stop the standalone Arena terminal or the other program using this port, then open Connect Arena again.'
+      }
+      const error = Error(message)
       for (const { reject } of this.pending.values()) reject(error)
       this.pending.clear()
       lines.close()

@@ -589,6 +589,47 @@ class DesktopProviderTests(unittest.TestCase):
             self.assertNotIn("Arena-Harness-Call",guidance)
             self.assertNotIn("WordPad",guidance)
 
+    def test_computer_use_guidance_follows_the_acknowledged_catalog_and_tool_continuations(self):
+        guide = "First line.\n\ninspect(await cua.getCapabilities())"
+        request = dict(self.request, computerUseGuidance=guide)
+        self.db.start(request)
+        first = self.db.poll(self.addr, True)
+        self.assertIn(json.dumps(guide, ensure_ascii=False), first["text"])
+        self.assertEqual(first["text"].split("\n\n", 1)[1].split("\n", 1)[0], "read file")
+        self.send_raw(first["id"], tool_call(first["id"]).split("\n")[1])
+        continuation = dict(request, requestId="continued", text="", toolResult=json.dumps(
+            {"toolCallId":"arena_first", "failed":False, "text":"read result"}))
+        updated = guide + "\nUpdated rule."
+        self.db.start(dict(continuation, computerUseGuidance=updated))
+        self.db.start(dict(continuation, computerUseGuidance="another revision after admission"))
+        # Drop all in-memory context, as on a companion restart.
+        self.db.use_catalog(None)
+        child = self.db.poll(self.addr, True)
+        self.assertTrue(child["text"].startswith("DeepSeek Harness tool result:"))
+        self.assertIn(json.dumps(updated, ensure_ascii=False), child["text"])
+        self.assertNotIn("another revision", child["text"])
+        self.assertNotIn(json.dumps(guide, ensure_ascii=False), child["text"])
+        self.send_raw(child["id"], tool_call(child["id"]).split("\n")[1], event_id="second-answer")
+        next_result = dict(continuation, requestId="retired", computerUseGuidance="", toolResult=json.dumps(
+            {"toolCallId":"arena_continued", "failed":False, "text":"another read result"}))
+        self.db.start(next_result)
+        retired = self.db.poll(self.addr, True)
+        self.assertIn("Computer Use guidance is unavailable", retired["text"])
+        self.assertNotIn("Updated rule", retired["text"])
+        self.db.event(dict(self.addr, id="retired-sent",kind="sent",job=retired["id"]))
+        self.db.event(dict(self.addr, id="completed",kind="assistant",text="Ready"))
+        self.db.start(dict(request,requestId="next",computerUseGuidance="",text="Follow up"))
+        self.assertNotIn("Computer Use guidance", self.db.poll(self.addr,True)["text"])
+
+    def test_changed_guidance_must_fit_before_a_continuation_is_queued(self):
+        self.db.start(dict(self.request, computerUseGuidance="small section"))
+        self.complete()
+        request = dict(self.request, requestId="continued",text="",computerUseGuidance="x"*180000,
+                       toolResult=json.dumps({"toolCallId":"arena_first","failed":False,"text":"read result"}))
+        with self.assertRaisesRegex(Problem,"limit"):
+            self.db.start(request)
+        self.assertIsNone(self.db.poll(self.addr,True))
+
     def test_local_tool_handoff_is_available_after_the_catalog_is_acknowledged(self):
         self.db.start(self.request)
         first = self.db.poll(self.addr, True)

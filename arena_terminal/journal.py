@@ -292,12 +292,14 @@ class Journal:
 
     def context(self):
         with self.lock:
-            if not self.catalog:
-                return None
-            digest = hashlib.sha256(self.catalog.encode()).hexdigest()
+            return self.pending_catalog(self.catalog)
+
+    def pending_catalog(self, instructions):
+        if instructions:
+            digest = hashlib.sha256(instructions.encode()).hexdigest()
             if not self.one("SELECT digest FROM catalog WHERE digest=?", (digest,)):
-                return {"id": digest, "text": self.catalog}
-            return None
+                return {"id": digest, "text": instructions}
+        return None
 
     def acknowledge_context(self, digest):
         if digest:
@@ -390,12 +392,17 @@ class Journal:
                 pngs = [base64.b64encode(image["bytes"]).decode("ascii") for image in images]
                 if pngs:
                     job["pngs"] = pngs
-                meta = self.context() if not row["parent"] else None
-                if not self.catalog and not row["parent"]:
-                    meta = self.one("""SELECT digest AS id,text FROM outgoing_context WHERE job=?
-                                       AND digest NOT IN (SELECT digest FROM catalog)""", (row["id"],))
+                # Desktop snapshots changed context at admission, including on a tool continuation.
+                # The standalone terminal can also supply its current catalog at poll time.
+                meta = self.one("""SELECT digest AS id,text FROM outgoing_context WHERE job=?
+                                   AND digest NOT IN (SELECT digest FROM catalog)""", (row["id"],))
+                if not meta and not row["parent"]:
+                    meta = self.context()
                 if meta:
-                    job["text"] = meta["text"] + "\n\n" + job["text"]
+                    if row["parent"]:
+                        job["text"] += "\n\n" + meta["text"]
+                    else:
+                        job["text"] = meta["text"] + "\n\n" + job["text"]
                     self.sql.execute("INSERT OR REPLACE INTO outgoing_context VALUES(?,?,?)", (row["id"], meta["id"], meta["text"]))
                 if len(job["text"]) > 180000:
                     self.sql.execute("UPDATE jobs SET state='limited' WHERE id=?", (row["id"],))

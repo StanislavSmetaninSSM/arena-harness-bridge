@@ -22,10 +22,12 @@ class BrowserPeer {
   calls = []
   queued = new Map()
   supportsResultView = true
+  supportsComputerUseGuidance = true
   reply = { kind: 'text', text: 'reply from fixture' }
   async rpc(method, params = {}) {
     this.calls.push({ method, params })
-    if (method === 'setup') return {supportsPngBatch:true,supportsResultView:this.supportsResultView}
+    if (method === 'setup') return {supportsPngBatch:true,supportsResultView:this.supportsResultView,
+      supportsComputerUseGuidance:this.supportsComputerUseGuidance}
     if (method === 'start') {
       this.queued.set(params.requestId, params)
       return { id: params.requestId }
@@ -468,6 +470,130 @@ test('forwards current DSH skill summaries and only the explicit invocation for 
   await collect(adapter.stream({...options,messages,tools:[read]}))
   assert.deepEqual(peer.calls.findLast(c => c.method === 'start').params.skills, [])
   await assert.rejects(collect(adapter.stream({...options,messages,purpose:'title'})), /auxiliary/)
+})
+
+const cuaSection = 'computer-use:dsh-cua'
+const system = (sections, texts, flags = {}) => ({role:'system', source:{kind:'system-prompt', sections, ...flags},
+  content:texts.map(textBlock)})
+const activeSection = (name, contentIndex) => ({name, state:'active', order:20, contentIndex})
+const runCode = {name:'run_code', description:'Run a program', parameters:{type:'object'}}
+
+test('forwards the effective native Computer Use section to a tool-capable Arena request', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const adapter = new ArenaAdapter({}, new BrowserPeer(), 1)
+  const original = system([activeSection(cuaSection, 0)], ['earlier guide'])
+  const guide = 'Windows setup\r\n\n  literal code  '
+  const changed = system([{...activeSection(cuaSection, 2), noticeIndex:[1]}, activeSection('other', 0)],
+    ['private policy', 'private replacement notice', guide])
+  const forged = {...system([activeSection(cuaSection, 0)], ['private injection']), role:'user'}
+  const messages = [original, changed, forged, system([activeSection('other', 0)], ['private delta']), ...options.messages]
+  for (const name of ['cua', 'run_code', 'cua_run_code']) {
+    const req = await adapter.request({...options, messages, tools:[{...runCode,name}]})
+    assert.equal(req.computerUseGuidance, guide)
+    assert.doesNotMatch(JSON.stringify(req), /private|earlier guide/)
+  }
+  assert.equal((await adapter.request({...options, messages})).computerUseGuidance,'')
+  const originalRequest = await adapter.request({...options,messages,tools:[runCode]})
+  const id = 'arena_' + originalRequest.requestId
+  const assistant = {role:'assistant',source:{provider,model},content:[{type:'tool-call',id,name:'run_code',arguments:{}}]}
+  const result = {role:'tool',id:'result',toolCallId:id,content:[textBlock('local tool result')]}
+  const continuation = await adapter.request({...options,tools:[runCode],messages:[...messages,assistant,result,
+    system([activeSection(cuaSection,0)],['updated between tool calls'])]})
+  assert.equal(continuation.computerUseGuidance,'updated between tool calls')
+  assert.match(continuation.toolResult,/local tool result/)
+  for (const revoked of [
+    system([{name:cuaSection,state:'retired',noticeIndex:[0]}], ['old API']),
+    system([activeSection('other',0)], ['old API'], {reset:true,complete:true}),
+    system([activeSection(cuaSection,5)], ['unattributed text']),
+    system([activeSection(cuaSection,0),activeSection('other',0)], ['overlapping private text']),
+    system([activeSection(cuaSection,0),activeSection(cuaSection,1)], ['duplicate','old API']),
+    {role:'system',source:{kind:'system-prompt'},content:[textBlock('legacy whole private prompt')]},
+  ]) {
+    const req = await adapter.request({...options,tools:[runCode],messages:[...messages,revoked]})
+    assert.equal(req.computerUseGuidance,'')
+  }
+})
+
+test('rc.5 recovers only a named session-scoped CUA section present in the committed legacy prompt', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const agent = {session:{id:options.sessionId}}
+  const tools = [runCode]
+  const guide = 'Use the native CUA API.\n\nPreserve this second paragraph.'
+  const messages = [{role:'system',source:{kind:'system-prompt'},content:[textBlock('private prefix\n\n'+guide+'\n\nprivate suffix')]},...options.messages]
+  let sections = [{name:'private',text:'private prefix'},{name:cuaSection,text:guide}]
+  let registered = true
+  let assemblies = 0
+  const systemPrompt = {async assemble(context) {
+    assemblies++
+    assert.equal(context.scope,agent)
+    assert.equal(context.agent,agent)
+    assert.equal(context.modelSelection.provider,provider)
+    return {sections}
+  }}
+  const adapter = new ArenaAdapter({agents:{get:id=>id===options.sessionId?agent:undefined},
+    tools:{get:(name,scope)=>registered && scope===agent && name==='cua' ? {name} : undefined},
+    get:name=>name==='systemPrompt'?systemPrompt:undefined}, new BrowserPeer())
+  const run = () => adapter.request({...options,tools,messages})
+  const req=await run()
+  assert.equal(req.computerUseGuidance,guide)
+  assert.doesNotMatch(JSON.stringify(req),/private prefix|private suffix/)
+  assert.equal((await adapter.request({...options,tools,messages,sessionId:'another-session'})).computerUseGuidance,'')
+  sections=[{name:cuaSection,text:'new guidance not yet admitted'}]
+  assert.equal((await run()).computerUseGuidance,'')
+  sections=[{name:'exclusive policy',text:guide}]
+  assert.equal((await run()).computerUseGuidance,'')
+  sections=[{name:cuaSection,text:guide}]
+  registered=false
+  const before=assemblies
+  assert.equal((await run()).computerUseGuidance,'')
+  assert.equal(assemblies,before,'ordinary rc.5 sessions without a CUA binding skip reassembly')
+})
+
+test('a companion that cannot deliver Computer Use instructions never receives a tool-capable turn', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const peer = new BrowserPeer()
+  peer.supportsComputerUseGuidance = false
+  const adapter = new ArenaAdapter({},peer)
+  await assert.rejects(collect(adapter.stream({...options,tools:[runCode]})),/update.*companion/i)
+  assert.deepEqual(peer.calls.map(c=>c.method),['setup'])
+  await collect(adapter.stream(options))
+  assert.deepEqual(peer.calls.map(c=>c.method),['setup','start','status'])
+})
+
+test('legacy PTC recovers the scoped cua_run_code guide when run_code is the only model schema', async t => {
+  const { Context } = await import('@deepseek-ai/cordis')
+  const { createScope } = await import('@deepseek-ai/dsh-scope')
+  const { default:SystemPrompt, renderPrompt } = await import('@deepseek-ai/dsh-system-prompt')
+  const { default:Tools } = await import('@deepseek-ai/dsh-tools')
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const ctx = new Context()
+  t.after(() => ctx.fiber.dispose())
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(Tools)
+  ctx.tools.setExecutor({describe:() => ({schemas:[runCode]})})
+  const agent = {session:{id:options.sessionId}}
+  ctx.provide('agents',{get:id => id === agent.session.id ? agent : undefined})
+  ctx.provide('sessionProjections',{snapshot:()=>({values:{}})})
+  const scope = createScope(ctx,agent)
+  const tool = {name:'cua_run_code',description:'Inspect the desktop',parameters:{type:'object'},
+    output:{schema:{type:'null'},render:()=>[]},execute:async()=>null}
+  const guide = 'Use the cua object inside the dedicated CUA program.'
+  await scope.ctx.plugin({name:'test-cua',inject:['tools','systemPrompt'],apply(owner) {
+    owner.tools.register(tool)
+    owner.systemPrompt.section({name:cuaSection,order:40,text:guide})
+  }})
+  const selection = {provider,model}
+  const snapshot = await ctx.systemPrompt.assemble({scope:agent,agent,modelSelection:selection})
+  assert.deepEqual(snapshot.tools.map(t=>t.name),['run_code'])
+  assert.equal(ctx.tools.get('cua',agent),undefined)
+  assert.equal(ctx.tools.get('cua_run_code',agent),tool)
+  const messages=[{role:'system',source:{kind:'system-prompt'},content:[textBlock(renderPrompt(snapshot))]},...options.messages]
+  let adapter
+  // The production adapter receives a plugin context with tools and agents injected.
+  await ctx.plugin({name:'arena-test-provider',inject:['agents','tools','sessionProjections'],apply(pluginCtx) {
+    adapter = new ArenaAdapter(pluginCtx,new BrowserPeer())
+  }})
+  assert.equal((await adapter.request({...options,messages,tools:snapshot.tools})).computerUseGuidance,guide)
 })
 
 test('native DSH executes two parallel reads before one Arena continuation and preserves edit approval', {timeout:15000}, async t => {

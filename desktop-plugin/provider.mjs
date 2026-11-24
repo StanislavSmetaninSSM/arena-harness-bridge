@@ -16,6 +16,49 @@ const batchName = 'arena_read_batch'
 const batchTools = new Set(['read', 'glob', 'grep'])
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const isBatch = items => Array.isArray(items) && items.length >= 2
+const cuaSectionName = 'computer-use:dsh-cua'
+const cuaToolNames = new Set(['cua', 'cua_run_code', 'run_code'])
+
+// rc.5 commits a single flattened system message. Obtain the named section
+// from the same Agent's native assembly and require it in that committed text.
+async function legacyCuaGuidance(ctx, agent, options, message) {
+  if (!agent || message.content?.length !== 1 || message.content[0]?.type !== 'text') return ''
+  // PTC can wrap either scoped CUA tool behind the single run_code schema.
+  if (!options.tools?.some(tool => tool.name === 'cua' || tool.name === 'cua_run_code') &&
+      !ctx.tools?.get('cua',agent) && !ctx.tools?.get('cua_run_code',agent)) return ''
+  const service = ctx.get?.('systemPrompt')
+  if (!service) return ''
+  const assembly = await service.assemble({agent, scope:agent, signal:options.signal,
+    modelSelection:{provider:options.provider,model:options.model}})
+  const sections = assembly.sections.filter(section => section.name === cuaSectionName)
+  if (sections.length !== 1) return ''
+  const guide = sections[0].text
+  if (typeof guide !== 'string' || !guide.trim()) return ''
+  return ('\n\n' + message.content[0].text + '\n\n').includes('\n\n' + guide + '\n\n') ? guide : ''
+}
+
+async function computerUseGuidance(ctx, agent, options) {
+  for (let i = options.messages.length - 1; i >= 0; i--) {
+    const row = options.messages[i]
+    if (row.role !== 'system') continue
+    if (row.source?.kind !== 'system-prompt') return ''
+    const sections = row.source.sections
+    if (sections === undefined) return legacyCuaGuidance(ctx,agent,options,row)
+    if (!Array.isArray(sections)) return ''
+    const matching = sections.filter(section => section?.name === cuaSectionName)
+    if (matching.length) {
+      const section = matching[0]
+      const index = section.contentIndex
+      if (matching.length !== 1 || section.state !== 'active' || !Number.isInteger(index) || index < 0 ||
+          sections.some(other => other !== section && other?.contentIndex === index ||
+            Array.isArray(other?.noticeIndex) && other.noticeIndex.includes(index))) return ''
+      const block = row.content?.[index]
+      return block?.type === 'text' && typeof block.text === 'string' && block.text.trim() ? block.text : ''
+    }
+    if (row.source.reset || row.source.complete) return ''
+  }
+  return ''
+}
 
 async function storeGeneratedImages(ctx, images, signal) {
   if (!Array.isArray(images) || images.length < 1 || images.length > maxGeneratedImages)
@@ -151,6 +194,8 @@ export class ArenaAdapter extends LlmAdapter {
     // The Desktop preset owns Plan Mode. Read the same committed session projection
     // as Desktop, so a pending selection takes effect at the next step boundary.
     const agent = this.ctx.agents?.get(options.sessionId)
+    request.computerUseGuidance = tools.some(tool => cuaToolNames.has(tool.name))
+      ? await computerUseGuidance(this.ctx, agent, options) : ''
     const planMode = agent && this.ctx.sessionProjections?.snapshot(agent.session, ['plan']).values.plan?.active
     if (typeof planMode === 'boolean') request.planMode = planMode
     if (results) {
@@ -203,8 +248,11 @@ export class ArenaAdapter extends LlmAdapter {
     const address = { id: request.requestId, sessionId: request.sessionId }
     let reply
     signal?.throwIfAborted()
-    if (request.pngs || request.toolResultView) {
+    const needsGuidanceSupport = request.tools.some(tool => cuaToolNames.has(tool.name))
+    if (request.pngs || request.toolResultView || needsGuidanceSupport) {
       const setup = await this.companion.rpc('setup')
+      if (needsGuidanceSupport && setup?.supportsComputerUseGuidance !== true)
+        throw Error('Update the Arena bridge companion to deliver native Computer Use instructions')
       if (request.pngs && setup?.supportsPngBatch !== true) throw Error('Update the Arena bridge companion to send multiple images in one turn')
       if (setup?.supportsResultView !== true) delete request.toolResultView
       signal?.throwIfAborted()

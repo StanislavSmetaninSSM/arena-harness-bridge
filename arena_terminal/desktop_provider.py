@@ -344,10 +344,22 @@ class DesktopJournal(Journal):
                    "Use Desktop tools for local project or computer operations, and ask_user_question for "
                    "questions to the Desktop user when available. Native tool catalog: " + schema
                    + "\nAvailable skills: " + json.dumps(skill_list,ensure_ascii=False))
+        guidance = request.get("computerUseGuidance")
+        if "computerUseGuidance" in request:
+            if not isinstance(guidance, str):
+                raise Problem("Expected Desktop Computer Use guidance as text")
+            # Keep the catalog a single paragraph: the browser uses its blank line to locate the user prompt.
+            if guidance:
+                context += ("\nCurrent Desktop Computer Use instructions (replace earlier instructions for this tool): "
+                            + json.dumps(guidance, ensure_ascii=False))
+            else:
+                context += ("\nComputer Use guidance is unavailable in this Desktop session. "
+                            "Disregard earlier Computer Use instructions. If a task needs GUI control, "
+                            "report that the instructions are unavailable and leave the desktop untouched.")
         # Capability negotiation affects the initial catalog only. Replaying a
         # previously admitted request must retain its original catalog and ID.
         presentation = request.get("toolResultView")
-        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView"))
+        fingerprint = request_fingerprint(request, ("supportsReadBatch", "toolResultView", "computerUseGuidance"))
         with self.lock, self.sql:
             owner = self.one("SELECT id FROM desktop_session")
             if not owner or owner["id"] != session:
@@ -360,7 +372,7 @@ class DesktopJournal(Journal):
             if old:
                 # Older companions may have included a presentation or capability hint in the digest.
                 if old["session"] != session or (old["fingerprint"] != fingerprint and not any(
-                    old["fingerprint"] == request_fingerprint(request, omitted)
+                    old["fingerprint"] == request_fingerprint(request, (*omitted, "computerUseGuidance"))
                     for omitted in ((), ("supportsReadBatch",), ("toolResultView",))
                 )):
                     raise Problem("Desktop request ID reused with different content")
@@ -412,13 +424,11 @@ class DesktopJournal(Journal):
                     raise Problem("Expected a message of at most 180000 characters")
                 if tools:
                     text += "\n\n" + handoff
-            if len(text) + (0 if result else len(context)) > 180000:
-                raise Problem("Message and native tool instructions exceed the bridge text limit")
+            meta = self.pending_catalog(context) if selection is None and (not prior_job or guidance is not None) else None
             if selection is None and plan_mode is not None:
                 text += "\n\n" + (PLAN_ACTIVE if plan_mode else PLAN_INACTIVE)
-                catalog_chars = 0 if result else len(context) + 2
-                if len(text) + catalog_chars > 180000:
-                    raise Problem("Message and native tool instructions exceed the bridge text limit")
+            if len(text) + (len(meta["text"]) + 2 if meta else 0) > 180000:
+                raise Problem("Message and native tool instructions exceed the bridge text limit")
             if self.paused():
                 raise Problem(self.paused())
             if self.one("SELECT id FROM jobs WHERE state NOT IN ('done','superseded')"):
@@ -430,7 +440,7 @@ class DesktopJournal(Journal):
             if len(images) > 1:
                 self.sql.executemany("INSERT INTO outgoing_pngs(job,position,bytes) VALUES(?,?,?)",
                                      ((job, index, raw) for index, raw in enumerate(images)))
-            if not prior_job and (meta := self.context()):
+            if meta:
                 # A queued turn can outlive the companion that constructed its native catalog.
                 self.sql.execute("INSERT INTO outgoing_context VALUES(?,?,?)", (job,meta["id"],meta["text"]))
             names = json.dumps([t["name"] for t in tools])
@@ -790,7 +800,7 @@ def serve():
                         with db.lock:
                             bound = db.one("SELECT chat FROM binding")
                         result = {"chat":bound["chat"] if bound else None, "port":8766, "supportsPngBatch":True,
-                                  "supportsResultView":True, "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
+                                  "supportsResultView":True, "supportsComputerUseGuidance":True, "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
                         if "sessionId" in params:
                             result["pairToken"] = pair
                     elif method == "start":

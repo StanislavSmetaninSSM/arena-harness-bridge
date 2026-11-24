@@ -12,7 +12,7 @@ The suite is skipped unless ARENA_DSH_PREFIX names an npm prefix holding both pa
     ARENA_DSH_PREFIX=<dir> python -m unittest test_headless_harness
 
 --install-links copies the plugin, so repeat the second command after editing desktop-plugin/.
-Use a Node version supported by the Harness under test. Node 24.22.3 works for both release targets. Port 8766 must be free.
+Use a Node version supported by the Harness under test. Node 24.22.3 works for both release targets.
 The release builder runs --release-check with the packaged plugin and treats skipped cases as failures.
 """
 import hmac
@@ -36,13 +36,12 @@ from arena_terminal.desktop_provider import DesktopJournal
 REPOSITORY = Path(__file__).resolve().parent
 PREFIX = os.environ.get("ARENA_DSH_PREFIX")
 RELEASE_CHECK = __name__ == "__main__" and sys.argv[1:] == ["--release-check"]
-PORT = 8766
 CHAT, TAB = "https://arena.ai/agent/headless-test", 1
 # browser-extension/adapter.js reports this instead of a tool source when a reply holds several marked objects.
 SEVERAL_COMMANDS = "Arena returned more than one marked tool command. No command was run."
 
 
-def port_is_free(port=PORT, patience=6):
+def port_is_free(port, patience=6):
     """Try the bind the companion will make. A companion outlives its Harness process by a moment."""
     deadline = time.monotonic() + patience
     while True:
@@ -142,14 +141,13 @@ class HeadlessHarness(unittest.TestCase):
         self.node = shutil.which("node")
         if not (self.node and self.dsh.is_file() and plugin.is_file()):
             self.skipTest("node, @deepseek-ai/dsh or dsh-arena-desktop is missing")
-        if not port_is_free():
-            self.skipTest(f"port {PORT} is in use")
         temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(temporary.cleanup)
         directory = Path(temporary.name).resolve()
         self.state, self.home, self.work = directory / "state", directory / "home", directory / "work"
         for path in (self.state, self.home, self.work):
             path.mkdir()
+        self.port_file = self.state / "desktop.port"
         (self.work / "a.txt").write_text("alpha-" + uuid4().hex + "\n", encoding="utf-8")
         (self.work / "b.txt").write_text("beta-" + uuid4().hex + "\n", encoding="utf-8")
         self.patch = directory / "patch.yml"
@@ -167,10 +165,6 @@ class HeadlessHarness(unittest.TestCase):
 
     def harness(self, task, *options):
         environment = harness_environment(self.home, self.state, self.bridge_root, RELEASE_CHECK)
-        port_file = self.state / "desktop.port"
-        if port_file.is_file():
-            previous = int(port_file.read_text(encoding="ascii").strip())
-            self.assertTrue(port_is_free(previous), f"the previous test companion still holds port {previous}")
         run = subprocess.run([self.node, str(self.dsh), "headless", "--patch", str(self.patch), "--json",
                               "--approval-policy", "never", *options, task],
                              cwd=self.work, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=90)
@@ -182,11 +176,16 @@ class HeadlessHarness(unittest.TestCase):
 
     def session(self, *replies):
         """Create a Harness session, then pair and bind it as /arena-pair and the extension would."""
+        if not self.port_file.exists():
+            with socket.socket() as probe:
+                self.prefer_test_port(probe)
         refused = self.harness("Create the session")
         self.assertEqual(refused[-1]["reason"]["kind"], "error")
         self.assertIn("Open Connect Arena", refused[-1]["reason"]["error"]["message"])
         self.assertFalse([event for event in refused if event["type"] == "tool_call"])
         session = refused[0]["sessionId"]
+        port = int(self.port_file.read_text(encoding="ascii").strip())
+        self.assertTrue(port_is_free(port), f"the previous test companion still holds port {port}")
         token = read_pairing(self.state)
         journal = DesktopJournal(self.state / "desktop.sqlite", self.state)
         try:
@@ -194,10 +193,15 @@ class HeadlessHarness(unittest.TestCase):
             binding = journal.bind(CHAT, TAB)
         finally:
             journal.close()
-        port = int((self.state / "desktop.port").read_text(encoding="ascii").strip())
         self.page = ScriptedPage(token, port, binding, replies)
         self.page.start()
         return session
+
+    def prefer_test_port(self, sock):
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        self.port_file.write_text(f"{port}\n", encoding="ascii")
+        return port
 
     def turn(self, task, *replies):
         events = self.harness(task, "--session-id", self.session(*replies))
@@ -224,10 +228,10 @@ class HeadlessHarness(unittest.TestCase):
 
     def test_busy_preferred_port_still_delivers_a_complete_harness_turn(self):
         with socket.socket() as other:
-            other.bind(("127.0.0.1", PORT))
+            occupied = self.prefer_test_port(other)
             other.listen()
             events, calls = self.turn("Check the connection", lambda delivery: {"text":"Fallback reached Desktop."})
-            self.assertNotEqual(self.page.port, PORT)
+            self.assertNotEqual(self.page.port, occupied)
             self.assertEqual(calls, [])
             self.assertEqual(events[-1]["text"], "Fallback reached Desktop.")
             self.assertEqual(events[-1]["reason"]["kind"], "completed")

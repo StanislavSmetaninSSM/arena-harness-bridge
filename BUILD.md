@@ -1,6 +1,6 @@
 # Windows release build
 
-Use 64-bit Windows, Python, npm and the .NET Framework C# compiler. Node.js 24.22.3 can run both supported Harness versions. The build needs access to the npm registry and the pinned Python embeddable distribution. Free loopback port 8766 before the build so the tests can start their own listener there and exercise the automatic fallback. To use a cached official Python ZIP, pass its path with `--python-embed`; the builder checks the same SHA-256 as for a download.
+Use 64-bit Windows, Python, npm and the .NET Framework C# compiler. Node.js 24.22.3 can run both supported Harness versions. The build needs access to the npm registry and the pinned Python embeddable distribution. The headless tests use private loopback ports and exercise the automatic fallback with a separate listener. To use a cached official Python ZIP, pass its path with `--python-embed`; the builder checks the same SHA-256 as for a download.
 
 ```powershell
 $bridgeVersion = Read-Host 'Bridge version to build (without v)'

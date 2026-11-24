@@ -4,7 +4,7 @@
 
 ### 1. Install the bridge
 
-1. Download and run [Arena-Harness-Bridge-Setup.exe](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest/download/Arena-Harness-Bridge-Setup.exe).
+1. Download and run [Arena-Harness-Bridge-Setup.exe](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/download/v0.1.13/Arena-Harness-Bridge-Setup.exe).
 2. If you need DeepSeek Harness Desktop, use the wizard’s download button. Install Desktop and open it once. Before installing the bridge, quit Desktop completely from the app menu or system tray.
 3. Check that the wizard has selected your Desktop installation and click **Install**. When the extension folder appears, copy its path.
 
@@ -25,12 +25,16 @@ If you open another Arena chat in the same Chrome tab between tasks, return to t
 
 If the extension asks for a token after Chrome restarts, open the same Arena chat. Run `/arena-pair` in the original Desktop conversation, copy the code, and click **Bind conversation** in the extension.
 
-**Updating.** Quit Desktop completely and run the new installer for the same profile. Use the Chrome extension from the same release. If Chrome loads the extension from the wizard’s folder, click **Reload** on its extension card. If you originally installed from a ZIP, disable the old extension and add the new one as in step 2. Refresh the original Arena tab. Run `/arena-pair` in the **original Desktop conversation** and bind the same Arena chat as in step 3.
+### Upgrading from v0.1.12
+
+1. Quit Desktop completely from the app menu or system tray. Run the v0.1.13 installer and select the same Desktop profile. The wizard installs plugin **0.1.24**.
+2. Open `chrome://extensions`. If Chrome loads the extension from the wizard’s folder, click **Reload** on its card. If you are switching from the ZIP to the installer, disable the old copy and follow “Add the Chrome extension” above using the wizard’s folder. The **Arena Harness Bridge** card should show version **0.1.46**.
+3. Refresh the original Arena tab. Open the **original conversation in Desktop**, run `/arena-pair`, and paste the code into the extension on that tab. Click **Bind conversation**. You can now use the normal Desktop message field.
 
 <details>
 <summary>Manual installation from the ZIP</summary>
 
-Extract the Windows ZIP to a folder you plan to keep. Quit Desktop completely. Open PowerShell in the extracted folder and enter the commands below, using the path to your own `DeepSeek Harness.exe`. If Desktop uses a custom profile, first set `$env:DSH_HOME` to the same directory you use to launch Desktop.
+Extract the [v0.1.13 Windows ZIP](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/download/v0.1.13/arena-harness-bridge-v0.1.13-windows.zip) to a folder you plan to keep. Quit Desktop completely. Open PowerShell in the extracted folder and enter the commands below, using the path to your own `DeepSeek Harness.exe`. If Desktop uses a custom profile, first set `$env:DSH_HOME` to the same directory you use to launch Desktop.
 
 ```powershell
 $desktop = Read-Host 'Full path to DeepSeek Harness.exe'

@@ -28,6 +28,19 @@ def tool_call(turn_id, name="read", arguments=None):
                                       "arguments":{} if arguments is None else arguments}) + '\n```'
 
 class DesktopProviderTests(unittest.TestCase):
+    def test_pair_status_observes_only_the_requested_session_and_preserves_delivery(self):
+        self.db.start(self.request)
+        first = self.db.poll(self.addr, True)["id"]
+        self.assertEqual(self.db.pair_status("desktop-session"), {"state":"paired"})
+        self.assertEqual(self.db.pair_status("another"), {"state":"otherSession"})
+        self.assertEqual(self.db.lease(), first)
+        self.db.check(self.addr)
+        self.db.event(dict(self.addr, id="pause-status", job=first, kind="limited", text="Daily usage limit reached"))
+        self.assertEqual(self.db.pair_status("desktop-session"), {"state":"paused"})
+        self.db.disconnect("desktop-session", reset=True)
+        self.assertEqual(self.db.pair_status("another"), {"state":"unpaired"})
+        self.assertIsNone(self.db.one("SELECT id FROM desktop_session"))
+
     def test_confirmed_text_argument_preserves_script_and_returns_only_explanation(self):
         self.db.start(dict(self.request, tools=[{"name":"pwsh"}]))
         first = self.db.poll(self.addr, True)
@@ -635,9 +648,11 @@ class DesktopProviderTests(unittest.TestCase):
         self.db.start(self.request)
         job = self.db.poll(self.addr, True)["id"]
         self.db.event(dict(self.addr, id="uncertain-first", kind="uncertain", job=job, text="Inspect Arena"))
-        with self.assertRaises(Problem):
-            self.db.bind(self.addr["chat"], self.addr["tab"]+1, job)
-        self.db.bind(self.addr["chat"], self.addr["tab"], "0"*32)
+        replacement = self.addr["tab"]+1
+        self.db.bind(self.addr["chat"], replacement, job)
+        # A stamp seen on the replacement tab cannot settle an ambiguous send from the original.
+        self.assertEqual(self.db.inspect(job)["state"], "uncertain")
+        self.db.bind(self.addr["chat"], replacement, "0"*32)
         self.assertEqual(self.db.inspect(job)["state"], "uncertain")
         with self.assertRaises(Problem):
             self.db.start(dict(self.request, requestId="next"))

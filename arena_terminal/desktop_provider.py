@@ -10,17 +10,25 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 
 from .__main__ import read_pairing
 from .desktop_files import DesktopFileStore
 from .journal import (
     InvalidToolSource, UnavailableTool, Journal, Problem, decode_generated_images,
-    new_id, source_tool_frame, tool_frame,
+    new_id, source_tool_frame, tool_frame, valid_chat,
 )
 from .transport import Endpoint, ExtensionHandler
 
 
 DEFAULT_DESKTOP_PORT = 8766
+# Background Chrome can coalesce tab timers into minute-long intervals.
+BROWSER_POLL_GRACE_SECONDS = 90
+BROWSER_OFFLINE = (
+    "The paired Chrome tab did not collect this delivery. Open the original Arena tab. "
+    "If Chrome restarted, run /arena-pair in this Desktop conversation and click Bind conversation "
+    "in the extension on the same Arena chat. Then resend your message."
+)
 TOOL_RESULT_HEADER = "DeepSeek Harness tool result:"
 READ_BATCH = "arena_read_batch"
 READ_BATCH_TOOLS = {"read", "glob", "grep"}
@@ -304,6 +312,7 @@ class DesktopJournal(Journal):
           UPDATE jobs SET state='question_queued' WHERE state='queued' AND id IN (SELECT answer_job FROM site_questions);
         """)
         self.files = DesktopFileStore(self.sql)
+        self._companion_started = self._queue_started = time.monotonic()
 
         # Old queued jobs combine user text with generated instructions. Their original
         # boundary is unknown, so resubmit them instead of editing their contents.
@@ -392,6 +401,8 @@ class DesktopJournal(Journal):
                 self.sql.execute("UPDATE requests SET error=? WHERE job=? AND reply IS NULL AND error IS NULL",
                                  (LEGACY_RESUBMIT, id))
             super().resolve(id, action)
+            if action in ("retry", "send"):
+                self._queue_started = time.monotonic()
 
     def pair_owner(self, session):
         if not isinstance(session,str) or not 0 < len(session) <= 256:
@@ -402,6 +413,51 @@ class DesktopJournal(Journal):
                 raise Problem("Arena is paired with another Desktop conversation. Run /arena-reset here, then run /arena-pair.")
             self.sql.execute("INSERT OR IGNORE INTO desktop_session VALUES(?)",(session,))
 
+    def pair_status(self, session):
+        """Read pairing state after the operator dialog closes, without claiming or rebinding it."""
+        with self.lock:
+            owner = self.one("SELECT id FROM desktop_session")
+            if owner and owner["id"] != session:
+                return {"state":"otherSession"}
+            if not owner or not self.one("SELECT id FROM binding"):
+                return {"state":"unpaired"}
+            if self.paused():
+                return {"state":"paused"}
+            if time.monotonic() - self._browser_contact() >= BROWSER_POLL_GRACE_SECONDS:
+                return {"state":"offline"}
+            return {"state":"unconfirmed" if self.last_poll is None else "paired"}
+
+    def _browser_contact(self):
+        return self._companion_started if self.last_poll is None else self.last_poll
+
+    def resume(self):
+        with self.lock:
+            if self.paused():
+                super().resume()
+                self._queue_started = time.monotonic()
+
+    def _expire_unclaimed(self, now):
+        # Called under the same lock/transaction as status or offer. Only one outgoing
+        # Desktop request may be active. A restarted companion grants a fresh grace.
+        if now - max(self._queue_started, self._browser_contact()) < BROWSER_POLL_GRACE_SECONDS:
+            return None
+        eligible = self._queued_job(supports_png_batch=True)
+        if eligible is None:
+            return None
+        request = self.one("""SELECT r.id,r.job FROM requests r
+                           JOIN desktop_session s ON s.id=r.session
+                           JOIN request_context c ON c.id=r.id JOIN binding b ON b.id=c.binding
+                           WHERE r.job=? AND r.error IS NULL AND r.reply IS NULL""", (eligible["id"],))
+        if request:
+            self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (request["job"],))
+            self.sql.execute("UPDATE requests SET error=? WHERE id=?", (BROWSER_OFFLINE, request["id"]))
+            return request["job"]
+
+    def _observe_browser_poll(self):
+        now = time.monotonic()
+        self._expire_unclaimed(now)
+        self.last_poll = now
+
     def bind(self,chat,tab,settled_delivery=None):
         if settled_delivery is not None and (not isinstance(settled_delivery, str)
                                              or not re.fullmatch(r"[a-f0-9]{32}", settled_delivery)):
@@ -409,11 +465,14 @@ class DesktopJournal(Journal):
         with self.lock, self.sql:
             if not self.one("SELECT id FROM desktop_session"):
                 raise Problem("Open Connect Arena in the target Desktop conversation first")
-            existing = self.one("SELECT id FROM binding")
-            binding = super().bind(chat,tab)
+            existing = self.one("SELECT id,chat,tab FROM binding")
             if existing is None:
+                binding = super().bind(chat,tab)
+                self.last_poll = time.monotonic()
                 return binding
-            if settled_delivery:
+            if not valid_chat(chat) or type(tab) is not int or tab < 0 or existing["chat"] != chat:
+                raise Problem("Open the originally paired Arena conversation before reconnecting")
+            if settled_delivery and existing["tab"] == tab:
                 # The old answer was inspected during explicit pairing. Retire the delivery,
                 # preserving its prior outcome and never accepting the old reply as new work.
                 settled = self.sql.execute("""UPDATE jobs SET state='done' WHERE id=? AND state IN ('offered','waiting','uncertain')
@@ -430,12 +489,15 @@ class DesktopJournal(Journal):
             # same URL and Chrome tab ID. Invalidate work from that interval.
             binding = new_id()
             self.files.discard_uncommitted()
-            self.sql.execute("UPDATE binding SET id=?", (binding,))
+            self.sql.execute("UPDATE binding SET id=?,tab=?", (binding,tab))
             self.sql.execute("DELETE FROM desktop_cancelled_deliveries")
             self.sql.execute("DELETE FROM desktop_transcript_faults")
-            self.sql.execute("UPDATE requests SET error='Browser reconnected. Inspect the prior turn in Arena.' WHERE reply IS NULL AND error IS NULL")
+            reason = "Browser reconnected. Inspect the prior turn in Arena."
+            self._stop_pending_requests(existing["id"], reason)
+            self.sql.execute("UPDATE requests SET error=? WHERE reply IS NULL AND error IS NULL", (reason,))
             self.sql.execute("UPDATE jobs SET state='done' WHERE state IN ('queued','files_queued','question_queued','held')")
             self.sql.execute("UPDATE jobs SET state='uncertain' WHERE state IN ('offered','waiting')")
+            self.last_poll = time.monotonic()
             return binding
 
     def stage_file_chunk(self, chunk):
@@ -609,6 +671,7 @@ class DesktopJournal(Journal):
                 raise Problem("Message and native tool instructions exceed the bridge text limit")
             if self.paused():
                 raise Problem(self.paused())
+            self._expire_unclaimed(time.monotonic())
             if self.one("SELECT id FROM jobs WHERE state NOT IN ('done','superseded')"):
                 raise Problem("A previous turn is still active. Inspect Arena and the connection status first.")
             queue = "files_queued" if has_files else "question_queued" if selection is not None else "queued"
@@ -632,6 +695,7 @@ class DesktopJournal(Journal):
                 self.sql.execute("INSERT INTO desktop_program_routes VALUES(?,?,?)",
                                  (rid, program_routes["language"], json.dumps(program_routes["names"])))
             self.sql.execute("INSERT INTO request_context VALUES(?,?,?,?)",(rid,binding["id"],browser_turn,origin))
+            self._queue_started = time.monotonic()
             return {"id":rid}
 
     def stop_changed_transcript(self, data):
@@ -660,25 +724,27 @@ class DesktopJournal(Journal):
                          (reason, binding))
 
     def recover_transcript(self, address):
-        with self.lock:
+        with self.lock, self.sql:
             self.check(address)
             if address.get("ready") is not False or address.get("nativeQuestionId") is not None:
                 raise Problem("A transcript recovery check cannot claim a delivery")
             fault = self.one("SELECT event FROM desktop_transcript_faults WHERE binding=?", (address["binding"],))
             if not fault or fault["event"] != address.get("recoverTranscript") or self.paused():
                 return False
+            self._observe_browser_poll()
             return bool(self.one("""SELECT 1 FROM jobs j JOIN requests r ON r.job=j.id
                                     JOIN request_context c ON c.id=r.id JOIN desktop_session s ON s.id=r.session
                                     WHERE c.binding=? AND c.origin IS NULL AND j.state IN ('queued','files_queued')
                                       AND r.reply IS NULL AND r.error IS NULL""", (address["binding"],)))
 
     def poll(self, address, ready):
-        with self.lock:
+        with self.lock, self.sql:
             self.check(address)
-            self.files.sweep_abandoned()
             fault = self.one("SELECT event FROM desktop_transcript_faults WHERE binding=?", (address["binding"],))
             if fault and fault["event"] != address.get("recoveredTranscript"):
                 return None
+            self._observe_browser_poll()
+            self.files.sweep_abandoned()
             return super().poll(address, ready)
 
     def event(self, data):
@@ -769,6 +835,7 @@ class DesktopJournal(Journal):
                     self.sql.execute("UPDATE requests SET error='The Arena question closed before the choice could be sent.' WHERE job=?",
                                      (answer_job,))
             self.sql.execute("INSERT OR IGNORE INTO closed_site_questions(job) VALUES(?)", (card["job"],))
+            self._observe_browser_poll()
             return card_id
 
     def native_answer(self, job):
@@ -891,6 +958,7 @@ class DesktopJournal(Journal):
         self.sql.execute("INSERT INTO desktop_prompts(job) VALUES(?)", (retry,))
         self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (job,))
         self.sql.execute("UPDATE requests SET job=? WHERE id=?", (retry, request["id"]))
+        self._queue_started = time.monotonic()
         return True
 
     def reject_tool_reply(self, job, diagnostic):
@@ -904,7 +972,7 @@ class DesktopJournal(Journal):
         return row
 
     def status(self, rid, session):
-        with self.lock:
+        with self.lock, self.sql:
             r = self.lookup(rid, session)
             if r["error"]:
                 return {"state":"failed","error":r["error"]}
@@ -928,6 +996,8 @@ class DesktopJournal(Journal):
             paused = self.paused()
             if paused and state in ("queued","files_queued","question_queued"):
                 return {"state":"limited","error":paused}
+            if state in ("queued","files_queued","question_queued") and self._expire_unclaimed(time.monotonic()) == r["job"]:
+                return {"state":"failed","error":BROWSER_OFFLINE}
             if state in ("limited","uncertain"):
                 issue = self.one("SELECT reason FROM delivery_issues WHERE job=?", (r["job"],))
                 reason = paused or (issue["reason"] if issue else None)
@@ -1077,6 +1147,9 @@ def serve():
                                   "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
                         if "sessionId" in params:
                             result["pairToken"] = pair_code
+                            result["pairingState"] = db.pair_status(params["sessionId"])["state"]
+                    elif method == "pairStatus":
+                        result = db.pair_status(params["sessionId"])
                     elif method == "stageFileChunk":
                         result = db.stage_file_chunk(params)
                     elif method == "start":

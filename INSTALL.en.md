@@ -19,6 +19,10 @@ Click **Open Chrome extensions** in the wizard. If that button is unavailable, e
 3. Return to the Arena tab. Open **Arena Harness Bridge** from Chrome’s extensions menu, paste the token, and click **Bind conversation**.
 4. Send “Hello” in **Desktop**. Arena’s reply will appear in that conversation.
 
+When you return to this conversation, use the normal message field. Switching conversations preserves the selected model and its Arena pairing.
+
+If the extension asks for a token after Chrome restarts, open the same Arena chat. Run `/arena-pair` in the original Desktop conversation, copy the code, and click **Bind conversation** in the extension.
+
 **Updating.** Quit Desktop completely and run the new installer for the same profile. Use the Chrome extension from the same release. If Chrome loads the extension from the wizard’s folder, click **Reload** on its extension card. If you originally installed from a ZIP, disable the old extension and add the new one as in step 2. Refresh the original Arena tab. Run `/arena-pair` in the **original Desktop conversation** and bind the same Arena chat as in step 3.
 
 <details>

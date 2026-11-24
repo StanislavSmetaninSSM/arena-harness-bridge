@@ -457,7 +457,7 @@ test('Connect Arena discloses its pairing credential only to the operator dialog
     return 'disconnect'
   })
   assert.match(command.description, /Connect Arena/i)
-  const invoke = sessionId => command.handler({agent:{session:{id:sessionId}},rawInput:'',signal:new AbortController().signal})
+  const invoke = sessionId => command.handler({agent:{session:{id:sessionId},model:{current:()=>({provider,model})}},rawInput:'',signal:new AbortController().signal})
   const result = await invoke(options.sessionId)
   assert.equal(result.kind, 'success')
   assert.deepEqual(calls, ['setup','disconnect'].map(method => ({method,params:{sessionId:options.sessionId}})))
@@ -637,9 +637,10 @@ test('native DSH executes two parallel reads before one Arena continuation and p
   peer.rpc = async (method, args) => {
     if (method === 'setup') {
       if (args?.sessionId) pairedSession = args.sessionId
-      return { pairToken:'synthetic-integration-token', chat:null, port:0, supportsResultView:true, supportsOnDemandContext:true }
+      return { pairToken:'synthetic-integration-token', chat:null, pairingState:'unpaired', port:0, supportsResultView:true, supportsOnDemandContext:true }
     }
     assert.equal(args.sessionId, pairedSession)
+    if (method === 'pairStatus') return { state:'paired' }
     if (method === 'start') { calls.push(args); return {id:args.requestId} }
     assert.equal(method, 'status')
     let reply

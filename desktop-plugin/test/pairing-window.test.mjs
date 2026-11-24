@@ -11,7 +11,7 @@ test('the human pairing command opens a visible Windows dialog with its helper c
   timeout: 25_000,
 }, async () => {
   const controller = new AbortController()
-  const peer = { rpc: async () => ({ pairToken:'synthetic-ui-test', chat:null, port:0 }) }
+  const peer = { rpc: async method => method === 'setup' ? { pairToken:'synthetic-ui-test', chat:null, pairingState:'unpaired', port:0 } : { state:'unpaired' } }
   const dialog = pairingCommand(peer).handler({ agent:{session:{id:'ui-test'}}, rawInput:'', signal:controller.signal })
   // Inspect and close only a top-level window created by this test process.
   const probe = `

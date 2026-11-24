@@ -40,10 +40,18 @@ python -m arena_terminal --root 'C:\путь\к\проекту'
 | `arena_terminal/` | Python-компаньон, журнал доставки и терминальный клиент |
 | `harness-adapter/` | Исполнитель для дополнительного терминального режима |
 
-Для сборки нужны Python и npm. Архив появится в `dist/`.
+Для подготовки релиза нужны Python, npm и доступ к npm-реестру. Для обеих текущих версий Harness подходит Node.js 24.22.3. Освободите порт `127.0.0.1:8766` перед запуском. Скрипт устанавливает собранный пакет плагина во временный профиль для каждой поддерживаемой версии Harness и последовательно запускает три теста Ивана через `dsh headless`. Страницу Arena в этих тестах заменяют подготовленные ответы. Итоговый ZIP появляется в `dist/` после успешного выполнения всех сценариев. Ошибка или пропуск останавливает сборку.
 
 ```powershell
-python scripts/build_windows_release.py --version 0.1.10
+$bridgeVersion = Read-Host 'Версия нового релиза без v'
+python scripts/build_windows_release.py --version $bridgeVersion
+```
+
+**Pre-release check (Windows).** Run the build command above with the new release version. Use Python, npm with registry access, and a free loopback port 8766. Node.js 24.22.3 is supported by both current Harness versions. The build tests the packaged plugin and companion on each supported Harness version. All three scripted headless scenarios must pass before the candidate ZIP replaces the output file.
+
+Комплектацию ZIP и обычные тесты можно проверить отдельно.
+
+```powershell
 python -m unittest test_arena_desktop test_arena_terminal test_windows_release
 node --test browser-extension/tests/*.test.cjs
 ```

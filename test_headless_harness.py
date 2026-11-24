@@ -12,7 +12,8 @@ The suite is skipped unless ARENA_DSH_PREFIX names an npm prefix holding both pa
     ARENA_DSH_PREFIX=<dir> python -m unittest test_headless_harness
 
 --install-links copies the plugin, so repeat the second command after editing desktop-plugin/.
-Node 24.9 or newer must be on PATH and port 8766 must be free.
+Use a Node version supported by the Harness under test. Node 24.22.3 works for both release targets. Port 8766 must be free.
+The release builder runs --release-check with the packaged plugin and treats skipped cases as failures.
 """
 import json
 import os
@@ -33,6 +34,7 @@ from arena_terminal.desktop_provider import DesktopJournal
 
 REPOSITORY = Path(__file__).resolve().parent
 PREFIX = os.environ.get("ARENA_DSH_PREFIX")
+RELEASE_CHECK = __name__ == "__main__" and sys.argv[1:] == ["--release-check"]
 PORT = 8766
 CHAT, TAB = "https://arena.ai/agent/headless-test", 1
 # browser-extension/adapter.js reports this instead of a tool source when a reply holds several marked objects.
@@ -109,6 +111,7 @@ class HeadlessHarness(unittest.TestCase):
         modules = Path(PREFIX).resolve() / "node_modules"
         self.dsh = modules / "@deepseek-ai" / "dsh" / "lib" / "bin.js"
         plugin = modules / "dsh-arena-desktop" / "index.mjs"
+        self.bridge_root = plugin.parent if RELEASE_CHECK else REPOSITORY
         self.node = shutil.which("node")
         if not (self.node and self.dsh.is_file() and plugin.is_file()):
             self.skipTest("node, @deepseek-ai/dsh or dsh-arena-desktop is missing")
@@ -137,13 +140,15 @@ class HeadlessHarness(unittest.TestCase):
 
     def harness(self, task, *options):
         environment = {**os.environ, "DSH_HOME":str(self.home), "ARENA_DESKTOP_STATE":str(self.state),
-                       "ARENA_BRIDGE_ROOT":str(REPOSITORY), "ARENA_PYTHON":sys.executable}
+                       "ARENA_BRIDGE_ROOT":str(self.bridge_root), "ARENA_PYTHON":sys.executable}
         self.assertTrue(port_is_free(), f"the previous companion still holds port {PORT}")
         run = subprocess.run([self.node, str(self.dsh), "headless", "--patch", str(self.patch), "--json",
                               "--approval-policy", "never", *options, task],
                              cwd=self.work, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=90)
         events = [json.loads(line) for line in run.stdout.splitlines() if line.startswith("{")]
         self.assertTrue(events and events[-1]["type"] == "final", run.stderr[-2000:])
+        expected_exit = 0 if events[-1]["reason"]["kind"] == "completed" else 1
+        self.assertEqual(run.returncode, expected_exit, run.stderr[-2000:])
         return events
 
     def session(self, *replies):
@@ -212,4 +217,9 @@ class HeadlessHarness(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if RELEASE_CHECK:
+        result = unittest.main(argv=[sys.argv[0]], verbosity=2, exit=False).result
+        if not result.wasSuccessful() or result.skipped or result.testsRun < 3:
+            sys.exit("Release check requires all three headless scenarios to run and pass.")
+    else:
+        unittest.main()

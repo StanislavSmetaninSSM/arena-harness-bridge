@@ -2,10 +2,12 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import zipfile
 
@@ -21,6 +23,31 @@ EXTENSION_FILES = (
     "native-questions.js", "popup.html", "popup.js", "raw-reply.js",
     "THIRD_PARTY_NOTICES.txt", "worker.js",
 )
+
+
+def check_headless_release(npm, package, plugin_manifest):
+    """Exercise the candidate tarball using every supported Harness CLI before publishing the ZIP."""
+    peers = plugin_manifest["peerDependencies"]
+    harness_packages = ["@deepseek-ai/dsh", *(name for name in peers if name.startswith("@deepseek-ai/dsh-"))]
+    peer_spec = peers["@deepseek-ai/dsh-llm"]
+    for entry in peer_spec.split("||"):
+        version = entry.strip()
+        if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[\w.-]+)?", version):
+            raise ValueError(f"Expected an exact Harness version in the release matrix, got {version!r}")
+        print(f"Running the headless release check with DeepSeek Harness {version}", flush=True)
+        with TemporaryDirectory(prefix="arena-headless-") as prefix:
+            Path(prefix, "package.json").write_text('{"private":true}\n', encoding="utf-8")
+            # npm may otherwise resolve the plugin's peer range to a newer Harness than the CLI.
+            pins = [f"{name}@{version}" for name in harness_packages]
+            subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefer-offline",
+                            *pins, str(package)], cwd=prefix, check=True)
+            for name in harness_packages:
+                installed = Path(prefix, "node_modules", name, "package.json")
+                actual = json.loads(installed.read_text(encoding="utf-8"))["version"]
+                if actual != version:
+                    raise ValueError(f"Expected {name} {version} for headless tests, found {actual}")
+            subprocess.run([sys.executable, str(ROOT / "test_headless_harness.py"), "--release-check"],
+                           cwd=prefix, env={**os.environ, "ARENA_DSH_PREFIX": prefix}, check=True)
 
 
 def main():
@@ -66,6 +93,7 @@ def main():
                 entry = zipfile.ZipInfo(name)
                 entry.external_attr = 0o100644 << 16
                 archive.writestr(entry, source.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+        check_headless_release(npm, package, json.loads((plugin / "package.json").read_text(encoding="utf-8")))
         temporary_zip.replace(output / filename)
     print(output / filename)
 

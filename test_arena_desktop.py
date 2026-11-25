@@ -1156,6 +1156,80 @@ class DesktopProviderTests(unittest.TestCase):
         self.assertEqual(job["nativeAnswer"],dict(card,answer="Image 2"))
         self.assertIsNone(self.db.poll(poller,False))
 
+    def test_two_voice_cards_accept_a_choice_then_skip_and_return_bound_audio(self):
+        event = self.site_question()
+        # RIFF/WAVE with mono unsigned 8-bit PCM. The two samples differ in their audio bytes.
+        header = bytes.fromhex('524946462600000057415645666d74201000000001000100401f0000401f0000010008006461746102000000')
+        previews = [{"mediaType":"audio/wav", "data":base64.b64encode(header + samples).decode()}
+                    for samples in (b"\x80\x80", b"\x00\xff")]
+        card = dict(event["nativeQuestion"], id="voice-1", options=["Voice Sample 1","Voice Sample 2","Skip"])
+        event.update(nativeQuestion=card, choiceAudio=previews)
+        with self.extension_client() as post:
+            self.assertTrue(post("poll",dict(self.addr,ready=False))[1].get("supportsAudioChoices"))
+            self.assertEqual(post("event", dict(event, choicePreviews=[]))[0],400)
+            invalid_status, invalid = post("event", dict(event, choiceAudio=[dict(previews[0],mediaType="audio/mpeg"),previews[1]]))
+            self.assertEqual(invalid_status,400)
+            self.assertEqual(invalid["code"],"arena-audio-rejected")
+            self.assertNotIn("code",post("event",dict(event,binding="another binding"))[1])
+            self.assertEqual(post("event", dict(event, choiceAudio=previews[:1]))[0],400)
+            status, ack = post("event",event)
+            self.assertEqual(status,200)
+            self.assertEqual(ack["nativeQuestionHandled"],"interactive")
+            self.assertEqual(post("event",event),(status,ack))
+            self.assertEqual(post("event",dict(event,choiceAudio=previews[::-1]))[0],400)
+
+        prior = "first"
+        for index, selected in enumerate(("Voice Sample 2", "Skip"), 1):
+            with self.subTest(selected=selected):
+                reply = self.db.status(prior,"desktop-session")["reply"]
+                self.assertEqual(reply["kind"],"audio-choice")
+                self.assertEqual(reply["audio"],previews)
+                answer = {"answers":[{"id":card["id"],"selected":[selected]}]}
+                rid = f"choice-{index}"
+                self.db.start(dict(self.request,requestId=rid,text="",tools=[{"name":"ask_user_question"}],toolResult=json.dumps(
+                    {"toolCallId":"arena_"+prior,"failed":False,"text":json.dumps(answer)})))
+                poll = dict(self.addr,supportsNativeQuestions=True,nativeQuestionId=card["id"])
+                self.assertIsNone(self.db.poll(dict(poll,nativeQuestionId="different"),False))
+                job = self.db.poll(poll,False)
+                self.assertEqual(job["nativeAnswer"],dict(card,answer=selected))
+                self.assertIsNone(self.db.poll(poll,False))
+                playback = dict(self.addr,id=f"playback-{index}",kind="busy",job=job["id"],voicePlaybackRequired=True)
+                with self.assertRaises(Problem):
+                    self.db.event(dict(playback,binding="another binding"))
+                with self.assertRaises(Problem):
+                    self.db.event(dict(playback,voicePlaybackRequired="true"))
+                self.db.event(dict(playback,job="another request",id=f"foreign-{index}"))
+                self.assertNotIn("voicePlaybackRequired",self.db.status(rid,"desktop-session"))
+                self.db.event(playback)
+                self.db.event(playback)
+                self.assertEqual(self.db.status(rid,"desktop-session").get("voicePlaybackRequired"),True if index == 1 else None)
+                self.db.event(dict(self.addr,id=f"sent-{index}",kind="sent",job=job["id"]))
+                self.db.event(dict(playback,id=f"stale-{index}"))
+                self.assertNotIn("voicePlaybackRequired",self.db.status(rid,"desktop-session"))
+                if index == 1:
+                    card = dict(card,id="voice-2")
+                    self.db.event(dict(event,id="second-card",nativeQuestion=card,replyTo=job["id"]))
+                prior = rid
+
+        # Arena's final speech is MPEG audio with an ID3 header. Keep the tag and frame bytes.
+        frame = bytes.fromhex('fffb9064') + bytes(413)
+        tagged = bytes.fromhex('49443304000000000000') + frame
+        tracks = [{"mediaType":"audio/mpeg", "data":base64.b64encode(samples).decode()}
+                  for samples in (tagged, frame)]
+        final = dict(self.addr,id="audio-only",kind="assistant",replyTo=job["id"],audio=tracks)
+        with self.assertRaisesRegex(Problem,"turn identity"):
+            self.db.event(dict(final,replyTo=None))
+        with self.extension_client() as post:
+            broken = [{"mediaType":"audio/mpeg","data":"SUQz"}]
+            status, rejection = post("event",dict(final,audio=broken))
+            self.assertEqual((status,rejection["code"]),(400,"arena-audio-rejected"))
+            self.assertEqual(self.db.status(prior,"desktop-session"),{"state":"waiting"})
+        self.db.event(final)
+        self.db.event(final)
+        self.assertEqual(self.db.status(prior,"desktop-session")["reply"],{"kind":"text","text":"","audio":tracks})
+        self.db.start(dict(self.request,requestId="after-audio",text="Connection still works"))
+        self.assertIn("Connection still works",self.db.poll(self.addr,True)["text"])
+
     def program_gallery_exchange(self):
         start = dict(self.request, tools=[{"name":"run_code"}], galleryViaCode=True)
         self.db.start(start)
@@ -1172,6 +1246,35 @@ class DesktopProviderTests(unittest.TestCase):
         arguments = self.db.status("first","desktop-session")["reply"]["arguments"]
         native = dict(callId="arena_first",arguments=arguments,text=answer("Image 2"))
         return card, program, native
+
+    def test_native_question_audio_is_independent_of_arbitrary_option_count(self):
+        event = self.site_question()
+        header = bytes.fromhex('524946462600000057415645666d74201000000001000100401f0000401f0000010008006461746102000000')
+        tracks = [{"mediaType":"audio/wav", "data":base64.b64encode(header + samples).decode()}
+                  for samples in (b"\x80\x80", b"\x00\xff")]
+        card = dict(event["nativeQuestion"],options=["Mix both", "Use the narrator", "End here"])
+        event.update(nativeQuestion=card,questionAudio=tracks)
+        with self.extension_client() as post:
+            self.assertTrue(post("poll",dict(self.addr,ready=False))[1].get("supportsAudioQuestions"))
+            self.assertEqual(post("event",dict(event,choiceAudio=tracks))[0],400)
+            self.assertEqual(post("event",dict(event,choicePreviews=[{"mediaType":"image/png","data":RED}]))[0],400)
+            status, ack = post("event",event)
+            self.assertEqual(status,200)
+            self.assertEqual(ack["nativeQuestionHandled"],"interactive")
+            self.assertEqual(post("event",event),(status,ack))
+            self.assertEqual(post("event",dict(event,questionAudio=tracks[::-1]))[0],400)
+        reply = self.db.status("first","desktop-session")["reply"]
+        self.assertEqual(reply["kind"],"audio-question")
+        self.assertEqual(reply["audio"],tracks)
+        self.assertEqual(reply["arguments"]["questions"][0]["options"],[{"label":label} for label in card["options"]])
+        answer = {"answers":[{"id":card["id"],"selected":["Use the narrator"]}]}
+        self.db.start(dict(self.request,requestId="audio-answer",text="",tools=[{"name":"ask_user_question"}],toolResult=json.dumps(
+            {"toolCallId":"arena_first","failed":False,"text":json.dumps(answer)})))
+        poll = dict(self.addr,supportsNativeQuestions=True,nativeQuestionId=card["id"])
+        job = self.db.poll(poll,False)
+        self.assertEqual(job["nativeAnswer"],dict(card,answer="Use the narrator"))
+        self.db.event(dict(self.addr,id="wrong-status",kind="busy",job=job["id"],voicePlaybackRequired=True))
+        self.assertNotIn("voicePlaybackRequired",self.db.status("audio-answer","desktop-session"))
 
     def test_program_gallery_uses_the_settled_native_answer_and_requires_current_admission(self):
         card, program, native = self.program_gallery_exchange()

@@ -703,7 +703,9 @@ const ArenaPage = (() => {
           const artifact = !isUser ? ArenaGeneratedImages.find(node,priorImages) : null;
           const nativeQuestion = !isUser ? ArenaNativeQuestions.find(node,ended) : null;
           const imageChoices = !isUser ? ArenaNativeQuestions.findImageChoices(node) : [];
-          const isAssistant = artifact || nativeQuestion || imageChoices.length || node.matches(assistants) || node.querySelector('.bg-surface-primary.rounded-xl.border.w-full .prose')
+          const {choices:audioChoices,artifact:audioArtifact} = !isUser ? ArenaNativeQuestions.findAudio(node) :
+            {choices:[],artifact:null};
+          const isAssistant = artifact || nativeQuestion || imageChoices.length || audioChoices.length || audioArtifact || node.matches(assistants) || node.querySelector('.bg-surface-primary.rounded-xl.border.w-full .prose')
             || node.matches('.bg-surface-primary.rounded-xl.border.w-full') && node.querySelector('.prose');
           const nativeBodies = !isUser && isAssistant ? all(node, nativeFinalBody) : [];
           const directBodies = node.id.startsWith('chat-message-') ? nativeBodies : [];
@@ -714,7 +716,8 @@ const ArenaPage = (() => {
           // Native file previews also contain .prose, outside the assistant's message body.
           const finalBodies = directBodies.length ? directBodies :
             hasAnalysis ? bodies.filter(el => el.matches('.prose.prose-base.body-base')) : bodies;
-          const body = finalBodies.length === 1 ? finalBodies[0] : finalBodies.length || hasAnalysis || artifact || nativeQuestion || imageChoices.length ? null : node;
+          const body = finalBodies.length === 1 ? finalBodies[0] : finalBodies.length || hasAnalysis || artifact ||
+            nativeQuestion || imageChoices.length || audioChoices.length || audioArtifact ? null : node;
           const multipleFinalBodies = directBodies.length>1 &&
             directBodies.every(el => el.parentElement === directBodies[0].parentElement);
           const siteId = messageSiteId(node);
@@ -724,7 +727,8 @@ const ArenaPage = (() => {
             if (url) priorImages.add(url);
           }
           const commandBodies = body ? [body] : multipleFinalBodies && ended ? directBodies : [];
-          const command = !nativeQuestion && !imageChoices.length && !artifact && isAssistant && !isUser && commandBodies.length ?
+          const command = !nativeQuestion && !imageChoices.length && !audioChoices.length && !audioArtifact &&
+            !artifact && isAssistant && !isUser && commandBodies.length ?
             markedToolFrame(node, commandBodies, nativeBodies) : false;
           let prose = body ? (isUser && !isAssistant ? paragraphText(body) : messageText(body, command)).trim() :
             multipleFinalBodies && ended ? directBodies.map(el=>messageText(el,true).trim()).filter(Boolean).join('\n\n') : '';
@@ -741,7 +745,7 @@ const ArenaPage = (() => {
           const row = {
             role: isUser && !isAssistant ? 'user' : isAssistant && !isUser ? 'assistant' : 'unknown',
             text: nativeQuestion ? [prose,ArenaNativeQuestions.describe(nativeQuestion)].filter(Boolean).join('\n\n') : prose,
-            nativeQuestion, imageChoices, prose, multipleFinalBodies, postImageProse,
+            nativeQuestion, imageChoices, audioChoices, audioArtifact, prose, multipleFinalBodies, postImageProse,
             echoMarkdown: body && isUser && !isAssistant ? paragraphText(body, true).trim() : undefined,
             lastLine: body && isUser && !isAssistant ? body.innerText.replace(/[\r\n]+$/, '').split(/\r?\n/).at(-1) : undefined,
             domKey: this.nodeIds.get(node),
@@ -749,7 +753,8 @@ const ArenaPage = (() => {
             artifact, artifactsPending:!!artifact,
             toolFrame: !!command,
             siteId,
-            complete: !!(body || artifact || nativeQuestion || imageChoices.length || multipleFinalBodies && prose) && (ended ||
+            complete: !!(body || artifact || nativeQuestion || imageChoices.length || audioChoices.length || audioArtifact ||
+              multipleFinalBodies && prose) && (ended ||
               node.matches('[data-message-status="complete"],[data-message-status="completed"],[data-streaming="false"],[data-status="complete"]'))
           };
           if (row.role === 'user' && row.nativeMessage && row.siteId === node.id && row.lastLine &&
@@ -758,7 +763,7 @@ const ArenaPage = (() => {
           if ((row.toolFrame || nativeBodies.length && commandBodies.every(el=>nativeBodies.includes(el))) &&
               row.role === 'assistant' &&
               node.dataset.agentTranscriptMessage === 'true' && node.id === 'chat-message-' + node.dataset.chatMessageId &&
-              !nativeQuestion && !imageChoices.length && !artifact) {
+              !nativeQuestion && !imageChoices.length && !audioChoices.length && !audioArtifact && !artifact) {
             this.replyNodes.set(row,node);
             row.visibleToolMarker = !!command || row.text.includes('"$harness"') && commandBodies.some(hasVisibleToolMarker);
           }
@@ -784,6 +789,40 @@ const ArenaPage = (() => {
           sources.length!==current.sources.length || !sources.every((source,index)=>source===current.sources[index]) ||
           !current.options.includes(request.answer)) throw Error('The original Arena image choices or previews changed.');
       current.buttons[current.options.indexOf(request.answer)].click();
+    }
+
+    async selectAudioChoice(request, sources, stillCurrent, attemptPlayback = true) {
+      const find=()=>{
+        const matches=this.rows().flatMap(row=>row.audioChoices).filter(card=>card.id===request.id);
+        const card=matches[0];
+        if (!stillCurrent() || matches.length!==1 || card.status!=='active' || !ArenaBridge.sameQuestion(card,request) ||
+            sources.length!==card.sources.length || !sources.every((source,index)=>source===card.sources[index]) ||
+            !card.options.includes(request.answer))
+          throw Error('The original Arena voice choices or previews changed.');
+        return card;
+      };
+      const current=find(), index=current.options.indexOf(request.answer);
+      const sound=current.players[index];
+      if (current.buttons[index].disabled && sound) {
+        if (!attemptPlayback) return false;
+        const wasPaused=sound.paused, wasMuted=sound.muted;
+        let playbackFailed=false;
+        try {
+          if (wasPaused) {
+            sound.muted=true;
+            // Arena enables the choice on the native player transitioning into playback.
+            sound.play().catch(()=>{playbackFailed=true;});
+          }
+          const end=Date.now()+4000;
+          while (find().buttons[index].disabled && !playbackFailed && Date.now()<end) await pause(50);
+        } finally {
+          if (wasPaused) {sound.pause();sound.muted=wasMuted;}
+        }
+      }
+      const button=find().buttons[index];
+      if (button.disabled) return false;
+      button.click();
+      return true;
     }
 
     state() {

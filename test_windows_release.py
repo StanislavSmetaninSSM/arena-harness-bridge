@@ -133,7 +133,8 @@ class WindowsReleaseTests(unittest.TestCase):
                             self.assertEqual(packed, data)
                     runtime = {"package/windows-python/" + name for name in self.runtime_files}
                     self.assertEqual(installed, python_files | runtime | {
-                        "package/package.json", "package/index.mjs", "package/provider.mjs", "package/tool-help.mjs",
+                "package/package.json", "package/index.mjs", "package/provider.mjs", "package/tool-help.mjs",
+                "package/incoming-audio.mjs",
                         "package/outgoing-image.mjs", "package/original-files.mjs", "package/original-files.client.js",
                         "package/pairing.mjs", "package/pairing.ps1",
                         "package/companion.mjs", "package/cordis.patch.yml", "package/README.md", "package/LICENSE",

@@ -50,7 +50,11 @@ async function request(code, endpoint, body) {
   const bearer = await verifiedBearer(port, secret);
   const response = await post(port, endpoint, body, bearer);
   const result = await response.json();
-  if (!response.ok) throw Error(result.error || 'Terminal returned HTTP ' + response.status);
+  if (!response.ok) {
+    const error=Error(result.error || 'Terminal returned HTTP ' + response.status);
+    if (response.status===400 && result.code==='arena-audio-rejected') error.audioRejected=true;
+    throw error;
+  }
   return result;
 }
 
@@ -58,16 +62,18 @@ const address = link => ({ binding: link.binding, chat: link.chat, tab: link.tab
 const getLink = async () => (await chrome.storage.session.get('link')).link;
 const save = link => chrome.storage.session.set({ link });
 
-function imagePayload(images) {
-  if (!Array.isArray(images) || !images.length || images.length > ArenaBridge.maxGeneratedImages)
-    throw Error('Invalid generated image count.');
+function mediaPayload(items, kind) {
+  if (!Array.isArray(items) || !items.length || items.length > ArenaBridge.maxGeneratedImages)
+    throw Error('Invalid generated '+kind+' count.');
+  const types = kind==='image' ? ['image/png','image/jpeg','image/webp'] :
+    ['audio/mpeg','audio/wav','audio/x-wav','audio/ogg','audio/mp4','audio/webm','audio/flac'];
   let bytes = 0;
-  return images.map(({mediaType,data}) => {
-    if (!['image/png','image/jpeg','image/webp'].includes(mediaType) || typeof data !== 'string'
+  return items.map(({mediaType,data}) => {
+    if (!types.includes(mediaType) || typeof data !== 'string'
         || !data.length || data.length % 4 || data.length > 11184812 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data))
-      throw Error('Invalid generated image data.');
+      throw Error('Invalid generated '+kind+' data.');
     bytes += data.length / 4 * 3 - (data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0);
-    if (bytes > 8 * 1024 ** 2) throw Error('Generated images exceed the 8 MiB limit.');
+    if (bytes > 8 * 1024 ** 2) throw Error('Generated '+(kind==='image'?'images':'audio')+' exceed the 8 MiB limit.');
     return {mediaType,data};
   });
 }
@@ -257,6 +263,8 @@ async function dispatch(message, sender) {
     return { job: result.job, queued: result.queued === true, context:result.context,
       supportsNativeQuestions:supportsNativeQuestions && result.supportsNativeQuestions===true,
       supportsImageChoices:supportsNativeQuestions && result.supportsImageChoices===true,
+      supportsAudioChoices:supportsNativeQuestions && result.supportsAudioChoices===true,
+      supportsAudioQuestions:supportsNativeQuestions && result.supportsAudioQuestions===true,
       nativeQuestionClosed:result.nativeQuestionClosed };
   }
   if (message.type === 'fileChunk') {
@@ -269,26 +277,38 @@ async function dispatch(message, sender) {
   if (message.type !== 'event' || !message.event) throw Error('Invalid content request.');
   const { id, kind, text, job } = message.event;
   const body = { ...address(link), id, kind, text, job };
+  if (kind==='busy' && job && job===link.lease && message.event.voicePlaybackRequired===true)
+    body.voicePlaybackRequired=true;
   if (kind === 'blocked' && message.event.transcriptChanged === true) body.transcriptChanged = true;
   if (kind === 'user' || kind === 'assistant') body.recoveredTranscript = message.recoveredTranscript;
-  if (message.event.choicePreviews!==undefined && message.event.nativeQuestion===undefined)
-    throw Error('Arena preview images require a native question.');
+  const previewCount=[message.event.choicePreviews,message.event.choiceAudio,message.event.questionAudio]
+    .filter(preview=>preview!==undefined).length;
+  if (previewCount && message.event.nativeQuestion===undefined)
+    throw Error('Arena previews require a native question.');
   if (message.event.nativeQuestion!==undefined) {
-    const {nativeQuestion,replyTo,choicePreviews} = message.event;
+    const {nativeQuestion,replyTo,choicePreviews,choiceAudio,questionAudio} = message.event;
     if (kind!=='assistant' || message.supportsNativeQuestions!==true || message.event.toolFrame || message.event.images ||
+        message.event.audio!==undefined || previewCount>1 ||
         typeof replyTo!=='string' || !replyTo || replyTo.length>256 || !ArenaBridge.validQuestion(nativeQuestion))
       throw Error('Invalid native Arena question.');
     Object.assign(body,{nativeQuestion,replyTo,supportsNativeQuestions:true});
-    if (choicePreviews!==undefined) body.choicePreviews=imagePayload(choicePreviews);
+    if (choicePreviews!==undefined) body.choicePreviews=mediaPayload(choicePreviews,'image');
+    if (choiceAudio!==undefined) body.choiceAudio=mediaPayload(choiceAudio,'audio');
+    if (questionAudio!==undefined) body.questionAudio=mediaPayload(questionAudio,'audio');
   } else if (kind === 'assistant' && message.event.images !== undefined) {
     const replyTo = message.event.replyTo;
     if (typeof replyTo !== 'string' || !replyTo || replyTo.length > 256) throw Error('Missing generated image turn identity.');
     body.replyTo = replyTo;
-    body.images = imagePayload(message.event.images);
+    body.images = mediaPayload(message.event.images,'image');
   } else if (kind === 'assistant' && typeof message.event.replyTo === 'string' &&
       message.event.replyTo.length > 0 && message.event.replyTo.length <= 256) {
     body.replyTo = message.event.replyTo;
     if (message.event.toolFrame===true && /^[0-9a-f]{32}$/.test(body.replyTo)) body.toolFrame = true;
+  }
+  if (message.event.audio!==undefined) {
+    if (kind!=='assistant' || !body.replyTo || body.toolFrame || body.nativeQuestion)
+      throw Error('Invalid generated audio reply.');
+    body.audio=mediaPayload(message.event.audio,'audio');
   }
   if (message.event.toolSource !== undefined) {
     if (!body.toolFrame || typeof message.event.toolSource !== 'string' ||
@@ -302,7 +322,21 @@ async function dispatch(message, sender) {
     link.receipt = body;
     await save(link);
   }
-  const result=await request(link.token, 'event', body);
+  let result;
+  try { result=await request(link.token, 'event', body); }
+  catch (error) {
+    if (!error.audioRejected || !body.audio && !body.choiceAudio && !body.questionAudio) throw error;
+    // An explicit rejection precedes acceptance of the event on the companion.
+    // Retry the same identity with its text and any images intact.
+    const {audio, choiceAudio, questionAudio, nativeQuestion, supportsNativeQuestions: _questions, ...fallback}=body;
+    const note=choiceAudio || questionAudio ?
+      'Arena is waiting for a choice. The audio files could not be transferred. Use the original Arena tab.' :
+      'Arena generated audio, but its files could not be transferred. Open them in the original Arena conversation.';
+    fallback.text=[fallback.text,note].filter(Boolean).join('\n\n');
+    result=await request(link.token,'event',fallback);
+    if (nativeQuestion) result={...result,nativeQuestionHandled:'display-only',
+      nativeQuestionId:nativeQuestion.id,replyTo:body.replyTo};
+  }
   if (delivery) {
     delete link.receipt;
     delete link.lease;

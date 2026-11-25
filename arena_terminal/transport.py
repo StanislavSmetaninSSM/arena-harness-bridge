@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .journal import Problem
+from .journal import Problem, RejectedAudio
 
 
 class Endpoint(ThreadingHTTPServer):
@@ -80,7 +80,7 @@ class ExtensionHandler(BaseHTTPRequestHandler):
             return self.reply(415, {"error": "JSON expected"})
         try:
             size = int(self.headers.get("Content-Length", "-1"))
-            # Bound image events before parsing base64 plus the optional Unicode caption.
+            # Bound media events before parsing base64 plus the optional Unicode caption.
             maximum = 13 * 1024**2 if self.path == "/v1/event" else 1_400_000
             if identity is not None:
                 maximum = 256
@@ -108,7 +108,9 @@ class ExtensionHandler(BaseHTTPRequestHandler):
                 job = None if closed else db.poll(body, body.get("ready"))
                 result = {"job":job, "queued":job is None and not body.get("nativeQuestionId") and db.eligible(body.get("supportsPngBatch")),
                           "lease":db.lease(),"context":db.context(),"supportsNativeQuestions":db.supports_native_questions,
-                          "supportsImageChoices":getattr(db, "supports_image_choices", False)}
+                          "supportsImageChoices":getattr(db, "supports_image_choices", False),
+                          "supportsAudioChoices":db.supports_audio_choices,
+                          "supportsAudioQuestions":db.supports_audio_questions}
                 if closure is not None:
                     result["nativeQuestionClosed"] = closure
             elif self.path == "/v1/file-chunk" and db.supports_files:
@@ -123,6 +125,8 @@ class ExtensionHandler(BaseHTTPRequestHandler):
                 result = {"content":self.server.adapter.skill(name)}
             else:
                 return self.reply(404, {"error":"Unknown endpoint"})
+        except RejectedAudio as error:
+            return self.reply(400, {"error":str(error), "code":"arena-audio-rejected"})
         except (ValueError, TypeError, KeyError, RecursionError) as error:
             return self.reply(400, {"error":str(error)})
         except sqlite3.Error as error:

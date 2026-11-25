@@ -45,6 +45,8 @@ async function exerciseBinding(port) {
         return {ok:true, json:async () => ({instance, proof})};
       }
       requests.push({ url, opts, data });
+      if (data.id==='rejected-audio' && (data.audio || data.choiceAudio))
+        return {ok:false,status:400,json:async()=>({code:'arena-audio-rejected',error:'Bad audio'})};
       if (data.kind === 'sent' || data.kind === 'uncertain') lease=null;
       if (loseSentAck && data.kind === 'sent') { loseSentAck = false; throw Error('connection interrupted after commit'); }
       const job = url.endsWith('/poll') && data.ready ? offered : null;
@@ -100,6 +102,23 @@ async function exerciseBinding(port) {
   assert.equal(requests.at(-1).data.supportsNativeQuestions,true);
   for(const bad of [{...event,replyTo:''},{...event,toolFrame:true},{...event,nativeQuestion:{...card,command:'run'}}])
     assert.equal((await send(tab,{...poll,type:'event',supportsNativeQuestions:true,event:bad})).ok,false);
+  const audio=[{mediaType:'audio/mpeg',data:'SUQzAA=='}];
+  const comparison={...event,id:'audio-comparison',questionAudio:audio};
+  assert.equal((await send(tab,{...poll,type:'event',supportsNativeQuestions:true,event:comparison})).ok,true);
+  assert.deepEqual(requests.at(-1).data.questionAudio,audio);
+  assert.deepEqual(requests.at(-1).data.nativeQuestion,card);
+  assert.equal((await send(tab,{...poll,type:'event',supportsNativeQuestions:true,event:{...comparison,choiceAudio:audio}})).ok,false);
+  const rejected={...event,id:'rejected-audio',nativeQuestion:{...card,options:['Voice Sample 1','Skip']},choiceAudio:audio};
+  const attempts=requests.length;
+  const fallback=await send(tab,{...poll,type:'event',supportsNativeQuestions:true,event:rejected});
+  assert.equal(fallback.nativeQuestionHandled,'display-only');
+  assert.equal(requests.length,attempts+2);
+  assert.deepEqual(requests.at(-2).data.choiceAudio,audio);
+  assert.equal(requests.at(-1).data.id,rejected.id);
+  assert.equal(requests.at(-1).data.replyTo,rejected.replyTo);
+  assert.equal(requests.at(-1).data.nativeQuestion,undefined);
+  assert.equal(requests.at(-1).data.choiceAudio,undefined);
+  assert.match(requests.at(-1).data.text,/original Arena tab/);
   await send(tab,{...poll,type:'event',event:{id:'a1',kind:'assistant',text:'frame',toolFrame:true}});
   assert.equal(requests.at(-1).data.toolFrame,undefined);
   const delivery='0123456789abcdef0123456789abcdef';

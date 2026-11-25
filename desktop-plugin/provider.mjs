@@ -5,6 +5,7 @@ import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { z } from 'zod'
 import { fileMetadata, selectedFileRefs, stageFiles } from './original-files.mjs'
 import { outgoingPng } from './outgoing-image.mjs'
+import { audioTrackLabels, choiceAudioLabels, incomingAudioLinks, matchesIncomingAudioLinks } from './incoming-audio.mjs'
 import { batchName, batchTools, hasHelpHint, programToolRoutes } from './tool-help.mjs'
 
 export const route = 'arena'
@@ -17,10 +18,47 @@ const maxOutgoingImages = 20 // Default DSH LocalAttachments limit per native me
 const maxOutgoingBytes = 32 * 1024 ** 2
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const isBatch = items => Array.isArray(items) && items.length >= 2
+const voiceProgramDescription = 'Choose a voice from Arena'
+const audioQuestionProgramDescription = 'Choose an option for Arena audio'
+const questionProgram = 'await tools.ask_user_question('
+const unavailableAudio = 'Desktop could not save the Arena audio. You can open it in the original Arena tab.'
 
-const galleryProof = z.object({arguments:z.object({questions:z.tuple([z.object({
-  id:z.string(), question:z.string(), options:z.array(z.object({label:z.string()}).strict()),
-}).strict()])}).strict(),text:z.string()}).strict()
+const galleryArguments = z.object({questions:z.tuple([z.object({
+  id:z.string().min(1), question:z.string().min(1), options:z.array(z.object({label:z.string().min(1)}).strict()).min(1),
+}).strict()])}).strict()
+const galleryProof = z.object({arguments:galleryArguments,text:z.string()}).strict()
+
+function isGalleryReply(message) {
+  if (message.content.some(block => block.type === 'image')) return true
+  const calls = message.content.filter(block => block.type === 'tool-call')
+  if (calls.length !== 1 || !['run_code','ask_user_question'].includes(calls[0].name)) return false
+  const call = calls[0]
+  try {
+    let args = JSON.parse(call.arguments)
+    let description
+    if (call.name === 'run_code') {
+      if (!record(args) || Object.keys(args).length !== 2 ||
+          ![voiceProgramDescription,audioQuestionProgramDescription].includes(args.description) ||
+          typeof args.code !== 'string' || !args.code.startsWith(questionProgram) || !args.code.endsWith(')')) return false
+      description = args.description
+      const json = args.code.slice(questionProgram.length,-1)
+      args = JSON.parse(json)
+      if (JSON.stringify(args) !== json) return false
+    }
+    const parsed = galleryArguments.safeParse(args)
+    if (!parsed.success) return false
+    const options = parsed.data.questions[0].options.map(option=>option.label)
+    const voices = options.at(-1) === 'Skip' ? options.slice(0,-1) : options
+    const voiceOptions = voices.length > 0 && choiceAudioLabels(voices).every((label,index)=>label === voices[index])
+    return message.content.some(block => {
+      if (block.type !== 'text') return false
+      if (description !== audioQuestionProgramDescription && voiceOptions && matchesIncomingAudioLinks(block.text,call.id,voices))
+        return true
+      return description !== voiceProgramDescription &&
+        matchesIncomingAudioLinks(block.text,call.id,audioTrackLabels(block.text.split('\n').length))
+    })
+  } catch { return false }
+}
 
 // The bounded, host-only projection is rebuilt from the Desktop session on
 // restore. The executor records the settled nested dispatch before the outer
@@ -33,7 +71,7 @@ const galleryProjection = {
     if (event.type === 'assistant/message') {
       const message = event.data.message
       if (message.source?.provider !== route || message.source.model !== model.id ||
-          !message.content.some(block=>block.type === 'image')) return null
+          !isGalleryReply(message)) return null
       const calls = message.content.filter(block=>block.type === 'tool-call')
       return calls.length === 1 && calls[0].name === 'run_code' ? {callId:calls[0].id,settled:false,proof:null} : null
     }
@@ -131,7 +169,7 @@ function selectMessage(messages, sessionId) {
       throw mismatch()
     }
     const toolName = calls[0].name
-    const gallery = assistant.content.some(block => block.type === 'image')
+    const gallery = isGalleryReply(assistant)
     return { message, index, toolName, gallery }
   }
   return { message, index }
@@ -288,6 +326,7 @@ export class ArenaAdapter extends LlmAdapter {
     const request = await this.request(options)
     const address = { id: request.requestId, sessionId: request.sessionId }
     let reply
+    let playbackNotice = false
     signal?.throwIfAborted()
     // Older companions expand every delivery with native schemas and Computer Use instructions.
     const setup = await this.companion.rpc('setup')
@@ -318,6 +357,13 @@ export class ArenaAdapter extends LlmAdapter {
         const status = await this.companion.rpc('status', address)
         if (status.state === 'done') { reply = status.reply; break }
         if (!['queued', 'waiting'].includes(status.state)) throw Error(status.error || `Arena request ${status.state}`)
+        if (status.voicePlaybackRequired === true && !playbackNotice) {
+          playbackNotice = true
+          const block = {type:'text',text:'Play the chosen voice sample in the original Arena tab. Desktop will apply your choice when Arena enables it.'}
+          yield {type:'block-start',index:0,blockType:'text'}
+          yield {type:'text-delta',index:0,text:block.text}
+          yield {type:'block-end',index:0,block}
+        }
         await delay(this.pollMs, undefined, { signal })
       }
       signal?.throwIfAborted()
@@ -327,12 +373,27 @@ export class ArenaAdapter extends LlmAdapter {
     }
     const blocks = []
     const imageChoice = reply?.kind === 'image-choice' && reply.name === 'ask_user_question'
+    const audioChoice = reply?.kind === 'audio-choice' && reply.name === 'ask_user_question'
+    const audioQuestion = reply?.kind === 'audio-question' && reply.name === 'ask_user_question'
+    const hasAudio = audioChoice || audioQuestion
+    const gallery = imageChoice || hasAudio
+    const renderAudio = async labels => {
+      try {
+        return await incomingAudioLinks(setup.audioDirectory, reply.audio, address.id, labels, signal)
+      } catch {
+        signal?.throwIfAborted()
+        return undefined
+      }
+    }
     if (reply?.kind === 'text' && typeof reply.text === 'string') {
-      if (reply.text || reply.images === undefined) blocks.push({ type:'text', text:reply.text })
+      const labels = audioTrackLabels(Array.isArray(reply.audio) ? reply.audio.length : 0)
+      const audio = reply.audio === undefined ? '' : await renderAudio(labels) ?? unavailableAudio
+      const text = [reply.text,audio].filter(Boolean).join('\n\n')
+      if (text || reply.images === undefined) blocks.push({ type:'text', text })
       if (reply.images !== undefined) blocks.push(...await storeGeneratedImages(this.ctx, reply.images, signal))
     } else if (reply?.kind === 'tool-batch') {
       const { calls, text, images } = reply
-      if (!request.supportsReadBatch || !isBatch(calls) || images !== undefined ||
+      if (!request.supportsReadBatch || !isBatch(calls) || images !== undefined || reply.audio !== undefined ||
           (text !== undefined && typeof text !== 'string') || !calls.every(call => record(call) &&
             Object.keys(call).length === 2 && batchTools.has(call.name) && record(call.arguments) &&
             request.tools.some(tool => tool.name === call.name))) {
@@ -341,30 +402,39 @@ export class ArenaAdapter extends LlmAdapter {
       if (text) blocks.push({ type:'text', text })
       calls.forEach((call, index) => blocks.push({ type:'tool-call', id:`arena_${address.id}_${index}`,
         name:call.name, arguments:JSON.stringify(call.arguments) }))
-    } else if ((reply?.kind === 'tool' || imageChoice) && reply.images === undefined &&
-             (imageChoice || request.tools.some(tool => tool.name === reply.name)) &&
+    } else if ((reply?.kind === 'tool' || gallery) && reply.images === undefined && (hasAudio || reply.audio === undefined) &&
+             (gallery || request.tools.some(tool => tool.name === reply.name)) &&
              reply.arguments && typeof reply.arguments === 'object' && !Array.isArray(reply.arguments) &&
              (reply.text === undefined || typeof reply.text === 'string')) {
       let name = reply.name
       let args = reply.arguments
       if (reply.text) blocks.push({ type:'text', text:reply.text })
-      if (imageChoice) {
-        const question = args.questions?.[0]
-        const choices = question?.options
-        const labels = Array.isArray(reply.previews) ? reply.previews.map((_,index) => `Image ${index+1}`) : []
-        if (!Array.isArray(args.questions) || args.questions.length !== 1 || typeof question?.id !== 'string' ||
-            typeof question.question !== 'string' || !Array.isArray(choices) ||
-            !labels.every((label,index) => choices[index]?.label === label) ||
-            (choices.length !== labels.length && !(choices.length === labels.length+1 && choices.at(-1)?.label === 'Skip')))
-          throw Error('Arena image choices and previews do not match')
-        const previews = await storeGeneratedImages(this.ctx, reply.previews, signal)
-        previews.forEach((image,index) => blocks.push({type:'text',text:labels[index]}, image))
-        if (!request.tools.some(tool => tool.name === name) || this.questionAdmission(options) === false) {
+      if (gallery) {
+        const parsed = galleryArguments.safeParse(args)
+        if (!parsed.success) throw Error('Invalid Arena question and options')
+        const [question] = parsed.data.questions
+        const choices = question.options
+        const labels = audioQuestion ? audioTrackLabels(Array.isArray(reply.audio) ? reply.audio.length : 0)
+          : audioChoice ? choiceAudioLabels(reply.audio)
+          : Array.isArray(reply.previews) ? reply.previews.map((_,index) => `Image ${index+1}`) : []
+        if (!labels.length || !audioQuestion && (!labels.every((label,index) => choices[index]?.label === label) ||
+            (choices.length !== labels.length && !(choices.length === labels.length+1 && choices.at(-1)?.label === 'Skip'))))
+          throw Error(`Arena ${audioChoice ? 'voice' : 'image'} choices and previews do not match`)
+        if (hasAudio) {
+          const links = await renderAudio(labels)
+          blocks.push({type:'text',text:links ?? unavailableAudio})
+          if (!links) name = undefined
+        } else {
+          const previews = await storeGeneratedImages(this.ctx, reply.previews, signal)
+          previews.forEach((image,index) => blocks.push({type:'text',text:labels[index]}, image))
+        }
+        if (name && (!request.tools.some(tool => tool.name === name) || this.questionAdmission(options) === false)) {
           if (request.galleryViaCode && this.admitsGalleryProgram(options)) {
             const payload = {questions:[{id:question.id,question:question.question,options:choices.map(({label})=>({label}))}]}
             name = 'run_code'
-            args = {description:'Choose an image from the Arena gallery',
-              code:`await tools.ask_user_question(${JSON.stringify(payload)})`}
+            args = {description:audioQuestion ? audioQuestionProgramDescription :
+                audioChoice ? voiceProgramDescription : 'Choose an image from the Arena gallery',
+              code:`${questionProgram}${JSON.stringify(payload)})`}
           } else {
             name = undefined
             blocks.push({type:'text',text:'If the panel is still open in the original Arena tab, choose an option there.'})
@@ -373,7 +443,8 @@ export class ArenaAdapter extends LlmAdapter {
       }
       if (name) blocks.push({ type:'tool-call', id:'arena_' + address.id, name, arguments:JSON.stringify(args) })
     } else throw Error('Invalid reply or tool outside the active DSH profile')
-    for (const [index, block] of blocks.entries()) {
+    for (const [offset, block] of blocks.entries()) {
+      const index = offset + Number(playbackNotice)
       signal?.throwIfAborted()
       yield { type:'block-start', index, blockType:block.type }
       if (block.type === 'text') yield { type:'text-delta', index, text:block.text }

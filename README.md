@@ -1,10 +1,10 @@
 # Arena Harness Bridge
 
-Подключите чат Arena к DeepSeek Harness Desktop. Пишите задания в Desktop, получайте там ответы и изображения. Когда Arena работает с файлами на вашем компьютере, действуют разрешения выбранного проекта в Harness.
+Подключите чат Arena к DeepSeek Harness Desktop. Пишите задания в Desktop, получайте ответы, изображения и аудио. Когда Arena работает с файлами на вашем компьютере, действуют разрешения выбранного проекта в Harness.
 
 **Windows x64** · [Скачать установщик](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest/download/Arena-Harness-Bridge-Setup.exe) · [Как установить и подключить чат](INSTALL.md)
 
-Use an Arena chat from DeepSeek Harness Desktop. Send messages, receive images, and let Arena use the local tools your Harness profile permits.
+Use an Arena chat from DeepSeek Harness Desktop. Send messages, receive images and audio, and let Arena use the local tools your Harness profile permits.
 
 **Windows x64** · [Download the installer](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/latest/download/Arena-Harness-Bridge-Setup.exe) · [Installation and pairing](INSTALL.en.md)
 

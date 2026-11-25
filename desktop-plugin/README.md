@@ -2,9 +2,17 @@
 
 Плагин добавляет модель **Arena Agent Mode** и команду **Connect Arena / Подключить Arena** (`/arena-pair`). Установите его с Python-компаньоном и расширением Chrome по [инструкции Windows](../INSTALL.md).
 
-Пакет 0.1.24 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
+Пакет 0.1.26 устанавливается штатной командой `dsh plugin --profile desktop add` на DeepSeek Harness Desktop `0.2.2-rc.5` и `0.2.3-alpha.2` без допуска версии.
 
-**English** — Plugin 0.1.24 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+**English** — Plugin 0.1.26 supports installation with `dsh plugin --profile desktop add` on DeepSeek Harness Desktop `0.2.2-rc.5` and `0.2.3-alpha.2` without a version exemption.
+
+Открывайте ссылки на голосовые превью и итоговые дорожки в правой панели Desktop. Для каждой карточки выберите голос или **Skip**. Если Desktop попросит запустить выбранное превью в исходной вкладке Arena, нажмите там **Play**. Мост применит сохранённый выбор.
+
+**English** — Open voice preview and final audio links in the Desktop sidebar. Choose a voice or **Skip** on each card. If Desktop asks you to play the chosen preview in the original Arena tab, press **Play** there. The bridge will apply the saved choice.
+
+Если Arena присылает несколько дорожек и вопрос о том, какая понравилась, откройте дорожки по ссылкам и выберите ответ на карточке Desktop. Варианты ответа сохраняются в исходном порядке.
+
+**English** — If Arena sends several tracks with a question about which one you prefer, open the tracks from their links and choose a response on the Desktop card. The answer options keep their original order.
 
 Arena запрашивает справку через `arena_tool_help`. Пустой запрос показывает, какие инструменты на текущем шаге вызываются напрямую и какие доступны внутри `run_code`. Запрос `{"name":"read"}` возвращает способ вызова, параметры, сведения о результате и опубликованную Harness инструкцию. Ссылка на индивидуальную инструкцию `{"guide":"tool:read"}` открывает ту же справку. Запрос `{"sdk":true}` открывает штатный SDK. Если пришёл `nextCursor`, его передают как `cursor` с теми же аргументами. Справка о новом инструменте появляется, как только Harness допускает его к работе на этом шаге.
 

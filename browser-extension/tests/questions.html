@@ -3,7 +3,7 @@
 <div class="prose prose-base body-base">Choose a color.</div>
 <div style="opacity:1"><div class="mb-1 flex w-full max-w-[600px] flex-col items-start overflow-hidden rounded-md border border-border-faint bg-surface-secondary">
 <div class="border-border-faint flex w-full items-start justify-between gap-3 border-b p-3"><span>Which color?</span><button type="button">Skip</button></div>
-<div role="radiogroup" aria-label="Which color?"><button type="button" role="radio" aria-checked="false">Amber</button><button type="button" role="radio" aria-checked="false">Indigo</button><input type="text"><button type="button" disabled aria-label="Submit custom response">→</button></div>
+<div role="radiogroup" aria-label="Which color?"><button type="button" role="radio" aria-checked="false">Amber</button><button type="button" role="radio" aria-checked="false"><div class="min-w-0 flex-1"><div class="body-sm text-text-secondary">Indigo</div><div class="body-sm text-text-tertiary">Listen to its track first.</div></div></button><input type="text"><button type="button" disabled aria-label="Submit custom response">→</button></div>
 </div></div></div></div></div></div></main><output id="out">running</output>
 <script src="../core.js"></script><script src="../generated-images.js"></script><script src="../native-questions.js"></script><script src="../adapter.js"></script><script>
 (async () => {
@@ -12,6 +12,7 @@
   const widget=document.querySelector('[style]'), stack=widget.parentElement, body=stack.querySelector('.prose');
   const original=row().nativeQuestion;
   check(original?.status==='active' && original.question==='Which color?' && original.options.join(',')==='Amber,Indigo','recognize active Arena question and its exact options');
+  check(row().text.includes('Listen to its track first.'),'option description is kept in the visible context');
   const group=widget.querySelector('[role=radiogroup]'), customField=group.querySelector('input'), customButton=group.querySelector('[aria-label]');
   customField.remove();customButton.remove();
   check(group.children.length===2 && row().nativeQuestion?.status==='active','live choice-only group with exactly two direct radio buttons');
@@ -26,7 +27,7 @@
   check(!row().nativeQuestion,'unexpected interactive control disqualifies choice-only widget');
   unexpected.remove();group.append(customField,customButton);
   let clicked=[];
-  for(const button of widget.querySelectorAll('button'))button.onclick=()=>{clicked.push(button.innerText);button.setAttribute('aria-checked','true')};
+  for(const button of widget.querySelectorAll('button'))button.onclick=()=>{clicked.push(button.innerText.split('\n',1)[0]);button.setAttribute('aria-checked','true')};
   const request={id:original.id,question:original.question,options:original.options,answer:'Indigo'};
   for(const invalid of [{...request,id:'chat-message-other'},{...request,options:['Indigo','Amber']},{...request,answer:'Blue'}]) {
     try{page.selectNativeAnswer(invalid)}catch{}

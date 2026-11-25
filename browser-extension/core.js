@@ -115,9 +115,20 @@ const ArenaBridge = (() => {
   }
 
   function pairingSettlement(rows) {
-    const reply=rows.at(-1), echo=rows.at(-2);
-    if (reply?.role!=='assistant' || echo?.role!=='user' || !reply.complete || reply.nativeQuestion ||
-        reply.artifact?.pending || reply.artifact?.error || (!reply.text && !reply.artifact) ||
+    const reply=rows.at(-1);
+    if (reply?.role!=='assistant' || !reply.complete || reply.nativeQuestion ||
+        reply.artifact?.pending || reply.artifact?.error || (!reply.text && !reply.artifact && !reply.audioArtifact)) return;
+    let index=rows.length-2;
+    if (reply.audioArtifact) {
+      while (index>=0 && rows[index].role==='assistant') {
+        const earlier=rows[index--];
+        if (!earlier.complete || earlier.toolFrame || earlier.nativeQuestion || !earlier.audioChoices?.length ||
+            earlier.audioChoices.some(card=>!['selected','skipped'].includes(card.status)) ||
+            !earlier.nativeMessage || !earlier.siteId?.startsWith('chat-message-') || !uniqueRow(rows,earlier)) return;
+      }
+    }
+    const echo=rows[index];
+    if (echo?.role!=='user' ||
         ![echo,reply].every(row=>row.nativeMessage && row.siteId?.startsWith('chat-message-') && uniqueRow(rows,row))) return;
     const delivery=/^Bridge delivery ([a-f\d]{32})$/.exec(echo.lastLine ?? '')?.[1];
     if (delivery && rows.filter(row=>row.role==='user' && row.lastLine===echo.lastLine).length===1) return delivery;
@@ -142,15 +153,24 @@ const ArenaBridge = (() => {
   }
 
   function returnMedia(row) {
-    const {artifact,nativeQuestion:card,imageChoices=[]}=row;
-    if (!artifact && !card && !imageChoices.length) return;
+    const {artifact,nativeQuestion:card,imageChoices=[],audioChoices=[],audioArtifact}=row;
+    if (!artifact && !card && !imageChoices.length && !audioChoices.length && !audioArtifact) return;
+    if (audioChoices.some(choice=>!['selected','skipped'].includes(choice.status) || !choice.sources?.length) ||
+        audioArtifact?.unavailable) return null;
     if (artifact && (artifact.pending || artifact.error || !artifact.sources?.length) ||
         card && (!['answered','closed','dismissed','failed'].includes(card.status) || card.draft) ||
         imageChoices.some(choice=>!['selected','skipped'].includes(choice.status) || !choice.sources?.length)) return null;
     const resources=artifact?.sources.map(mediaResource) ?? [];
     const choices=imageChoices.map(({id,status,question,options,sources})=>[id,status,question,options,sources.map(mediaResource)]);
     if (resources.includes(null) || choices.some(choice=>choice[4].includes(null))) return null;
-    return JSON.stringify([resources,card && [card.id,card.status,card.question,card.options,card.selected,!!card.summary],choices]);
+    const media=[resources,card && [card.id,card.status,card.question,card.options,card.selected,!!card.summary],choices];
+    if (audioChoices.length || audioArtifact) {
+      const audio=audioArtifact?.sources.map(mediaResource) ?? [];
+      const voices=audioChoices.map(({id,status,sources})=>[id,status,sources.map(mediaResource)]);
+      if (audio.includes(null) || voices.some(choice=>choice[2].includes(null))) return null;
+      media.push(voices,audio);
+    }
+    return JSON.stringify(media);
   }
 
   function consumedRow(row) {
@@ -301,8 +321,8 @@ const ArenaBridge = (() => {
       }
     }
 
-    finishNativeCard(row, card, answer, echo) {
-      if (!confirmedQuestion(card,row.nativeQuestion,answer)) throw Error('Native question confirmation changed.');
+    finishNativeCard(row, card, answer, echo, confirmation = row.nativeQuestion) {
+      if (!confirmedQuestion(card,confirmation,answer)) throw Error('Native question confirmation changed.');
       this.pendingNativeCommand = null;
       this.seen.push(consumedRow(row));
       if (echo?.role==='user' && echo.text===answer) this.seen.push(consumedRow(echo));
@@ -444,7 +464,7 @@ const ArenaBridge = (() => {
           rows[i+1]?.role==='assistant';
         const nativeMedia = media && this.waiting && row.role==='assistant' && row.nativeMessage &&
           (row.artifact || this.expectedImages);
-        if (!row.text && !row.images?.length && !nativeUploadTurn && !nativeMedia) break;
+        if (!row.text && !row.images?.length && !row.audioArtifact && !nativeUploadTurn && !nativeMedia) break;
         let receipt, submittedSource, pendingProof;
         if (row.role === 'user') {
           if (this.expected?.receipt) {
@@ -486,10 +506,13 @@ const ArenaBridge = (() => {
           const allowTool = row.toolFrame === true && !!this.commandDelivery && this.replyTo === this.commandDelivery &&
             this.expectsImage !== 'explicit' && i === rows.length-1 && uniqueRow(rows,row,this.seen);
           const reportedFailure = this.expectsImage && !allowTool && imageUnavailable(row.text);
-          const result = !allowTool && !row.nativeQuestion && !row.nativeSourceRejected ? media?.(i,this) : undefined;
+          const settledAudioQuestion=row.audioArtifact && row.nativeQuestion?.status==='answered';
+          const result = !allowTool && (!row.nativeQuestion || settledAudioQuestion) && !row.nativeSourceRejected ?
+            media?.(i,this) : undefined;
           if (result === null) break;
           if (result === undefined) {
-            if (generating || !row.complete || row.artifactsPending && !(row.artifact?.progressOnly && reportedFailure)) break;
+            if (generating || !row.complete || row.audioArtifact ||
+                row.artifactsPending && !(row.artifact?.progressOnly && reportedFailure)) break;
             if (this.expectsImage && !row.images?.length && !allowTool && !reportedFailure && !row.nativeSourceRejected) break;
           } else end = result.end;
           if (row.nativeMessage && !publishNativeFinal) {
@@ -498,11 +521,15 @@ const ArenaBridge = (() => {
           }
           const fields = { text: result?.text ?? row.responseText ?? row.text, replyTo:this.replyTo };
           const images = result?.images ?? row.images;
+          if (result?.audio?.length) {
+            if (!this.replyTo) return output.concat(this.fail('Cannot associate the generated audio with a submitted user turn.'));
+            fields.audio = result.audio;
+          }
           if (images?.length) {
             if (!this.replyTo) return output.concat(this.fail('Cannot associate the generated image with a submitted user turn.'));
             fields.images = images;
           }
-          else if (allowTool) {
+          else if (allowTool && !fields.audio) {
             fields.toolFrame = true;
             if (row.toolSource !== undefined) fields.toolSource = row.toolSource;
           }

@@ -177,9 +177,40 @@ window.__ModuleLoader__.load({
       return React.createElement('span',{hidden:true,role:'alert',ref})
     }
 
+    const audioId = 'arena-audio'
+    const audioTypes = {mp3:'audio/mpeg',wav:'audio/wav',ogg:'audio/ogg',m4a:'audio/mp4',webm:'audio/webm',flac:'audio/flac'}
+
+    function ArenaAudio({content,resourceAddress}) {
+      const data = content.kind === 'bytes' ? content.data : undefined
+      const suffix = /\.arena-audio\.([a-z0-9]+)$/i.exec(new URL(resourceAddress).pathname)?.[1]?.toLowerCase()
+      const mediaType = Object.hasOwn(audioTypes,suffix) ? audioTypes[suffix] : undefined
+      const [source,setSource] = React.useState()
+      React.useEffect(() => {
+        if (!data || !mediaType) return
+        const url = URL.createObjectURL(new Blob([data],{type:mediaType}))
+        setSource({data,url,suffix})
+        return () => URL.revokeObjectURL(url)
+      },[data,mediaType,suffix])
+      if (!source || source.data !== data || source.suffix !== suffix) return null
+      return React.createElement('div',{style:{display:'grid',gap:12,padding:16}},
+        React.createElement('audio',{src:source.url,controls:true,preload:'metadata',style:{width:'100%'}}),
+        React.createElement('a',{href:source.url,download:`arena-audio.${suffix}`},'Download audio'))
+    }
+
+    function registerAudio(ctx) {
+      const extensions = Object.keys(audioTypes).map(suffix => `${audioId}.${suffix}`)
+      ctx.effect(() => ctx.documentPreviews.register({id:audioId,extensions,binaryExtensions:extensions,
+        title:()=>'Arena audio', loading:'bytes-complete',wrap:false}))
+      ctx.effect(() => ctx.slots.inject('sidebar.right.tab.document', () => ctx.slots.register({
+        name:'sidebar.right.tab.document',key:audioId,
+      },ArenaAudio)))
+    }
+
     return {
       inject:['slots','modelDirectories'],
       apply(ctx) {
+        // The sidebar is optional for non-Desktop profile compositions.
+        ctx.inject?.(['documentPreviews'],registerAudio)
         ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register({
           name:'conversation.input.overlay', id:'arena-original-file-intake',
           inject(sessionId) {

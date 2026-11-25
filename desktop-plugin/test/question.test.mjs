@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -44,7 +44,10 @@ try:
     if card is not None:
         reply.update(nativeQuestion=card, supportsNativeQuestions=True, replyTo=job["id"])
     if previews is not None:
-        reply["choicePreviews"] = previews
+        field = "choicePreviews"
+        if previews[0]["mediaType"].startswith("audio/"):
+            field = "choiceAudio" if card["options"][0] == "Voice Sample 1" else "questionAudio"
+        reply[field] = previews
     db.event(reply)
     db.event(reply)
     db.close()
@@ -190,7 +193,7 @@ test('a bound Arena question reaches the native answerer once and only its ownin
   assert.deepEqual(agent.session.deriveMessages().at(-1).content,[{type:'text',text:'Ответ получен.'}])
 })
 
-for (const mode of ['selected','partial','initialized','masked','revoked','revoked-after-open','native-revoked-after-open','cancelled']) {
+for (const mode of ['selected','partial','initialized','masked','revoked','revoked-after-open','native-revoked-after-open','cancelled','voice-selected','voice-native-skip','audio-question']) {
   test('the PTC gallery keeps both previews and returns only a submitted native choice: '+mode, {timeout:30000}, async t => {
     const { Context } = await import('@deepseek-ai/cordis')
     const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
@@ -222,21 +225,28 @@ for (const mode of ['selected','partial','initialized','masked','revoked','revok
       const run = runtime.run.bind(runtime)
       t.mock.method(runtime,'run',async spec=>({...await run(spec),sandbox:{mode:'workspace-write',denied:false,enforcement:'partial'}}))
     }
-    const direct = mode==='native-revoked-after-open'
+    const direct = mode==='native-revoked-after-open' || mode==='voice-native-skip'
     await ctx.plugin(await import('@deepseek-ai/dsh-tool-executor-'+(direct ? 'native' : 'ptc')))
     await ctx.plugin((await import('@deepseek-ai/dsh-agent-loop')).default,{agents:[]})
     await ctx.plugin(await import('@deepseek-ai/dsh-tool-ask-user'))
     await ctx.plugin((await import('@deepseek-ai/dsh-attachment-local')).default,{dshHome:root})
 
-    const gallery = {id:'card-"\n\\',question:'Pick "${a}"\n`quoted`? 🚀',options:['Image 1','Image 2','Skip']}
-    const previews = [
+    const voice = mode.startsWith('voice-')
+    const audioQuestion = mode === 'audio-question'
+    const hasAudio = voice || audioQuestion
+    const labels = voice ? ['Voice Sample 1','Voice Sample 2'] : audioQuestion ? ['Audio track 1','Audio track 2'] : ['Image 1','Image 2']
+    const choices = audioQuestion ? ['Mix both', 'Use the narrator', 'End here'] : [...labels,'Skip']
+    const selected = mode==='voice-native-skip' ? 'Skip' : choices[1]
+    const gallery = {id:'card-"\n\\',question:'Pick "${a}"\n`quoted`? 🚀',options:choices}
+    const header = '524946462600000057415645666d74201000000001000100401f0000401f0000010008006461746102000000'
+    const previews = hasAudio ? ['8080','00ff'].map(samples=>({mediaType:'audio/wav',data:Buffer.from(header+samples,'hex').toString('base64')})) : [
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC',
     ].map(data => ({mediaType:'image/png',data}))
     const starts = [], answers = []
     const statuses = new Map()
     const peer = {async rpc(method,params) {
-      if (method==='setup') return {supportsOnDemandContext:true,supportsResultView:true}
+      if (method==='setup') return {supportsOnDemandContext:true,supportsResultView:true,audioDirectory:join(root,'audio')}
       if (method==='status') {
         if (mode==='revoked') await maskQuestion()
         return statuses.get(params.id)
@@ -244,7 +254,7 @@ for (const mode of ['selected','partial','initialized','masked','revoked','revok
       assert.equal(method,'start')
       starts.push(params)
       const first = starts.length===1
-      if (!first && mode==='selected') {
+      if (!first && (mode==='selected' || mode==='voice-selected' || audioQuestion)) {
         const {Session} = await import('@deepseek-ai/dsh-session')
         const {session} = agent
         const events = session.snapshotEvents()
@@ -252,7 +262,7 @@ for (const mode of ['selected','partial','initialized','masked','revoked','revok
         const projection = await adapter.galleryProjection
         const recovered = projection.stateOf(restored)
         assert.equal(recovered.callId,params.galleryAnswer.callId)
-        assert.deepEqual(JSON.parse(recovered.proof.text),{answers:[{id:gallery.id,selected:['Image 2']}]})
+        assert.deepEqual(JSON.parse(recovered.proof.text),{answers:[{id:gallery.id,selected:[selected]}]})
         const dispatch = events.findLast(event=>event.type==='tool/ptc-dispatch')
         restored.append('tool/ptc-dispatch',{...dispatch.data,subCallId:'second-dispatch'})
         assert.equal(projection.stateOf(restored).proof,null)
@@ -287,26 +297,32 @@ for (const mode of ['selected','partial','initialized','masked','revoked','revok
     const toolName = direct ? 'ask_user_question' : 'run_code'
     assert.deepEqual(starts[0].tools.map(tool=>tool.name),[toolName])
     const assistant = agent.session.deriveMessages().findLast(row=>row.role==='assistant')
-    assert.equal(assistant.content.filter(block=>block.type==='image').length,2)
+    if (hasAudio) {
+      const prose = assistant.content.filter(block=>block.type==='text').map(block=>block.text).join('\n')
+      const audio = [...prose.matchAll(/\[((?:Voice Sample|Audio track) \d+)\]\(<([^>]+)>\)/g)]
+      assert.deepEqual(audio.map(([,label])=>label),labels)
+      for (const [index,[, ,path]] of audio.entries())
+        assert.deepEqual(await readFile(decodeURIComponent(path)),Buffer.from(previews[index].data,'base64'))
+    } else assert.equal(assistant.content.filter(block=>block.type==='image').length,2)
     if (mode==='masked' || mode==='revoked') {
       assert.equal(question,null)
       assert.equal(assistant.content.some(block=>block.type==='tool-call'),false)
       assert.match(assistant.content.filter(block=>block.type==='text').map(block=>block.text).join(' '),/Arena tab/i)
     } else {
       assert.ok(question,'No PTC gallery question reached the native answerer')
-      assert.deepEqual(assistant.content.map(block=>block.type),['text','image','text','image','tool-call'])
+      assert.deepEqual(assistant.content.map(block=>block.type),hasAudio ? ['text','text','tool-call'] : ['text','image','text','image','tool-call'])
       assert.equal(assistant.content.at(-1).name,toolName)
       assert.deepEqual(question.questions,[{id:gallery.id,question:gallery.question,options:gallery.options.map(label=>({label}))}])
       if (mode==='cancelled') agent.cancel({kind:'user'})
       else {
         if (mode.endsWith('revoked-after-open')) await maskQuestion()
-        submitted.resolve({answers:[{id:gallery.id,selected:['Image 2']}]})
+        submitted.resolve({answers:[{id:gallery.id,selected:[selected]}]})
       }
     }
     await idle
     if (mode==='cancelled') assert.equal(question.signal.aborted,true)
-    const answered = ['selected','partial','initialized'].includes(mode)
-    assert.deepEqual(answers,answered ? [{...gallery,answer:'Image 2'}] : [])
+    const answered = ['selected','partial','initialized','voice-selected','voice-native-skip','audio-question'].includes(mode)
+    assert.deepEqual(answers,answered ? [{...gallery,answer:selected}] : [])
     assert.equal(starts.length,answered ? 2 : 1)
     if (answered) assert.deepEqual(agent.session.deriveMessages().at(-1).content,[{type:'text',text:'Choice received.'}])
   })

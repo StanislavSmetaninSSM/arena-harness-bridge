@@ -57,6 +57,26 @@ test('installed package declares a browser client to preserve a File before imag
   assert.equal(typeof module.factory(()=>({})).apply,'function')
 })
 
+test('the Desktop client claims only bridge audio files for byte-backed playback', async () => {
+  const source = await readFile(new URL('../original-files.client.js',import.meta.url),'utf8')
+  let module, renderer, definition
+  runInNewContext(source,{window:{__ModuleLoader__:{load:entry=>{module=entry}}}})
+  module.factory(()=>({})).apply({
+    documentPreviews:{register(value) { definition = value; return () => {} }},
+    slots:{
+      inject(_name,register) {return register()},
+      register(metadata,body) { if (metadata.key==='arena-audio') renderer = body; return () => {} },
+    },
+    inject(_names,register) {return register(this)},
+    effect(register) {return register()},
+  })
+  assert.equal(definition.loading,'bytes-complete')
+  assert.ok(definition.extensions.includes('arena-audio.mp3'))
+  assert.ok(definition.extensions.includes('arena-audio.wav'))
+  assert.ok(!definition.extensions.includes('mp3'))
+  assert.equal(typeof renderer,'function')
+})
+
 test('chunk boundaries survive fragmentation and a repeated occurrence uploads bytes once per staging attempt',async()=>{
   const {stageFiles,fileMetadata} = await import('../original-files.mjs')
   const bytes = fixtures.at(-1)[1]

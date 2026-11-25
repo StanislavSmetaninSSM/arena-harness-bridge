@@ -1,6 +1,6 @@
 {
   "name": "dsh-arena-desktop",
-  "version": "0.1.24",
+  "version": "0.1.26",
   "description": "Arena Agent Mode in the DeepSeek Harness Desktop model selector",
   "private": true,
   "type": "module",

@@ -15,7 +15,7 @@ import time
 from .__main__ import read_pairing
 from .desktop_files import DesktopFileStore
 from .journal import (
-    InvalidToolSource, UnavailableTool, Journal, Problem, decode_generated_images,
+    InvalidToolSource, UnavailableTool, Journal, Problem, decode_generated_audio, decode_generated_images,
     new_id, source_tool_frame, tool_frame, valid_chat,
 )
 from .transport import Endpoint, ExtensionHandler
@@ -32,6 +32,7 @@ BROWSER_OFFLINE = (
 TOOL_RESULT_HEADER = "DeepSeek Harness tool result:"
 READ_BATCH = "arena_read_batch"
 READ_BATCH_TOOLS = {"read", "glob", "grep"}
+MEDIA_QUESTIONS = ("image-choice", "audio-choice", "audio-question")
 DESKTOP_CANCELLED = "Desktop cancelled this request"
 CONNECTION = "DeepSeek Harness Desktop is connected."
 INTRO = (
@@ -281,6 +282,8 @@ class DesktopJournal(Journal):
     supports_files = True
     supports_native_questions = True
     supports_image_choices = True
+    supports_audio_choices = True
+    supports_audio_questions = True
     supports_pairing_settlement = True
 
     def __init__(self, path, root, *, exclusive=False):
@@ -304,6 +307,7 @@ class DesktopJournal(Journal):
             binding TEXT PRIMARY KEY, event TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS desktop_prompts(job TEXT PRIMARY KEY, plan_mode INTEGER, sent INTEGER DEFAULT 0);
           CREATE TABLE IF NOT EXISTS desktop_program_galleries(job TEXT PRIMARY KEY);
+          CREATE TABLE IF NOT EXISTS desktop_voice_playback(job TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS desktop_mode_sync(id INTEGER PRIMARY KEY CHECK(id=1));
           -- Even an older companion performing a retry must keep this answer out of its ordinary text queue.
           CREATE TRIGGER IF NOT EXISTS requeue_site_answer AFTER UPDATE OF state ON jobs
@@ -612,7 +616,7 @@ class DesktopJournal(Journal):
                 if batch_count is not None:
                     if reply["kind"] != "tool-batch" or len(reply["calls"]) != batch_count or images or request.get("text"):
                         raise Problem("The native results do not match the original Arena read batch")
-                elif reply["kind"] not in ("tool", "image-choice"):
+                elif reply["kind"] not in ("tool", *MEDIA_QUESTIONS):
                     raise Problem("The native result does not match the original Arena tool request")
                 if presentation is not None:
                     if isinstance(presentation, dict) and (
@@ -633,7 +637,8 @@ class DesktopJournal(Journal):
                         raise Problem("The original Arena question card has closed. No choice was sent.")
                     if images or request.get("text"):
                         raise Problem("A native Arena answer must contain only the Desktop selection")
-                    if reply["kind"] == "image-choice" and "ask_user_question" not in json.loads(prior["names"]):
+                    gallery = reply["kind"] in MEDIA_QUESTIONS
+                    if gallery and "ask_user_question" not in json.loads(prior["names"]):
                         settled = request.get("galleryAnswer")
                         if ("run_code" not in names or request.get("galleryViaCode") is not True
                                 or tool_data.get("failed") is not False or not isinstance(settled, dict)
@@ -642,7 +647,7 @@ class DesktopJournal(Journal):
                             raise Problem("Desktop has no admitted native answer for this Arena gallery. No choice was sent.")
                         selection = selected_option(json.loads(site["card"]), {"failed":False,"text":settled.get("text")})
                     else:
-                        if reply["kind"] == "image-choice" and "ask_user_question" not in names:
+                        if gallery and "ask_user_question" not in names:
                             raise Problem("Desktop's gallery permission changed. No choice was sent.")
                         selection = selected_option(json.loads(site["card"]), tool_data)
             else:
@@ -719,7 +724,7 @@ class DesktopJournal(Journal):
         self.sql.execute("""UPDATE requests SET error=? WHERE error IS NULL
                             AND id IN (SELECT c.id FROM request_context c WHERE c.binding=?)
                             AND (reply IS NULL OR (
-                                 json_extract(reply,'$.kind') IN ('tool','tool-batch','image-choice')
+                                 json_extract(reply,'$.kind') IN ('tool','tool-batch','image-choice','audio-choice','audio-question')
                                  AND NOT EXISTS (SELECT 1 FROM request_context WHERE origin=requests.id)))""",
                          (reason, binding))
 
@@ -759,12 +764,26 @@ class DesktopJournal(Journal):
     def native_question(self, data, replay):
         card = site_card(data["nativeQuestion"])
         previews = None
+        audio = None
+        audio_kind = None
         if "choicePreviews" in data:
             previews = data["choicePreviews"]
             decode_generated_images(previews)
             expected = [f"Image {i}" for i in range(1, len(previews) + 1)]
             if card["options"] not in (expected, expected + ["Skip"]):
                 raise Problem("Arena image choices and previews do not match")
+        if "choiceAudio" in data:
+            audio = data["choiceAudio"]
+            audio_kind = "audio-choice"
+            decode_generated_audio(audio)
+            expected = [f"Voice Sample {i}" for i in range(1, len(audio) + 1)]
+            if card["options"] not in (expected, expected + ["Skip"]):
+                raise Problem("Arena voice choices and previews do not match")
+        if "questionAudio" in data:
+            audio = data["questionAudio"]
+            audio_kind = "audio-question"
+            decode_generated_audio(audio)
+        media_choice = previews is not None or audio is not None
         origin = data.get("replyTo")
         if not isinstance(origin,str) or not 0 < len(origin) <= 256:
             raise Problem("Missing Desktop job for the Arena question")
@@ -772,10 +791,14 @@ class DesktopJournal(Journal):
                                WHERE q.binding=? AND q.card_id=?""", (data["binding"],card["id"]))
         if existing:
             reply = json.loads(existing["reply"])
+            prior_audio_kind = reply["kind"]
+            if prior_audio_kind not in ("audio-choice", "audio-question"):
+                prior_audio_kind = reply.get("audioKind", "audio-choice") if "audio" in reply else None
             if (existing["job"] != origin or json.loads(existing["card"]) != card
-                    or reply.get("previews", reply.get("images")) != previews):
+                    or reply.get("previews", reply.get("images")) != previews or reply.get("audio") != audio
+                    or prior_audio_kind != audio_kind):
                 raise Problem("The Arena question no longer matches its original turn")
-            return "interactive" if reply["kind"] in ("tool", "image-choice") else "display-only"
+            return "interactive" if reply["kind"] in ("tool", *MEDIA_QUESTIONS) else "display-only"
         cancelled = self.confirmed_cancelled_delivery(data)
         if cancelled:
             if cancelled["card"] is not None:
@@ -797,23 +820,32 @@ class DesktopJournal(Journal):
             raise Problem("Arena question does not belong to the waiting Desktop request")
         self.sql.execute("INSERT INTO site_questions(job,binding,card_id,card) VALUES(?,?,?,?)",
                          (origin,data["binding"],card["id"],json.dumps(card)))
-        if ("ask_user_question" in json.loads(request["names"]) or
-                previews is not None and self.one("SELECT 1 FROM desktop_program_galleries WHERE job=?", (origin,))):
+        interactive = ("ask_user_question" in json.loads(request["names"]) or
+                       media_choice and self.one("SELECT 1 FROM desktop_program_galleries WHERE job=?", (origin,)))
+        if interactive:
             question = {"id":card["id"],"question":card["question"],"options":[{"label":label} for label in card["options"]]}
             reply = {"kind":"tool","name":"ask_user_question","arguments":{"questions":[question]}}
             if previews is not None:
                 reply.update(kind="image-choice", previews=previews)
+            if audio is not None:
+                reply.update(kind=audio_kind, audio=audio)
+                if data.get("text"):
+                    reply["text"] = data["text"]
         else:
             hint = ("Desktop cannot open a choice for this gallery. If the panel is still open in the original Arena tab, "
-                    "choose an option there." if previews is not None else
+                    "choose an option there." if media_choice else
                     "Desktop's active profile does not offer ask_user_question.")
             text = "\n".join([card["question"], *card["options"], hint])
             reply = {"kind":"text","text":text}
             if previews is not None:
                 reply["images"] = previews
+            if audio is not None:
+                reply["audio"] = audio
+                if audio_kind == "audio-question":
+                    reply["audioKind"] = audio_kind
         self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (origin,))
         self.sql.execute("UPDATE requests SET reply=? WHERE id=?", (json.dumps(reply),request["id"]))
-        return "interactive" if reply["kind"] in ("tool", "image-choice") else "display-only"
+        return "interactive" if interactive else "display-only"
 
     def close_site_question(self, address):
         with self.lock, self.sql:
@@ -846,6 +878,19 @@ class DesktopJournal(Journal):
                           SELECT COALESCE(MAX(rowid),0) FROM events WHERE kind='user')""", (job,))
         return {**json.loads(row["card"]), "answer":row["answer"]} if row else None
 
+    def require_voice_playback(self, binding, job):
+        # A stale browser signal cannot affect another request or revive a settled one.
+        self.sql.execute("""INSERT OR IGNORE INTO desktop_voice_playback(job)
+            SELECT j.id FROM jobs j JOIN site_questions q ON q.answer_job=j.id
+            JOIN requests source ON source.job=q.job JOIN requests r ON r.job=j.id
+            JOIN desktop_session s ON s.id=r.session AND s.id=source.session
+            JOIN request_context c ON c.id=r.id AND c.origin=source.id
+            WHERE j.id=? AND j.state='offered' AND r.error IS NULL AND r.reply IS NULL
+              AND q.binding=? AND c.binding=q.binding AND q.answer!='Skip'
+              AND json_extract(source.reply,'$.kind')='audio-choice'
+              AND NOT EXISTS(SELECT 1 FROM closed_site_questions WHERE job=q.job)
+              AND c.browser_turn=(SELECT COALESCE(MAX(rowid),0) FROM events WHERE kind='user')""", (job, binding))
+
     def observe_delivery(self, kind, job):
         if kind == "user":
             self.sql.execute("""UPDATE jobs SET state='superseded' WHERE state NOT IN ('done','superseded')
@@ -854,6 +899,7 @@ class DesktopJournal(Journal):
                                           AND route.browser_turn < (SELECT MAX(rowid) FROM events WHERE kind='user'))""")
         elif kind == "sent":
             self.sql.execute("UPDATE desktop_cancelled_deliveries SET confirmed=1 WHERE job=?", (job,))
+            self.sql.execute("DELETE FROM desktop_voice_playback WHERE job=?", (job,))
         elif job:
             self.sql.execute("DELETE FROM desktop_cancelled_deliveries WHERE job=?", (job,))
         else:
@@ -882,12 +928,14 @@ class DesktopJournal(Journal):
         if settled:
             job = cancelled["job"]
         else:
-            if (not active or (("replyTo" in data or "images" in data) and data.get("replyTo") != active["origin"])
+            if (not active or (("replyTo" in data or "images" in data or "audio" in data) and data.get("replyTo") != active["origin"])
                     or not self.one("SELECT 1 FROM requests WHERE job=? AND error IS NOT NULL", (active["id"],))):
                 return False
             job = active["id"]
         if "images" in data:
             decode_generated_images(data["images"])
+        if "audio" in data:
+            decode_generated_audio(data["audio"])
         if settled:
             self.sql.execute("UPDATE jobs SET state='done' WHERE id=?", (job,))
             self.sql.execute("DELETE FROM desktop_cancelled_deliveries WHERE job=?", (job,))
@@ -989,6 +1037,9 @@ class DesktopJournal(Journal):
                     images = self.generated_images(r["job"])
                     if images:
                         reply["images"] = images
+                    audio = self.generated_audio(r["job"])
+                    if audio:
+                        reply["audio"] = audio
                 return {"state":"done","reply":reply}
             state = self.state(r["job"])
             if state in ("superseded","held"):
@@ -1002,7 +1053,10 @@ class DesktopJournal(Journal):
                 issue = self.one("SELECT reason FROM delivery_issues WHERE job=?", (r["job"],))
                 reason = paused or (issue["reason"] if issue else None)
                 return {"state":state,"error":reason or "Inspect the Arena chat before resuming this delivery"}
-            return {"state":"queued" if state in ("queued","files_queued","question_queued") else "waiting"}
+            pending = {"state":"queued" if state in ("queued","files_queued","question_queued") else "waiting"}
+            if state == "offered" and self.one("SELECT 1 FROM desktop_voice_playback WHERE job=?", (r["job"],)):
+                pending["voicePlaybackRequired"] = True
+            return pending
 
     def cancel(self, rid, session):
         with self.lock, self.sql:
@@ -1143,6 +1197,7 @@ def serve():
                         with db.lock:
                             bound = db.one("SELECT chat FROM binding")
                         result = {"chat":bound["chat"] if bound else None, "port":server.server_port, "supportsPngBatch":True, "supportsFiles":True,
+                                  "audioDirectory":str(private.resolve() / "audio"),
                                   "supportsResultView":True, "supportsOnDemandContext":True, "supportsToolHelp":True,
                                   "mode":"desktop", "pause":db.paused(), "deliveries":db.issues()}
                         if "sessionId" in params:

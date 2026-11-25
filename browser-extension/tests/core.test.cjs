@@ -375,6 +375,29 @@ test('a missing user source at publication cannot reset the verification deadlin
   assert.match(log.fault,/row 1 \(source unavailable\)/);
 });
 
+test('an audio-only final delivers all tracks and releases the turn once', () => {
+  const log=new Transcript(history), signal={generating:false,idle:true,publishNativeFinal:true};
+  const tracks=[{mediaType:'audio/mpeg',data:'SUQzAA=='},{mediaType:'audio/mpeg',data:'SUQzAQ=='}];
+  const row={...assistant('',true),siteId:'chat-message-audio',nativeMessage:true,audioArtifact:{sources:['one','two']}};
+  const rows=[...history,user('speak'),row];
+  const observed=log.scan(rows,signal);
+  assert.deepEqual(observed.map(e=>e.kind),['user']);
+  const media=()=>({end:rows.length,text:'',audio:tracks});
+  assert.deepEqual(events(log.scan(rows,{...signal,media})),[{kind:'assistant',text:'',audio:tracks,replyTo:observed[0].id}]);
+  assert.deepEqual(log.scan(rows,{...signal,media}),[]);
+  assert.equal(log.waiting,false);
+});
+
+test('pairing can retire a stamped turn completed by a voice choice and separate final audio', () => {
+  const echo={...stampedUser('speak'),nativeMessage:true,siteId:'chat-message-user'};
+  const panel={...assistant('Choose a voice',true),nativeMessage:true,siteId:'chat-message-panel',
+    audioChoices:[{id:'voice',status:'selected',sources:['https://arena.ai/sample']}]};
+  const final={...assistant('',true),nativeMessage:true,siteId:'chat-message-audio',
+    audioArtifact:{sources:['https://arena.ai/final']}};
+  assert.equal(pairingSettlement([echo,panel,final]),stamp);
+  assert.equal(pairingSettlement([echo,{...panel,complete:false},final]),undefined);
+});
+
 test('an image-only final waits for verified artifact bytes and is emitted exactly once', () => {
   const log=new Transcript(history), signal={generating:false,idle:true};
   const picture={mediaType:'image/png',data:'aW1hZ2U='};

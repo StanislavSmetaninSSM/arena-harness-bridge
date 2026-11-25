@@ -1,0 +1,82 @@
+<!doctype html><meta charset="utf-8"><title>Arena voice selection</title>
+<main><div id="chat-message-voice" data-agent-transcript-message="true" data-chat-message-id="voice">
+<div class="bg-surface-primary rounded-xl border w-full"><div class="px-3 pb-3"><div class="flex flex-col gap-2">
+<div class="prose prose-base body-base"><p>Choose a voice.</p></div>
+</div><div hidden><span aria-label="Response ended">Finished</span></div></div></div></div></main>
+<output id="out">running</output>
+<script src="../core.js"></script><script src="../generated-images.js"></script>
+<script src="../native-questions.js"></script><script src="../adapter.js"></script><script>
+(async () => {
+  const check=(value,reason)=>{if(!value)throw Error(reason);};
+  const page=new ArenaPage(document), stack=document.querySelector('.gap-2');
+  const wav=new Uint8Array(8044);
+  const view=new DataView(wav.buffer);
+  wav.set(new TextEncoder().encode('RIFF'),0);
+  view.setUint32(4,wav.length-8,true);
+  wav.set(new TextEncoder().encode('WAVEfmt '),8);
+  view.setUint32(16,16,true);
+  view.setUint16(20,1,true);
+  view.setUint16(22,1,true);
+  view.setUint32(24,8000,true);
+  view.setUint32(28,8000,true);
+  view.setUint16(32,1,true);
+  view.setUint16(34,8,true);
+  wav.set(new TextEncoder().encode('data'),36);
+  view.setUint32(40,wav.length-44,true);
+  wav.fill(128,44);
+  const sources=Array.from({length:4},()=>URL.createObjectURL(new Blob([wav],{type:'audio/wav'})));
+  const query='Which voice sample do you want to continue with?';
+  const choices=(pair)=>'<div class="my-2 rounded-xl border"><div class="p-3">'+
+    '<div class="flex items-start justify-between gap-3"><div>'+query+'</div><button type="button">Skip</button></div>'+
+    '<div class="mt-3 flex flex-wrap gap-3">'+pair.map((src,index)=>
+      '<div class="group flex"><div><span>Voice Sample '+(index+1)+'</span></div>'+
+      '<div><audio class="tts-audio-player" controls src="'+src+'"></audio></div>'+
+      '<button type="button" disabled>Continue with this</button></div>').join('')+'</div></div></div>';
+  stack.insertAdjacentHTML('beforeend',choices(sources.slice(0,2))+choices(sources.slice(2)));
+  const initial=page.rows().at(-1);
+  check(initial.audioChoices?.length===2 && initial.audioChoices.every(card=>card.status==='active'),
+    'recognize both voice panels even before the native final marker becomes visible');
+  check(!initial.complete && initial.text==='Choose a voice.' &&
+    initial.audioChoices[1].sources.join(',')===sources.slice(2).join(','),
+    'preserve native text, ordering and exact players');
+  const [first,second]=initial.audioChoices;
+  const encoded=await ArenaNativeQuestions.encodeAudio(first);
+  check(encoded.length===2 && encoded[0].mediaType==='audio/wav' && encoded[0].data.startsWith('UklGR'),
+    'deliver both original WAV previews');
+  const calls=[];
+  const summarize=(card,label)=>{
+    const panel=card.players[0].closest('.my-2');
+    panel.className='my-2';
+    panel.innerHTML='<div><span>Voice sample selected</span><audio class="tts-audio-player" controls src="'+card.sources[0]+
+      '"></audio><div><span>'+label+'</span><button type="button">hear other voice</button></div></div>';
+  };
+  second.buttons.at(-1).onclick=()=>{calls.push('skip second');summarize(second,'This voice was selected');};
+  first.buttons[0].onclick=()=>{calls.push('voice first');summarize(first,'You selected this voice');};
+  first.players[0].addEventListener('play',()=>{first.buttons[0].disabled=false;});
+  await page.selectAudioChoice({...second,answer:'Skip'},second.sources,()=>true);
+  if(location.hash==='#default-autoplay') {
+    const clicked=await page.selectAudioChoice({...first,answer:'Voice Sample 1'},first.sources,()=>true);
+    check(clicked===false && calls.length===1,'default autoplay keeps the original choice pending');
+    document.querySelector('#out').textContent='Waiting for native playback';
+    while(first.buttons[0].disabled) await new Promise(resolve=>setTimeout(resolve,50));
+    document.querySelector('#out').textContent='running';
+  }
+  await page.selectAudioChoice({...first,answer:'Voice Sample 1'},first.sources,()=>true);
+  check(calls.join(',')==='skip second,voice first','click only the requested card and option');
+  const closed=page.rows().at(-1).audioChoices;
+  check(closed[0].id===first.id && closed[0].status==='selected' && closed[0].sources[0]===first.sources[0] &&
+    closed[1].id===second.id && closed[1].status==='skipped' && closed[1].sources[0]===second.sources[0],
+    'Arena’s native explicit and default summaries confirm the original cards');
+  const mismatch=await page.selectAudioChoice({...first,answer:'Voice Sample 1'},second.sources,()=>true)
+    .then(()=>false,()=>true);
+  check(mismatch && calls.length===2,'reject an obsolete list of preview sources');
+  stack.replaceChildren();
+  stack.insertAdjacentHTML('beforeend','<div class="my-1"><div class="body-sm"><span>Generated speech</span></div>'+
+    '<audio class="tts-audio-player" controls src="'+sources[0]+'"></audio></div>');
+  stack.nextElementSibling.hidden=false;
+  const final=page.rows().at(-1);
+  check(final.role==='assistant' && final.complete && !final.text && final.audioArtifact?.players.length===1,
+    'a completed native audio reply is observable without a text caption');
+  document.querySelector('#out').textContent='All fixture checks passed';
+})().catch(e=>document.querySelector('#out').textContent=e.stack);
+</script>

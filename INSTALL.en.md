@@ -4,7 +4,7 @@
 
 ### 1. Install the bridge
 
-1. Download and run [Arena-Harness-Bridge-Setup.exe](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/download/v0.1.13/Arena-Harness-Bridge-Setup.exe).
+1. Download and run [Arena-Harness-Bridge-Setup.exe](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/download/v0.1.14/Arena-Harness-Bridge-Setup.exe).
 2. If you need DeepSeek Harness Desktop, use the wizard’s download button. Install Desktop and open it once. Before installing the bridge, quit Desktop completely from the app menu or system tray.
 3. Check that the wizard has selected your Desktop installation and click **Install**. When the extension folder appears, copy its path.
 
@@ -25,16 +25,20 @@ If you open another Arena chat in the same Chrome tab between tasks, return to t
 
 If the extension asks for a token after Chrome restarts, open the same Arena chat. Run `/arena-pair` in the original Desktop conversation, copy the code, and click **Bind conversation** in the extension.
 
-### Upgrading from v0.1.12
+### Audio and voice selection in Desktop
 
-1. Quit Desktop completely from the app menu or system tray. Run the v0.1.13 installer and select the same Desktop profile. The wizard installs plugin **0.1.24**.
-2. Open `chrome://extensions`. If Chrome loads the extension from the wizard’s folder, click **Reload** on its card. If you are switching from the ZIP to the installer, disable the old copy and follow “Add the Chrome extension” above using the wizard’s folder. The **Arena Harness Bridge** card should show version **0.1.46**.
+Click an audio link in Arena’s reply to open the player in the Desktop sidebar. If Arena asks you to choose a voice, listen to the previews and select an option or click **Skip** if available. If Desktop asks you to start a preview in Arena, click **Play** in the original tab. The bridge applies your saved choice and continues the conversation.
+
+### Upgrading from v0.1.13
+
+1. Quit Desktop completely from the app menu or system tray. Run the v0.1.14 installer and select the same Desktop profile. The wizard installs plugin **0.1.26**.
+2. Open `chrome://extensions`. If Chrome loads the extension from the wizard’s folder, click **Reload** on its card. If you are switching from the ZIP to the installer, disable the old copy and follow “Add the Chrome extension” above using the wizard’s folder. The **Arena Harness Bridge** card should show version **0.1.48**.
 3. Refresh the original Arena tab. Open the **original conversation in Desktop**, run `/arena-pair`, and paste the code into the extension on that tab. Click **Bind conversation**. You can now use the normal Desktop message field.
 
 <details>
 <summary>Manual installation from the ZIP</summary>
 
-Extract the [v0.1.13 Windows ZIP](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/download/v0.1.13/arena-harness-bridge-v0.1.13-windows.zip) to a folder you plan to keep. Quit Desktop completely. Open PowerShell in the extracted folder and enter the commands below, using the path to your own `DeepSeek Harness.exe`. If Desktop uses a custom profile, first set `$env:DSH_HOME` to the same directory you use to launch Desktop.
+Extract the [v0.1.14 Windows ZIP](https://github.com/StanislavSmetaninSSM/arena-harness-bridge/releases/download/v0.1.14/arena-harness-bridge-v0.1.14-windows.zip) to a folder you plan to keep. Quit Desktop completely. Open PowerShell in the extracted folder and enter the commands below, using the path to your own `DeepSeek Harness.exe`. If Desktop uses a custom profile, first set `$env:DSH_HOME` to the same directory you use to launch Desktop.
 
 ```powershell
 $desktop = Read-Host 'Full path to DeepSeek Harness.exe'

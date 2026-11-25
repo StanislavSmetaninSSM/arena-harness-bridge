@@ -21,7 +21,7 @@ SETUP_NAME = "Arena-Harness-Bridge-Setup.exe"
 PYTHON_URL = "https://www.python.org/ftp/python/3.14.10/python-3.14.10-embed-amd64.zip"
 PYTHON_SHA256 = "90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159"
 PLUGIN_FILES = (
-    "companion.mjs", "cordis.patch.yml", "index.mjs", "outgoing-image.mjs",
+    "companion.mjs", "cordis.patch.yml", "incoming-audio.mjs", "index.mjs", "outgoing-image.mjs",
     "original-files.mjs", "original-files.client.js",
     "package.json", "pairing.mjs", "pairing.ps1", "provider.mjs", "tool-help.mjs", "README.md",
 )

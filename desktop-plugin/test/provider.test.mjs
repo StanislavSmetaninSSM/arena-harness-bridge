@@ -35,7 +35,7 @@ class BrowserPeer {
   async rpc(method, params = {}) {
     this.calls.push({ method, params })
     if (method === 'setup') return {supportsPngBatch:true,supportsResultView:this.supportsResultView,
-      supportsOnDemandContext:this.supportsOnDemandContext}
+      supportsOnDemandContext:this.supportsOnDemandContext,audioDirectory:this.audioDirectory}
     if (method === 'start') {
       this.queued.set(params.requestId, params)
       return { id: params.requestId }
@@ -64,6 +64,87 @@ test('native DSH registry advertises Arena and streams only the newest human act
     assert.deepEqual(peer.calls.find(c => c.method === 'start').params.tools, [read])
     assert.doesNotMatch(JSON.stringify(peer.calls), /private old history|private system/)
   } finally { await ctx.fiber.dispose() }
+})
+
+test('an audio-only reply opens the two original files through durable local Desktop links', async t => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const root = await mkdtemp(join(tmpdir(),'arena audio #'))
+  t.after(() => rm(root,{recursive:true,force:true}))
+  const peer = new BrowserPeer()
+  peer.audioDirectory = join(root,'audio')
+  const header = '524946462600000057415645666d74201000000001000100401f0000401f0000010008006461746102000000'
+  const files = [Buffer.from(header + '8080','hex'), Buffer.from(header + '00ff','hex')]
+  peer.reply = {kind:'text', text:'', audio:files.map(raw => ({mediaType:'audio/wav',data:raw.toString('base64')}))}
+  const adapter = new ArenaAdapter({},peer,1)
+  const locations = async () => {
+    const events = await collect(adapter.stream(options))
+    assert.deepEqual(events.at(-1).reason,{kind:'stop'})
+    const output = events.filter(event=>event.type==='text-delta').map(event=>event.text).join('\n')
+    const links = [...output.matchAll(/\[Audio track (\d+)\]\(<([^>]+)>\)/g)]
+    assert.deepEqual(links.map(([,ordinal])=>ordinal),['1','2'])
+    return links.map(([, ,address])=>decodeURIComponent(address))
+  }
+  const paths = await locations()
+  assert.deepEqual(await locations(),paths)
+  for (const [index,path] of paths.entries()) {
+    assert.ok(path.startsWith(peer.audioDirectory.replaceAll('\\','/')+'/'))
+    assert.match(path,/\.arena-audio\.wav$/)
+    assert.deepEqual(await readFile(path),files[index])
+  }
+})
+
+test('an unavailable audio directory yields a visible diagnostic and a completed turn', async t => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const root = await mkdtemp(join(tmpdir(),'arena-audio-failure-'))
+  t.after(() => rm(root,{recursive:true,force:true}))
+  const peer = new BrowserPeer()
+  peer.audioDirectory = join(root,'cannot-create')
+  await writeFile(peer.audioDirectory,'a file in place of the audio directory')
+  peer.reply = {kind:'text', text:'Here is the narration.', audio:[{mediaType:'audio/wav',data:Buffer.from(
+    '524946462600000057415645666d74201000000001000100401f0000401f00000100080064617461020000008080','hex').toString('base64')}]}
+  const events = await collect(new ArenaAdapter({},peer,1).stream(options))
+  assert.deepEqual(events.at(-1).reason,{kind:'stop'})
+  const output = events.filter(event=>event.type==='text-delta').map(event=>event.text).join('\n')
+  assert.match(output,/narration/)
+  assert.match(output,/could not save.*audio/i)
+  assert.doesNotMatch(output,/\[Audio track/)
+})
+
+test('a pending voice playback reports its action once and keeps the original reply stream', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const peer = new BrowserPeer()
+  const rpc = peer.rpc.bind(peer)
+  let polls = 0
+  peer.rpc = async (method, args) => {
+    if (method === 'status' && polls++ < 2) return {state:'waiting',voicePlaybackRequired:true}
+    return rpc(method,args)
+  }
+  const events = await collect(new ArenaAdapter({},peer,1).stream(options))
+  const deltas = events.filter(event=>event.type==='text-delta')
+  assert.equal(deltas.length,2)
+  assert.match(deltas[0].text,/play the chosen voice sample/i)
+  assert.equal(deltas[1].text,peer.reply.text)
+  assert.deepEqual(deltas.map(({index})=>index),[0,1])
+  assert.equal(peer.calls.filter(({method})=>method==='start').length,1)
+})
+
+test('ordinary tool calls with overlapping voice prompts do not become bridge audio choices', async () => {
+  const { ArenaAdapter } = await import('../provider.mjs')
+  const original = options.messages[0]
+  const id = 'arena_' + createHash('sha256').update(JSON.stringify([options.sessionId,original.id])).digest('hex')
+  const args = {questions:[{id:'regular-question',question:'Pick a voice',options:[{label:'Voice Sample 1'},{label:'Skip'}]}]}
+  const similarLinks = '- [Voice Sample 1](</another/arena-0123456789abcdef-1-012345678901234567890123.arena-audio.mp3>)'
+  for (const [name,payload] of [
+    ['ask_user_question',args],
+    ['run_code',{description:'Choose a voice from Arena',code:`await tools.ask_user_question(${JSON.stringify(args)})`}],
+  ]) {
+    const messages = [original,{id:'assistant',role:'assistant',source:{kind:'model',provider,model},
+      content:[textBlock(similarLinks),{type:'tool-call',id,name,arguments:JSON.stringify(payload)}]},
+    {id:'normal-result',role:'tool',toolCallId:id,content:[textBlock('Tool result')]}]
+    const request = await new ArenaAdapter({},new BrowserPeer(),1).request({...options,messages})
+    assert.equal(JSON.parse(request.toolResult).text,'Tool result')
+    assert.equal(request.galleryAnswer,undefined)
+  }
 })
 
 test('an explicit tool action streams its explanation and exactly one executable block', async () => {

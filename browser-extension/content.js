@@ -5,6 +5,7 @@
   const pageKey = crypto.randomUUID();
   const unpublished = new WeakMap();
   const pendingMedia = new WeakMap();
+  const pendingAudio = new WeakMap();
   const finalSettleMs = 900;
   const mediaSettleMs = 2400;
   const mediaIdleLimitMs = 120000;
@@ -171,24 +172,77 @@
     return row?.imageChoices?.find(card=>!['skipped','selected'].includes(card.status));
   }
 
+  function nextAudioChoice(row) {
+    return row?.audioChoices?.find(card=>!['skipped','selected'].includes(card.status));
+  }
+
+  function audioShape(rows) {
+    return JSON.stringify(rows.map(row=>[row.siteId,row.role,row.audioArtifact?.sources,row.audioArtifact?.unavailable]));
+  }
+
+  function audioReply(s,rows,state,index,log,publish) {
+    const tail=rows.slice(index);
+    if (!tail.some(row=>row.audioArtifact)) return undefined;
+    if (!log.replyTo || state.generating || !tail.at(-1)?.complete || tail.some(row=>row.role!=='assistant' ||
+        !row.nativeMessage || !row.siteId || row.toolFrame || nextAudioChoice(row))) return null;
+    const key=audioShape(tail);
+    const text=tail.map(row=>row.responseText ?? (s.questionAudioSeen?.siteId===row.siteId ? row.prose : row.text)).filter(Boolean);
+    const artifacts=tail.flatMap(row=>{
+      const part=row.audioArtifact;
+      if (!part) return [];
+      const shown=s.questionAudioSeen;
+      if (shown?.siteId!==row.siteId) return [part];
+      const fresh=part.sources.map((source,i)=>shown.sources.includes(source)?-1:i).filter(i=>i!==-1);
+      return [{...part,players:fresh.map(i=>part.players[i]),sources:fresh.map(i=>part.sources[i])}];
+    });
+    const players=artifacts.flatMap(part=>part.players);
+    const sources=artifacts.flatMap(part=>part.sources);
+    if (s.audio?.owner!==log.replyTo || s.audio.key!==key)
+      s.audio={owner:log.replyTo,key,since:Date.now()};
+    const batch=s.audio;
+    if (!publish || Date.now()-batch.since<finalSettleMs) return null;
+    if (!players.length && !artifacts.some(part=>part.unavailable)) return {end:rows.length,text:text.join('\n\n')};
+    if (batch.failed || !s.supportsAudioChoices || artifacts.some(part=>part.unavailable)) {
+      text.push('Arena generated audio. The bridge could not transfer the files. Open the audio in the original Arena conversation.');
+      return {end:rows.length,text:text.join('\n\n')};
+    }
+    if (batch.audio) {
+      batch.delivery={index,end:rows.length,key};
+      return {end:rows.length,text:text.join('\n\n'),audio:batch.audio};
+    }
+    if (!batch.capturing) {
+      batch.capturing=true;
+      ArenaNativeQuestions.encodeAudio({players,sources}).then(audio=>{batch.audio=audio;},()=>{batch.failed=true;});
+    }
+    return null;
+  }
+
   function imageChoiceState(card, pending) {
     if (card?.status==='selected') {
       const index=pending.sources.indexOf(card.sources[0]);
       return index===-1 ? null : {...pending.wire,status:'answered',selected:pending.wire.options[index]};
     }
-    if (card?.status==='skipped' && sameSources(card.sources,pending.sources))
+    if (card?.status==='skipped' && (pending.audio ? pending.sources.includes(card.sources[0]) :
+        sameSources(card.sources,pending.sources)))
       return {...pending.wire,status:'answered',selected:'Skip'};
     return card;
+  }
+
+  function selectAudioChoice(s, pending, attemptPlayback) {
+    return page.selectAudioChoice({...pending.wire,answer:pending.answer},pending.sources,()=>
+      session===s && s.chat===here() && !s.departed && s.question===pending &&
+      !s.log.fault && !page.state().verification,attemptPlayback);
   }
 
   function nativeQuestionTurn(s, rows, state) {
     const index = s.log.seen.length, row = rows[index];
     let pending = s.question;
     const question = row?.nativeQuestion;
-    const image = pending?.sources ? row?.imageChoices?.find(card=>card.id===pending.wire.id)
-      : !pending && question?.status!=='active' ? nextImageChoice(row) : null;
-    const gallery = !!(pending?.sources || image);
-    const card = pending?.sources ? imageChoiceState(image,pending) : image || question;
+    const choice = pending?.sources ? (pending.audio ? row?.audioChoices : row?.imageChoices)?.find(card=>card.id===pending.wire.id)
+      : !pending && question?.status!=='active' ? nextImageChoice(row) || nextAudioChoice(row) : null;
+    const gallery = !!(pending?.sources || choice);
+    const audio = pending?.audio || choice?.id?.includes('/voice-choice/');
+    const card = pending?.sources ? imageChoiceState(choice,pending) : choice || question;
     const currentTurn = rows.length===index+1 || gallery && rows.slice(index+1).every(next=>next.role==='assistant' && next.nativeMessage);
     if (!pending && (!card || !gallery && card.status!=='active' || !s.log.waiting || !currentTurn)) {
       s.questionCandidate=null;
@@ -210,50 +264,65 @@
     s.log.pendingRows = true;
     if (!pending) {
       if (gallery && card.status==='invalid') {
-        suspend(s,{kind:'blocked',text:'Arena image choices changed or include an unreadable image.'},s.log.waitingJob);
+        suspend(s,{kind:'blocked',text:audio ? 'The voice choices changed. Open the original Arena voice panel.' :
+          'Arena image choices changed or include an unreadable image.'},s.log.waitingJob);
         return true;
       }
       const wire = {id:card.id,question:card.question,options:[...card.options]};
+      const comparison=!gallery && s.supportsAudioQuestions ? row.audioArtifact : null;
       if (!ArenaBridge.sameQuestion(s.questionCandidate?.wire,wire) ||
-          gallery && !sameSources(s.questionCandidate?.sources,card.sources)) {
-        s.questionCandidate={wire,sources:gallery ? card.sources : undefined,since:Date.now()};
+          gallery && !sameSources(s.questionCandidate?.sources,card.sources) ||
+          Boolean(s.questionCandidate?.comparison)!==Boolean(comparison) ||
+          comparison && (!sameSources(s.questionCandidate.comparison.sources,comparison.sources) ||
+            s.questionCandidate.comparison.unavailable!==comparison.unavailable)) {
+        s.questionCandidate={wire,sources:gallery ? card.sources : undefined,comparison,since:Date.now()};
         return true;
       }
       const candidate=s.questionCandidate;
       if (Date.now()-candidate.since < 900) return true;
       const origin = s.log.waitingJob;
-      const interactive = s.supportsNativeQuestions && !!origin;
-      if (gallery && origin && (!s.supportsImageChoices || candidate.failed)) {
+      const audioFallback=audio && (!s.supportsAudioChoices || candidate.failed ||
+        card.status==='loading' && Date.now()-candidate.since>15000);
+      const interactive = s.supportsNativeQuestions && !!origin && !audioFallback;
+      if (gallery && !audio && origin && (!s.supportsImageChoices || candidate.failed)) {
         const text=candidate.failed ? 'The Arena image previews could not be read.' : 'Update the Desktop companion to choose Arena images.';
         suspend(s,{kind:'blocked',text},origin);
         return true;
       }
-      if (gallery && card.status!=='active') {
+      if (gallery && card.status!=='active' && !audioFallback) {
         if (Date.now()-candidate.since>120000)
           suspend(s,{kind:'blocked',text:'Arena did not finish loading its image previews.'},origin);
-        else if (card.sources.every(Boolean)) {
+        else if (!audio && card.sources.every(Boolean)) {
           try { ArenaGeneratedImages.activate(card); }
           catch (error) { suspend(s,{kind:'blocked',text:error.message},origin); }
         }
         return true;
       }
-      if (gallery && interactive && !candidate.previews) {
+      const withAudio=interactive && comparison && !comparison.unavailable && !candidate.failed;
+      if (interactive && (gallery || withAudio) && !candidate.previews) {
         if (!candidate.capturing) {
           candidate.capturing=true;
-          ArenaGeneratedImages.encode(card).then(previews=>{candidate.previews=previews;},()=>{candidate.failed=true;});
+          const encode=audio || withAudio ? ArenaNativeQuestions.encodeAudio : ArenaGeneratedImages.encode;
+          encode(withAudio ? comparison : card).then(previews=>{candidate.previews=previews;},()=>{candidate.failed=true;});
         }
         return true;
       }
-      const event = ArenaBridge.event('assistant',{text:row.text,...(interactive ? {nativeQuestion:wire,replyTo:origin} : {})});
-      if (gallery && interactive) event.choicePreviews=candidate.previews;
+      const text=audioFallback ? [row.text,'Arena is waiting for a voice choice. Play a preview or use Skip in the original Arena tab.']
+        .filter(Boolean).join('\n\n') :
+        comparison && !withAudio ? [row.text,'The audio files are available in the original Arena conversation.'].filter(Boolean).join('\n\n') : row.text;
+      const event = ArenaBridge.event('assistant',{text,...(interactive ? {nativeQuestion:wire,replyTo:origin} :
+        audioFallback && origin ? {replyTo:origin} : {})});
+      if (gallery && interactive) event[audio?'choiceAudio':'choicePreviews']=candidate.previews;
+      if (withAudio) event.questionAudio=candidate.previews;
       pending = s.question = {wire,event,origin,siteId:row.siteId,initialProse:row.prose,passive:!interactive,
-        sources:gallery ? candidate.sources : undefined};
+        audio,sources:gallery ? candidate.sources : undefined,questionSources:withAudio ? comparison.sources : undefined};
       unpublished.set(event,origin);
       s.outbox.push(event);
       return true;
     }
     const same = ArenaBridge.sameQuestion(pending.wire,card) &&
-      (!gallery || card.status!=='active' || sameSources(pending.sources,card.sources));
+      (!gallery || card.status!=='active' || sameSources(pending.sources,card.sources)) &&
+      (!pending.questionSources || card.status!=='active' || sameSources(pending.questionSources,row.audioArtifact?.sources));
     const confirmed = ArenaBridge.confirmedQuestion(pending.wire,card,pending.answer);
     const summary = card?.summary && card.id===pending.wire.id && card.question===pending.wire.question &&
       pending.wire.options.includes(card.selected);
@@ -261,7 +330,7 @@
       row.prose && row.prose!==pending.initialProse && row.complete && !state.generating;
     const dismissed = card?.status==='dismissed' && card.id===pending.wire.id && row.siteId===pending.siteId;
     pending.closed = dismissed || (same || summary) && ['failed','closed','answered'].includes(card.status);
-    if (!pending.dispatched && (!same || card.status!=='active' || !currentTurn)) {
+    if (!pending.dispatched && (!same || card.status!=='active' && !(pending.audio && pending.passive && card.status==='loading') || !currentTurn)) {
       s.outbox = s.outbox.filter(event=>event!==pending.event);
       unpublished.delete(pending.event);
       s.question = s.questionCandidate = null;
@@ -287,6 +356,7 @@
     }
     if (!pending.confirmed) {
       if (confirmed) {
+        pending.playbackRequired = false;
         pending.confirmed = true;
         pending.confirmedAt=Date.now();
         s.outbox.push(ArenaBridge.event('sent',{job:pending.answerJob}));
@@ -295,26 +365,38 @@
         s.log.expectsImage = false;
         s.log.expectedImages = null;
       } else {
+        if (pending.playbackRequired && same && card.status==='active') {
+          const index=card.options.indexOf(pending.answer);
+          if (!card.buttons?.[index] || card.buttons[index].disabled || state.verification || state.issue) return true;
+          pending.playbackRequired=false;
+          pending.clickedAt=Date.now();
+          selectAudioChoice(s,pending,false).then(clicked=>{
+            if (clicked===false) pending.playbackRequired=true;
+          },error=>suspend(s,{kind:'blocked',text:error.message},pending.answerJob));
+          return true;
+        }
         if (!same || card.status!=='active' || Date.now()-pending.clickedAt >= 15000)
           suspend(s,{kind:'uncertain',text:'Arena did not confirm the selected option on the original question. Inspect the conversation.'},pending.answerJob);
         return true;
       }
     }
-    if (confirmed && (nextImageChoice(row) || gallery && question?.status==='active')) {
+    if (confirmed && (nextImageChoice(row) || nextAudioChoice(row) || gallery && question?.status==='active')) {
       s.question = s.questionCandidate = null;
       return true;
     }
     if (confirmed && rows.length>index+1) {
-      s.log.finishNativeCard(gallery ? {...row,nativeQuestion:card} : row,pending.wire,pending.answer,rows[index+1]);
+      s.log.finishNativeCard(row,pending.wire,pending.answer,rows[index+1],card);
     } else if ((confirmed || !card) && finalProse) {
       row.responseText=row.prose;
+      if (pending.questionSources) s.questionAudioSeen={siteId:row.siteId,sources:pending.questionSources};
     } else {
+      if (audio && state.generating) pending.confirmedAt=Date.now();
       if (Date.now()-pending.confirmedAt>120000)
         suspend(s,{kind:'blocked',text:'Arena confirmed the selection but has not shown a verifiable following reply.'},pending.answerJob);
       return true;
     }
     s.question = s.questionCandidate = null;
-    return gallery && !!nextImageChoice(rows[s.log.seen.length]);
+    return gallery && !!(nextImageChoice(rows[s.log.seen.length]) || nextAudioChoice(rows[s.log.seen.length]));
   }
 
   function settleFinal(s,row) {
@@ -371,7 +453,19 @@
     // Keep a native final mutable until the tick can publish it after earlier events.
     const events = s.log.scan(rows, {...scanState,publishNativeFinal,captureSource:row=>page.captureReplySource?.(row),
       recoverReply:(row,delivery)=>page.recoverToolReply?.(row,delivery),
-      media:(index,log)=>mediaReply(s,rows,state,index,log,publishNativeFinal)});
+      media:(index,log)=>{
+        const audio=audioReply(s,rows,state,index,log,publishNativeFinal);
+        if (audio===undefined) return mediaReply(s,rows,state,index,log,publishNativeFinal);
+        if (!audio || !rows.slice(index).some(row=>row.artifact)) return audio;
+        const images=mediaReply(s,rows,state,index,log,publishNativeFinal);
+        if (images===null) return null;
+        const bytes=[...(audio.audio ?? []),...(images?.images ?? [])].reduce((total,{data})=>
+          total+data.length/4*3-(data.endsWith('==')?2:data.endsWith('=')?1:0),0);
+        if (bytes>8*1024**2) return {...audio,text:[audio.text,
+          'The combined attachments exceed the bridge transfer limit. Open the images in the original Arena conversation.']
+          .filter(Boolean).join('\n\n')};
+        return {...audio,images:images?.images};
+      }});
     if (s.log.historyChangedAt != null) return;
     if (s.log.transcriptChanged) {
       suspend(s,{kind:'blocked',text:s.log.fault},events.find(event=>event.kind==='uncertain')?.job ?? s.activeJob);
@@ -386,6 +480,7 @@
     for (const event of events) {
       if (event.kind === 'assistant') unpublished.set(event,s.activeJob);
       if (event.kind==='assistant' && event.images && s.media?.delivery) pendingMedia.set(event,s.media.delivery);
+      if (event.kind==='assistant' && event.audio && s.audio?.delivery) pendingAudio.set(event,s.audio.delivery);
       if (event.kind === 'assistant' || event.kind === 'user') s.activeJob = null;
     }
     if (s.log.fault && !events.some(event => event.kind === 'uncertain' || event.kind === 'blocked'))
@@ -394,6 +489,8 @@
       s.pictures=null;
       s.imageWait=null;
       s.media=null;
+      s.audio=null;
+      s.questionAudioSeen=null;
       s.settling = true;
       s.settleField = null;
     }
@@ -415,6 +512,8 @@
     if (s.log.expected) return 'Waiting for the sent message to appear.';
     if (s.imageWait) return 'Waiting for the native generated image from this Arena reply.';
     if (s.media) return 'Waiting for the Arena image batch and final reply.';
+    if (s.audio) return 'Waiting for the Arena audio files.';
+    if (s.question?.playbackRequired) return 'Play the chosen voice preview in the original Arena tab. The saved choice will continue automatically.';
     if (s.log.waiting || s.log.pendingRows || state.generating) return 'Waiting for a completed Arena turn.';
     if (state.upload) return 'An attachment is present in the browser draft.';
     if (state.review) return 'Waiting for Arena to restore the composer after the review panel.';
@@ -533,11 +632,29 @@
         if (session !== s || s.chat !== here() || s.departed || prepared) return;
         if (page.state().verification) { collect(s); return; }
         const next = s.outbox[0];
+        const question=s.question;
+        if (next.questionAudio && question?.event===next && question.dispatched) {
+          const current=page.rows()[s.log.seen.length];
+          if (current?.nativeQuestion?.status!=='active' || !ArenaBridge.sameQuestion(question.wire,current.nativeQuestion) ||
+              !sameSources(question.questionSources,current.audioArtifact?.sources)) {
+            s.outbox.shift();
+            suspend(s,{kind:'blocked',text:'The Arena audio changed while delivering the question. Inspect the original Arena card.'},
+              question.origin);
+            continue;
+          }
+        }
         const media=pendingMedia.get(next);
         if (media && mediaShape(page.rows().slice(media.index))!==media.key) {
           s.outbox.shift();
           suspend(s,{kind:'blocked',text:'The generated images changed before delivery. Inspect the original Arena reply.'},media.job);
           continue;
+        }
+        const audio=pendingAudio.get(next);
+        if (audio && audioShape(page.rows().slice(audio.index,audio.end))!==audio.key) {
+          delete next.audio;
+          next.text=[next.text,'The Arena audio changed before delivery. Open the audio in the original Arena conversation.']
+            .filter(Boolean).join('\n\n');
+          pendingAudio.delete(next);
         }
         if (unpublished.has(next) || next.toolFrame) {
           collect(s,false,false,next.kind==='assistant');
@@ -600,12 +717,15 @@
       const nativeQuestionId = s.question?.dispatched && !s.question.passive && !s.question.answerJob ? s.question.wire.id : undefined;
       const nativeQuestionClosed = Boolean(nativeQuestionId && s.question.closed);
       const ready = !s.question && state.ready && !s.settling && !s.log.waiting && !s.log.expected && !s.log.pendingRows;
-      const { job, context, supportsNativeQuestions, supportsImageChoices, nativeQuestionClosed:closedId } = await rpc(s, 'poll', {
+      const { job, context, supportsNativeQuestions, supportsImageChoices, supportsAudioChoices, supportsAudioQuestions,
+        nativeQuestionClosed:closedId } = await rpc(s, 'poll', {
         ready, supportsPngBatch:true, supportsFiles:true, supportsNativeQuestions:true, nativeQuestionId, nativeQuestionClosed
       });
       if (session !== s || prepared) return;
       s.supportsNativeQuestions = supportsNativeQuestions === true;
       s.supportsImageChoices = supportsImageChoices === true;
+      s.supportsAudioChoices = supportsAudioChoices === true;
+      s.supportsAudioQuestions = supportsAudioQuestions === true;
       if (nativeQuestionClosed && closedId===nativeQuestionId && s.question?.wire.id===closedId && !job) {
         s.question.passive = true;
         collect(s);
@@ -626,7 +746,15 @@
             throw Error('Cannot deliver the answer to the original active Arena question.');
           pending.answerJob=job.id; pending.answer=answer.answer; pending.clickedAt=Date.now();
           try {
-            if (pending.sources) page.selectImageChoice(answer,pending.sources);
+            if (pending.audio) {
+              const clicked=await selectAudioChoice(s,pending,true);
+              if (clicked===false) {
+                pending.playbackRequired=true;
+                s.outbox.push(ArenaBridge.event('busy',{job:job.id,voicePlaybackRequired:true,
+                  text:'Arena requires playback of the chosen voice in its browser tab.'}));
+              }
+            }
+            else if (pending.sources) page.selectImageChoice(answer,pending.sources);
             else page.selectNativeAnswer(answer);
           }
           catch (error) { suspend(s,{kind:'blocked',text:error.message},job.id); return; }

@@ -44,13 +44,15 @@ function serveRawReplyFixture() {
   });
 }
 
-for (const [fixture, description] of [
+for (const [fixture, description, waitForGesture] of [
   ['fixture.html', 'sending, completion, PNG verification and draft protection'],
   ['batch.html', 'atomic ordered PNG uploads and upload rejection'],
   ['files.html', 'original user files, mixed formats and native upload rejection'],
   ['../../desktop-plugin/test/original-files-client.html', 'Desktop picker, paste and drop route original files to the addressed composer'],
   ['questions.html', 'native single-choice question controls and terminal widgets'],
   ['image-choices.html', 'native image choice previews and exact controls'],
+  ['audio-choices.html', 'native voice previews, exact selection and final audio'],
+  ['audio-choices.html', 'native voice selection after Chrome requests playback', true],
   ['status-authority.html', 'standalone final tool frames after native status rows'],
   ['raw-reply.html', 'raw tool JSON and comparison of the native Copy with the live stream'],
   ['review.html', 'native feedback and safe recovery before Send']
@@ -59,13 +61,15 @@ for (const [fixture, description] of [
     ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' : '/usr/bin/google-chrome');
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-bridge-fixture-'));
   let url = pathToFileURL(path.join(__dirname, fixture)).href;
+  if (waitForGesture) url += '#default-autoplay';
   const server = fixture === 'raw-reply.html' ? serveRawReplyFixture() : null;
   if (server) {
     server.listen(0,'127.0.0.1');
     await once(server,'listening');
     url = 'http://127.0.0.1:' + server.address().port + '/agent/fixture';
   }
-  const proc = spawn(chrome, ['--headless=new','--disable-gpu','--no-first-run',
+  const mediaFlags=fixture==='audio-choices.html' && !waitForGesture ? ['--autoplay-policy=no-user-gesture-required'] : [];
+  const proc = spawn(chrome, ['--headless=new','--disable-gpu','--no-first-run',...mediaFlags,
     '--disable-background-networking','--disable-sync','--allow-file-access-from-files',
     '--user-data-dir='+profile,'--remote-debugging-port=0',url],{stdio:'ignore',windowsHide:true});
   let launchError;
@@ -97,7 +101,13 @@ for (const [fixture, description] of [
         // Chrome can expose the target before the fixture's document has committed.
         if(answer.error && !/context/i.test(answer.error.message)) throw Error(answer.error.message);
         const status=answer.result?.result?.value;
-        if(status && status!=='running' && !status.startsWith('Passed ')) {
+        if(status==='Waiting for native playback' && waitForGesture) {
+          socket.send(JSON.stringify({id:++id,method:'Runtime.evaluate',params:{
+            expression:"document.querySelector('audio').play()",userGesture:true,awaitPromise:true
+          }}));
+          do { answer=JSON.parse((await replies.next()).value[0].data); } while(answer.id!==id);
+          assert.equal(answer.result?.exceptionDetails,undefined,'native playback with a user gesture starts');
+        } else if(status && status!=='running' && !status.startsWith('Passed ')) {
           assert.equal(status,'All fixture checks passed');
           break;
         }
